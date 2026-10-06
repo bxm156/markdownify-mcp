@@ -193,7 +193,7 @@ export class JobService {
       const part = path.join(this.dir(id), "input.part");
       const limit = new Transform({ transform(chunk, _encoding, callback) {
         bytes += chunk.length;
-        callback(bytes > job.size_bytes ? new ServiceError(413, "Upload exceeds declared size") : null, chunk);
+        callback(bytes > job.size_bytes ? new ServiceError(413, "Upload exceeds declared size", "UPLOAD_SIZE_MISMATCH", { limit_bytes: job.size_bytes, requested_bytes: bytes }) : null, chunk);
       } });
       const timeout = setTimeout(() => controller.abort(), Math.max(1, Date.parse(job.expires_at) - Date.now()));
       const abortSource = () => source.destroy(new ServiceError(408, "Upload cancelled or timed out"));
@@ -201,7 +201,7 @@ export class JobService {
       try {
         controller.signal.throwIfAborted();
         await pipeline(source, limit, createWriteStream(part, { flags: "wx", mode: 0o600 }), { signal: controller.signal });
-        if (bytes !== job.size_bytes) throw new ServiceError(400, "Upload size does not match declared size");
+        if (bytes !== job.size_bytes) throw new ServiceError(400, "Upload size does not match declared size", "UPLOAD_SIZE_MISMATCH", { limit_bytes: job.size_bytes, requested_bytes: bytes });
         this.available(job);
         await fs.rename(part, this.input(job));
         const uploaded: Job = { ...job, status: "uploaded", expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() };
