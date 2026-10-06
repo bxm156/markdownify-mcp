@@ -1,0 +1,105 @@
+name: Docker Hub publication
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  IMAGE_NAME: bryanmarty/markdownify-mcp
+concurrency:
+  group: dockerhub-main
+  cancel-in-progress: false
+jobs:
+  test-and-publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and test source
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build:remote
+          bun test src/remote
+          python -m pip install 'markitdown[pdf,docx,xlsx,pptx]==0.1.5'
+          bun scripts/remote-converter-smoke.ts
+      - uses: docker/setup-buildx-action@v4
+      - name: Build candidate without registry credentials
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.remote
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: markdownify-remote:publish-candidate
+          build-args: VCS_REF=${{ github.sha }}
+      - name: Prepare disposable agent credentials
+        run: bun scripts/create-test-agent-registry.ts "$RUNNER_TEMP/markdownify-agents.json" "$GITHUB_ENV"
+      - name: Test candidate container with three isolated agents
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'docker rm -f -v markdownify-publish-test >/dev/null 2>&1 || true' EXIT
+          docker run -d --name markdownify-publish-test -p 127.0.0.1:8000:8000 \
+            -v "$RUNNER_TEMP/markdownify-agents.json:/run/markdownify-agents.json:ro" \
+            -e MD_AUTH_FILE=/run/markdownify-agents.json \
+            -e MD_PUBLIC_BASE_URL=http://localhost:8000 markdownify-remote:publish-candidate
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --max-time 1 http://localhost:8000/healthz >/dev/null; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then docker logs markdownify-publish-test; exit 1; fi
+          bun scripts/multitenant-http-smoke.ts
+      - name: Check publication configuration
+        id: publication
+        shell: bash
+        env:
+          HUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          HUB_IMAGE: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HUB_USERNAME" ] || [ -z "$HUB_TOKEN" ]; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo 'Image tests passed. Docker Hub publication skipped: configure secrets DOCKERHUB_USERNAME, DOCKERHUB_TOKEN.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! [[ "$HUB_IMAGE" =~ ^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo 'Invalid IMAGE_NAME: use lowercase namespace/repository.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          current_main=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$current_main" != "$GITHUB_SHA" ]; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo 'Image tests passed. Publication skipped because main has advanced; its newer run will publish.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+      - name: Login after all validation passes
+        if: steps.publication.outputs.ready == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push the exact tested image
+        if: steps.publication.outputs.ready == 'true'
+        shell: bash
+        env:
+          HUB_IMAGE: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          for tag in "sha-$GITHUB_SHA" latest; do
+            docker tag markdownify-remote:publish-candidate "$HUB_IMAGE:$tag"
+            docker push "$HUB_IMAGE:$tag"
+          done
+          echo "Published tested linux/amd64 image: $HUB_IMAGE:sha-$GITHUB_SHA and $HUB_IMAGE:latest" >> "$GITHUB_STEP_SUMMARY"
+

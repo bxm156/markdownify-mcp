@@ -32,10 +32,10 @@ The model chooses actions; the runtime reads file bytes and performs the upload.
 | M3: remote MCP | Native HTTP transport, bearer auth, create_upload/start_conversion/get_conversion_status/get_markdown/delete_job | SDK client completes upload -> start -> poll -> retrieve; auth/validation tests pass |
 | M4: first MVP packaging | Docker/Compose, environment template, agent helper, LiteLLM example, CI, operational documentation | Portable build and remote test suite pass; deployment and LiteLLM setup are documented; source published in the fork |
 | M5: deployment verification | Deploy to a selected host, configure TLS/volume/secrets/LiteLLM | Real agent through the user's LiteLLM uploads and retrieves a document; cleanup and restart observed |
-| M6: multiple tenants (deferred) | Trusted identity propagation, tenant ownership/quotas, isolated access, audit | Cross-tenant access denied in tests |
+| M6: multiple tenants and private agents | Trusted identity propagation, tenant/agent ownership and quotas, isolated access, audit | Same-tenant and cross-tenant foreign access denied; container workflow passes |
 | M7: scaling (deferred) | Transactional job database, shared queue/object storage, worker isolation, retries/monitoring | Multiple workers/replicas safely operate under failure |
 
-Execution target for this task: M0-M4. M5 requires a hosting destination and LiteLLM instance/credentials, which have not been supplied. Record its actual verification state rather than claiming deployment. M6-M7 are explicitly out of scope.
+Execution scope: M0-M4 delivered the first MVP; the user subsequently authorized M6 tenant and private-agent isolation, implemented in phase 2 below. M5 requires a hosting destination and LiteLLM instance/credentials, which have not been supplied. M7 scaling remains deferred. Record actual verification rather than claiming public deployment.
 
 ## Agent work split
 
@@ -77,5 +77,27 @@ States: awaiting_upload -> uploaded -> queued -> running -> completed / failed; 
 
 ## Verification status
 
-M0-M4 are complete. Implementation is published in [PR #1](https://github.com/bxm156/markdownify-mcp/pull/1). [Linux CI run 37454606073](https://github.com/bxm156/markdownify-mcp/actions/runs/37454606073) passed the build, 20 remote tests/97 assertions, real PDF and generated Office conversions, container image build and authenticated container upload/conversion/retrieval/deletion workflow. See [MVP validation](docs/MVP-VALIDATION.md) for local results and limits. M5 (public hosting and live LiteLLM verification) remains pending; M6-M7 are deferred.
+M0-M4 are complete and PR #1 is merged. [Linux CI run 37454606073](https://github.com/bxm156/markdownify-mcp/actions/runs/37454606073) passed the build, 20 remote tests/97 assertions, real PDF and generated Office conversions, container image build and authenticated container upload/conversion/retrieval/deletion workflow. See [MVP validation](docs/MVP-VALIDATION.md) for local results and limits. M5 (public hosting and live LiteLLM verification) remains pending. M6 implementation and verification are recorded in phase 2 below; M7 remains deferred.
+
+## Phase 2: tenant and agent isolation
+
+The user authorized M6 ahead of public deployment and explicitly chose **private files and results for every agent**, including agents belonging to the same tenant. A job is one uploaded file, its conversion state, and its Markdown result. Agent identities are stable across reconnects and credential rotation; an MCP connection is not an ownership boundary.
+
+Implementation branch: `multi-tenant-agents`, based on merged PR #1 at `b8f99dce8bb8bb5749c4b700fc50eaf5047c97eb`.
+
+Milestones for this phase:
+
+1. Credential identity: operator-managed SHA-256 credential registry, separate tenant/agent identities, disabled credentials and rotation; reject ambiguous shared-key configuration.
+2. Private operations: require both owner IDs before upload/start/status/Markdown/delete, including before cancellation and locks. Foreign and missing jobs return the same response. Upload PUT requires both active agent bearer credential and the scoped upload token.
+3. Bounded resources: global, tenant and agent job/storage admission budgets, concurrency caps, and fair queue scheduling. Keep one process per data directory; distributed workers remain M7.
+4. Audit and migration: metadata-only bounded audit logs; existing unowned jobs require one explicit operator-selected owner, with full startup validation before ownership changes.
+5. PR #1 feedback: track the actual Copilot pagination issue in [issue #2](https://github.com/bxm156/markdownify-mcp/issues/2), replace full-result allocations with indexed bounded-memory pages, and close the issue when the fix merges.
+6. Agent guidance: add repository `SKILL.md` with exact MCP arguments, runtime upload authentication, finite polling, code-point pagination, and private-agent constraints.
+7. Validation and publication: unit/integration attacks from same-tenant and cross-tenant agents, restart/migration/quota/fairness checks, real documents, and three-agent workflow against the Docker image in Linux CI. Publish a reviewable PR; do not merge without user authorization.
+
+M5 remains pending because a hosting destination and live LiteLLM environment have not been supplied. This phase proves application-level ownership for trusted parser/runtime deployment, not hostile-document parser sandboxing or distributed execution.
+
+### Phase 2 verification
+
+M6 implementation is complete in [PR #3](https://github.com/bxm156/markdownify-mcp/pull/3). [CI run 37456711823](https://github.com/bxm156/markdownify-mcp/actions/runs/37456711823) passed the portable build, 40 tests/272 assertions, real PDF and generated Office conversions, Docker image build, compatibility workflow, and three-agent same/cross-tenant isolation workflow against the running container. [Validation details](docs/MULTITENANT-VALIDATION.md) include local and container results. Issue #2 closes when PR #3 merges; the PR remains open for user review.
 

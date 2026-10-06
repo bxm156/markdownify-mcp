@@ -2,11 +2,13 @@
 import { loadConfig } from "./config.js";
 import { createHttpServer } from "./http.js";
 import { JobService } from "./jobs.js";
+import { createAuditLogger } from "./audit.js";
 
 async function main() {
   process.env.PYTHONUTF8 = "1";
   const config = loadConfig();
-  const jobs = new JobService(config.jobs);
+  const audit = await createAuditLogger(config.jobs.dataDir);
+  const jobs = new JobService({ ...config.jobs, audit });
   await jobs.init();
   const server = createHttpServer(jobs, config);
   server.requestTimeout = 5 * 60_000;

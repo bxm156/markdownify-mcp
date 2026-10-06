@@ -1,11 +1,11 @@
 # Remote file conversion MVP
 
-This fork adds a native Streamable HTTP MCP server at `/mcp`, a binary upload endpoint, and a bounded background conversion queue. The existing stdio server remains available separately. This deployment is for one trusted tenant: every holder of the shared API key can operate every job. Run exactly one process/replica per data directory. Job metadata is stored in atomic JSON manifests on disk, alongside input and Markdown files; there is no external database or queue.
+This fork adds a native Streamable HTTP MCP server at `/mcp`, a binary upload endpoint, and a bounded background conversion queue. Start with [QUICKSTART.md](QUICKSTART.md) for a new deployment with private agent credentials, or [MULTITENANT.md](MULTITENANT.md) for authentication, quotas, and LiteLLM forwarding. Run exactly one process/replica per data directory. Job metadata is stored in atomic JSON manifests on disk, alongside input and Markdown files; there is no external database or queue. The original stdio tools remain available separately. The optional `MD_API_KEY` setup below is for one logical agent only; use `MD_AUTH_FILE` for multiple agents.
 
 ## Agent workflow
 
 1. Call `create_upload` with `{ "filename": "report.docx", "size_bytes": 12345 }`.
-2. The result contains `upload_id`, `upload_url`, `required_headers`, and `expires_at`. The agent **runtime**, with access to the local file, must HTTP `PUT` its raw bytes to that URL using those headers. Do not include bytes or base64 in model context. The upload URL has no secret query parameters; `required_headers.Authorization` carries a short-lived upload token.
+2. The result contains `upload_id`, `upload_url`, `required_headers`, and `expires_at`. The agent **runtime**, with access to the local file, must HTTP `PUT` its raw bytes to that URL using those headers plus its own `Authorization: Bearer <agent credential>`. Do not include bytes or base64 in model context. The upload URL has no secret query parameters; `required_headers.X-Upload-Token` carries a short-lived upload token. The server never returns the long-lived agent credential.
 3. Call `start_conversion` with `{ "upload_id": "..." }`; receive `job_id` immediately. This operation is idempotent for a queued/running/completed job.
 4. Poll `get_conversion_status` with `{ "job_id": "..." }`, with backoff and a deadline.
 5. When status is `completed`, call `get_markdown` with `{ "job_id": "...", "offset": 0, "max_chars": 50000 }`. Append `markdown`, then follow `next_offset` until it is `null`. Offsets count Unicode code points, not bytes. The server bounds page size to 100,000 characters and avoids splitting a surrogate pair.
@@ -54,13 +54,13 @@ docker compose -f compose.remote.yaml logs --tail=100
 
 The image installs MarkItDown 0.1.5 with the PDF/Office extras, runs as a non-root user, and stores jobs in the `markdownify-data` volume. Compose publishes port 8000 on the host's loopback interface, uses a read-only root filesystem with temporary scratch storage, and bounds container resources. The volume survives container replacement. `docker compose down -v` deletes it and all jobs. Do not share this volume between replicas.
 
-Put a TLS reverse proxy in front of the local port for remote access. Set `MD_PUBLIC_BASE_URL=https://markdownify.example.com` to the **origin** accessible directly from the agent runtime. It must have no path, query, userinfo, or fragment. The proxy must route both `/mcp` and `/uploads/*` to this service, preserve the public `Host` header and `Authorization` header, allow `PUT`, and accept at least the configured maximum upload size. Configure proxy upload/body limits and timeouts to match your actual files. If the proxy rewrites Host, explicitly set `MD_ALLOWED_HOSTS` to a comma-separated allowlist of the public and internal host:port values needed. CORS browser uploads are not provided; this MVP targets server-side agent runtimes.
+Put a TLS reverse proxy in front of the local port for remote access. Set `MD_PUBLIC_BASE_URL=https://markdownify.example.com` to the **origin** accessible directly from the agent runtime. It must have no path, query, userinfo, or fragment. The proxy must route both `/mcp` and `/uploads/*` to this service, preserve the public `Host`, `Authorization`, and `X-Upload-Token` headers, allow `PUT`, and accept at least the configured maximum upload size. Configure proxy upload/body limits and timeouts to match your actual files. If the proxy rewrites Host, explicitly set `MD_ALLOWED_HOSTS` to a comma-separated allowlist of the public and internal host:port values needed. CORS browser uploads are not provided; this MVP targets server-side agent runtimes.
 
 Supergateway is unnecessary for this entry point because it already speaks Streamable HTTP. Wrapping the legacy stdio entry in Supergateway exposes the legacy tools, not these upload tools. Use the native `/mcp` endpoint for this workflow.
 
 ## LiteLLM connection
 
-Add this to your LiteLLM configuration; load `MARKDOWNIFY_MCP_TOKEN` with the same value as the converter's `MD_API_KEY` in the LiteLLM process:
+For a single logical agent using legacy-key mode, add this to your LiteLLM configuration; load `MARKDOWNIFY_MCP_TOKEN` with the same value as the converter's `MD_API_KEY` in the LiteLLM process:
 
 ```yaml
 mcp_servers:
@@ -71,7 +71,7 @@ mcp_servers:
     auth_value: os.environ/MARKDOWNIFY_MCP_TOKEN
 ```
 
-Grant the agent's LiteLLM virtual key access to the `markdownify` MCP server. Connect the agent MCP client to `https://litellm.example.com/markdownify/mcp` using `x-litellm-api-key: Bearer <virtual-key>`. LiteLLM may prefix tool names with its server alias, such as `markdownify-create_upload`; discover the tool list rather than hardcoding gateway names. The gateway key and upstream `MD_API_KEY` are separate credentials. Binary `PUT` requests go directly from the agent runtime to Markdownify, using the returned scoped token; LiteLLM carries tool calls, not file bytes.
+Grant the agent's LiteLLM virtual key access to the `markdownify` MCP server. Connect the agent MCP client to `https://litellm.example.com/markdownify/mcp` using `x-litellm-api-key: Bearer <virtual-key>`. LiteLLM may prefix tool names with its server alias, such as `markdownify-create_upload`; discover the tool list rather than hardcoding gateway names. The gateway key and upstream `MD_API_KEY` are separate credentials. Binary `PUT` requests go directly from the agent runtime to Markdownify, using its own bearer credential plus the returned scoped token; LiteLLM carries tool calls, not file bytes. For multiple isolated agents, follow [MULTITENANT.md](MULTITENANT.md) and forward each agent credential instead of configuring this shared static token.
 
 This configuration follows the [LiteLLM MCP configuration reference](https://docs.litellm.ai/docs/mcp_config_reference), checked through Firecrawl on October 6, 2026. Live LiteLLM interoperability and internet deployment still require testing in your deployment environment.
 
@@ -89,6 +89,7 @@ bun examples/upload-and-convert.ts ./report.docx ./report.md
 export MCP_URL=https://litellm.example.com/markdownify/mcp
 export LITELLM_API_KEY='<agent virtual key>'
 export MARKDOWNIFY_BASE_URL=https://markdownify.example.com
+export MARKDOWNIFY_AGENT_TOKEN='<same secret as MD_API_KEY>'
 bun examples/upload-and-convert.ts ./report.pdf ./report.md
 ```
 
@@ -98,7 +99,8 @@ For PowerShell use `$env:MCP_URL='...'` (and similarly for other variables) inst
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MD_API_KEY` | Required, ≥32 characters | Shared MCP bearer credential |
+| `MD_API_KEY` | Required in legacy mode, ≥32 characters | Bearer credential for the single default/default agent; must be absent when MD_AUTH_FILE is set |
+| `MD_AUTH_FILE` | Required for isolated agents | Trusted hashed credential registry; see [MULTITENANT.md](MULTITENANT.md) |
 | `MD_PUBLIC_BASE_URL` | `http://localhost:8000` | Direct upload origin |
 | `MD_HOST` / `MD_PORT` | `127.0.0.1` / `8000` | Listener; Compose overrides host to `0.0.0.0` |
 | `MD_ALLOWED_HOSTS` | Public host and local probe hosts | Explicit Host allowlist override |
@@ -114,7 +116,7 @@ For PowerShell use `$env:MCP_URL='...'` (and similarly for other variables) inst
 
 Storage reservations are conservative: even a small file reserves the full configured Markdown output limit. Increase storage or lower output limits to accommodate more live jobs. JSON manifests and scratch buffers add overhead; the application budget is not a filesystem quota. Use a dedicated volume with adequate free space. Store it on an encrypted disk if document confidentiality requires it. Do not log upload authorization headers or whole `create_upload` results in agent traces.
 
-The converter is a subprocess with a timeout and bounded stdout; it is not a security sandbox for hostile document parser exploits. This first milestone assumes trusted callers and document sources, has no per-user isolation, no distributed queue, no OCR service, and no live deployment automation.
+The converter is a subprocess with a timeout and bounded stdout; it is not a security sandbox for hostile document parser exploits. The current service isolates files by authenticated tenant and agent, with tenant/agent budgets and metadata auditing. It assumes trusted document sources and has no distributed queue, OCR service, or live deployment automation. See [MULTITENANT.md](MULTITENANT.md) for deployment limits and ownership migration.
 
 ## Verification
 

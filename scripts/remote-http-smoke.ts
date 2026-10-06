@@ -31,7 +31,7 @@ try {
   assert.equal(uploadUrl.search, "", "Upload URL must not carry credentials in query parameters");
   const input = createReadStream(fixture);
   try {
-    const response = await fetch(uploadUrl, { method: "PUT", body: input as unknown as BodyInit, duplex: "half", headers: upload.required_headers, redirect: "error", signal: AbortSignal.timeout(30000) } as RequestInit & { duplex: "half" });
+    const response = await fetch(uploadUrl, { method: "PUT", body: input as unknown as BodyInit, duplex: "half", headers: { ...upload.required_headers, Authorization: `Bearer ${key}` }, redirect: "error", signal: AbortSignal.timeout(30000) } as RequestInit & { duplex: "half" });
     assert.equal(response.status, 204, "Binary upload failed");
   } finally { input.destroy(); }
   const queued = await call<{ job_id: string }>("start_conversion", { upload_id: jobId });
