@@ -77,5 +77,5 @@ States: awaiting_upload -> uploaded -> queued -> running -> completed / failed; 
 
 ## Verification status
 
-Implementation and test results will be recorded in docs/MVP-VALIDATION.md before publication.
+M0-M4 are complete. Implementation is published in [PR #1](https://github.com/bxm156/markdownify-mcp/pull/1). [Linux CI run 37454606073](https://github.com/bxm156/markdownify-mcp/actions/runs/37454606073) passed the build, 20 remote tests/97 assertions, real PDF and generated Office conversions, container image build and authenticated container upload/conversion/retrieval/deletion workflow. See [MVP validation](docs/MVP-VALIDATION.md) for local results and limits. M5 (public hosting and live LiteLLM verification) remains pending; M6-M7 are deferred.
 

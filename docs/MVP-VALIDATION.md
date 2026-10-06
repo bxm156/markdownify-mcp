@@ -4,6 +4,8 @@ Validated locally on 2026-10-06 on Windows using Bun 1.4.2, Node 24.19.0, Python
 
 ## Passed
 
+GitHub Linux CI [run 37454606073](https://github.com/bxm156/markdownify-mcp/actions/runs/37454606073) completed successfully for implementation commit `f0475aba89bb5a7c884c231e8f64bd6ec086d60d`. It passed all 20 remote tests and 97 assertions, converted the real PDF and generated Office fixtures, built `Dockerfile.remote`, started the resulting Node 22 container, and verified authenticated MCP initialization/tool discovery, binary PDF upload, asynchronous conversion, paginated retrieval and deletion.
+
 - Frozen-lockfile dependency installation with dependency scripts disabled.
 - Portable TypeScript build: `bun run build:remote`.
 - Remote suite: 20 tests, 97 assertions, zero failures.
@@ -20,7 +22,7 @@ The upstream DOCX/XLSX/PPTX sample files are 19-byte plain text, so the smoke te
 ## Limitations and remaining verification
 
 - Upstream test suite: 68 passed, 11 repository-conversion tests failed because Windows cannot launch the existing Repomix executable resolution. Those legacy tools are unchanged and are not exposed by the remote service.
-- Local Docker daemon access was blocked by the execution sandbox's named-pipe permissions, even after the user started Docker. Elevated Docker access was rejected by the configured permission policy. Container build/runtime verification is delegated to the dedicated GitHub CI workflow.
+- Local Docker daemon access was blocked by the execution sandbox's named-pipe permissions, even after the user started Docker. Elevated Docker access was rejected by the configured permission policy. Container build/runtime verification passed in GitHub CI instead.
 - Live LiteLLM integration and public TLS deployment are not yet tested: no host or gateway configuration/credentials were supplied.
 - Single tenant, one process per private data directory. Every shared-key holder can access all jobs.
 - Parser subprocesses have deadlines/output limits; resource and exploit isolation depend on deployment/container controls. No OCR or multi-tenant isolation is included.
