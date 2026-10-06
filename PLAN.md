@@ -78,3 +78,4 @@ States: awaiting_upload -> uploaded -> queued -> running -> completed / failed; 
 ## Verification status
 
 Implementation and test results will be recorded in docs/MVP-VALIDATION.md before publication.
+

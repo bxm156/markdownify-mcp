@@ -17,6 +17,10 @@
     "setup.bat"
   ],
   "scripts": {
+    "build:remote": "bun ./node_modules/typescript/bin/tsc",
+    "start:remote": "node dist/remote/index.js",
+    "test:remote": "bun test src/remote",
+    "test:converter": "bun scripts/remote-converter-smoke.ts",
     "build": "tsc && chmod +x dist/*.js",
     "dev": "tsc --watch",
     "preinstall": "node preinstall.js",
