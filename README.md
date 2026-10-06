@@ -1,5 +1,11 @@
 # Markdownify MCP Server
 
+## Remote uploads and asynchronous conversion
+
+This fork adds a single-tenant HTTP service for uploading documents, converting them in the background, and retrieving Markdown later through MCP. Native Streamable HTTP works with LiteLLM; file bytes stream directly to the service using a short-lived upload token.
+
+See [the milestone plan](PLAN.md), [remote setup and agent example](docs/REMOTE.md), and [MVP validation](docs/MVP-VALIDATION.md). The original local stdio tools remain available. Start the hosted service with `bun run build:remote` and `bun run start:remote` after setting `MD_API_KEY` and installing the required MarkItDown extras.
+
 ![markdownify mcp logo](logo.jpg)
 
 Markdownify is a Model Context Protocol (MCP) server that converts various file types and web content to Markdown format. It provides a set of tools to transform PDFs, images, audio files, web pages, and more into easily readable and shareable Markdown text.
