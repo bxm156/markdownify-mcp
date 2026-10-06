@@ -118,14 +118,14 @@ describe("durable single tenant jobs", () => {
     const { instance } = await service({ maxOutputBytes: 2 });
     const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
     await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"])); await instance.startConversion(principal, job.upload_id);
-    expect((await waitFor(instance, job.upload_id, "failed")).error).toBe("Document conversion failed");
+    expect((await waitFor(instance, job.upload_id, "failed")).error_info).toMatchObject({ code: "OUTPUT_LIMIT_EXCEEDED", details: { limit_bytes: 2 } });
     await expect(instance.getMarkdown(principal, job.upload_id)).rejects.toMatchObject({ statusCode: 409 });
     const { instance: timed } = await service({ conversionTimeoutMs: 20, converter: async (_input, _output, signal) => {
       await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
     } });
     const slow = await timed.createUpload(principal, { filename: "slow.txt", size_bytes: 1 });
     await timed.upload(principal, slow.upload_id, slow.upload_token, Readable.from(["a"])); await timed.startConversion(principal, slow.upload_id);
-    expect((await waitFor(timed, slow.upload_id, "failed")).error).toBe("Conversion cancelled or timed out");
+    expect((await waitFor(timed, slow.upload_id, "failed")).error_info).toMatchObject({ code: "CONVERSION_TIMEOUT" });
   });
   test("stalled uploads time out and close and deletion abort pending streams", async () => {
     const { instance, options } = await service({ uploadTtlMs: 30 });

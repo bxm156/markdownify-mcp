@@ -22,7 +22,7 @@ function parsed(result: any): any {
 }
 function errorText(result: any): string {
   expect(result.isError).toBe(true);
-  return result.content[0].text;
+  return JSON.parse(result.content[0].text).error;
 }
 
 async function deployment(uploadTtlMs = 60_000) {
@@ -120,7 +120,7 @@ test("foreign and unknown IDs remain indistinguishable after expiration", async 
   for (const id of [upload.upload_id, missing]) {
     const denied = await fixture.upload(id, TOKEN_B, upload.required_headers, "x");
     expect(denied.status).toBe(404);
-    expect(await denied.json()).toEqual({ error: "Job not found" });
+    expect(await denied.json()).toMatchObject({ error: "Job not found", error_info: { code: "JOB_NOT_FOUND" } });
   }
 });
 

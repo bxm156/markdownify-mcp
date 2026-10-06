@@ -8,11 +8,10 @@ import { Converter, createConverter } from "./converter.js";
 import { validatePrincipal, type Principal } from "./identity.js";
 import { prepareMarkdownIndex, readMarkdownPage } from "./markdown.js";
 
-export class ServiceError extends Error {
-  constructor(public statusCode: number, message: string) { super(message); }
-}
+import { ServiceError, errorInfo, lookupError, legacyCode, type ErrorCode, type ErrorDetails } from "./errors.js";
+export { ServiceError } from "./errors.js";
 export type JobStatus = "awaiting_upload" | "uploaded" | "queued" | "running" | "completed" | "failed" | "expired";
-type Job = { tenant_id: string; agent_id: string; id: string; filename: string; extension: string; size_bytes: number; token_hash?: string; status: JobStatus; created_at: string; expires_at: string; error?: string };
+type Job = { tenant_id: string; agent_id: string; id: string; filename: string; extension: string; size_bytes: number; token_hash?: string; status: JobStatus; created_at: string; expires_at: string; error?: string; error_code?: ErrorCode; error_details?: ErrorDetails };
 export type AuditEvent = { event: string; tenant_id: string; agent_id: string; job_id?: string; status?: string; reason?: string };
 export type JobServiceOptions = { dataDir: string; maxUploadBytes: number; maxStorageBytes: number; maxJobs: number; retentionMs: number; uploadTtlMs: number; conversionTimeoutMs: number; maxOutputBytes: number; concurrency: number; converter?: Converter; legacyOwner?: Principal; maxTenantJobs?: number; maxTenantStorageBytes?: number; maxTenantConcurrency?: number; maxAgentJobs?: number; maxAgentStorageBytes?: number; maxAgentConcurrency?: number; audit?: (event: AuditEvent) => void | Promise<void> };
 const extensions = new Set([".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".md", ".csv", ".html", ".json"]);
@@ -120,6 +119,8 @@ export class JobService {
       if (job.status === "running") {
         job.status = "failed";
         job.error = "Conversion interrupted by server restart";
+        job.error_code = "CONVERSION_INTERRUPTED";
+        delete job.error_details;
         job.expires_at = new Date(Date.now() + this.options.retentionMs).toISOString();
         await this.save(job);
       }
@@ -144,19 +145,25 @@ export class JobService {
       if (typeof filename !== "string" || filename.length > 255 || !filename.length || /[\x00-\x1f\x7f/\\]/.test(filename) || filename === "." || filename.includes("..")) throw new ServiceError(400, "Invalid filename");
       const extension = path.extname(filename).toLowerCase();
       if (!extensions.has(extension)) throw new ServiceError(415, "Unsupported file format");
-      if (!Number.isSafeInteger(size_bytes) || size_bytes < 0 || size_bytes > this.options.maxUploadBytes) throw new ServiceError(413, "Invalid or excessive file size");
+      if (!Number.isSafeInteger(size_bytes) || size_bytes < 0) throw new ServiceError(413, "Invalid or excessive file size");
+      if (size_bytes > this.options.maxUploadBytes) throw new ServiceError(413, "File exceeds upload limit", "FILE_TOO_LARGE", { limit_bytes: this.options.maxUploadBytes, requested_bytes: size_bytes });
       const live = [...this.jobs.values()].filter(job => job.status !== "expired");
       const reserved = live.reduce((total, job) => total + job.size_bytes + this.options.maxOutputBytes, 0);
-      if (live.length >= this.options.maxJobs || reserved + size_bytes + this.options.maxOutputBytes > this.options.maxStorageBytes) {
-        await this.audit("quota_denied", principal, undefined, undefined, "capacity_exhausted");
-        throw new ServiceError(507, "Temporary storage capacity exhausted");
-      }
-      const scoped = (jobs: Job[], maxJobs: number, maxBytes: number) => jobs.length >= maxJobs || jobs.reduce((total, job) => total + job.size_bytes + this.options.maxOutputBytes, 0) + size_bytes + this.options.maxOutputBytes > maxBytes;
       const tenant = live.filter(job => job.tenant_id === principal.tenantId);
       const agent = tenant.filter(job => job.agent_id === principal.agentId);
-      if (scoped(tenant, this.options.maxTenantJobs ?? this.options.maxJobs, this.options.maxTenantStorageBytes ?? this.options.maxStorageBytes) || scoped(agent, this.options.maxAgentJobs ?? this.options.maxJobs, this.options.maxAgentStorageBytes ?? this.options.maxStorageBytes)) {
-        await this.audit("quota_denied", principal, undefined, undefined, "capacity_exhausted");
-        throw new ServiceError(507, "Temporary storage capacity exhausted");
+      const reservation = size_bytes + this.options.maxOutputBytes;
+      for (const [scope, jobs, maxJobs, maxBytes] of [
+        ["global", live, this.options.maxJobs, this.options.maxStorageBytes],
+        ["tenant", tenant, this.options.maxTenantJobs ?? this.options.maxJobs, this.options.maxTenantStorageBytes ?? this.options.maxStorageBytes],
+        ["agent", agent, this.options.maxAgentJobs ?? this.options.maxJobs, this.options.maxAgentStorageBytes ?? this.options.maxStorageBytes],
+      ] as const) {
+        const bytes = scope === "global" ? reserved : jobs.reduce((total, job) => total + job.size_bytes + this.options.maxOutputBytes, 0);
+        if (jobs.length >= maxJobs || bytes + reservation > maxBytes) {
+          await this.audit("quota_denied", principal, undefined, undefined, "capacity_exhausted");
+          // Report configured budgets, never other agents' usage or job IDs.
+          if (jobs.length >= maxJobs) throw new ServiceError(507, "Temporary job capacity exhausted", "JOB_LIMIT_EXCEEDED", { scope, limit_jobs: maxJobs });
+          throw new ServiceError(507, "Temporary storage capacity exhausted", "STORAGE_LIMIT_EXCEEDED", { scope, limit_bytes: maxBytes, requested_bytes: size_bytes, reserved_bytes: reservation });
+        }
       }
       await this.audit("create_upload", principal);
       const id = randomUUID(), token = randomBytes(32).toString("base64url");
@@ -231,7 +238,7 @@ export class JobService {
     return this.locked(id, async () => {
       const job = await this.owned(principal, id); this.available(job);
       await this.audit("read_status", principal, id, job.status);
-      return { job_id: id, filename: job.filename, status: job.status, created_at: job.created_at, expires_at: job.expires_at, ...(job.error ? { error: job.error } : {}) };
+      return { job_id: id, filename: job.filename, status: job.status, created_at: job.created_at, expires_at: job.expires_at, ...(job.error ? { error: job.error, error_info: { ...lookupError(job.error_code ?? legacyCode(job.error)), ...(job.error_details ? { details: job.error_details } : {}) } } : {}) };
     });
   }
   async getMarkdown(principal: Principal, id: string, { offset = 0, max_chars = 16_000 }: { offset?: number; max_chars?: number } = {}) {
@@ -269,6 +276,7 @@ export class JobService {
   private async run(id: string, controller: AbortController) {
     let job: Job | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
     const part = path.join(this.dir(id), "output.part");
     try {
       job = await this.locked(id, async () => {
@@ -276,31 +284,34 @@ export class JobService {
         if (value.status !== "queued") throw new Error("Job is no longer queued");
         const running: Job = { ...value, status: "running" }; await this.save(running); this.jobs.set(id, running); return running;
       });
-      timeout = setTimeout(() => controller.abort(new Error("Conversion timeout")), this.options.conversionTimeoutMs);
+      timeout = setTimeout(() => { timedOut = true; controller.abort(); }, this.options.conversionTimeoutMs);
       await this.converter(this.input(job), part, controller.signal);
       controller.signal.throwIfAborted();
-      if ((await fs.stat(part)).size > this.options.maxOutputBytes) throw new Error("Output limit exceeded");
+      if ((await fs.stat(part)).size > this.options.maxOutputBytes) throw new ServiceError(413, "Converted Markdown exceeds output limit", "OUTPUT_LIMIT_EXCEEDED", { limit_bytes: this.options.maxOutputBytes });
       await this.locked(id, async () => {
         await fs.rename(part, path.join(this.dir(id), "output.md"));
         await prepareMarkdownIndex(path.join(this.dir(id), "output.md"));
         const completed: Job = { ...job!, status: "completed", expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() };
         await this.save(completed); this.jobs.set(id, completed); await this.internalAudit("conversion_completed", completed);
       });
-    } catch {
+    } catch (error) {
       if (!job) {
         // A failed running-state commit must not leave a queued job that pump()
         // retries in a tight loop while the filesystem remains unavailable.
         await this.locked(id, async () => {
           const pending = this.jobs.get(id);
           if (pending?.status !== "queued") return;
-          const failed: Job = { ...pending, status: "failed", error: "Unable to persist conversion job", expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() };
+          const failed: Job = { ...pending, status: "failed", error: "Unable to persist conversion job", error_code: "INTERNAL_ERROR", expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() };
           this.jobs.set(id, failed);
           await this.save(failed).catch(() => undefined);
         });
       }
       if (job) await this.locked(id, async () => {
         await fs.rm(part, { force: true });
-        const failed: Job = { ...job!, status: "failed", error: controller.signal.aborted ? "Conversion cancelled or timed out" : "Document conversion failed", expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() };
+        const info = timedOut ? { ...lookupError("CONVERSION_TIMEOUT"), details: { timeout_ms: this.options.conversionTimeoutMs } }
+          : controller.signal.aborted ? lookupError("CONVERSION_CANCELLED")
+          : error instanceof ServiceError && error.code === "OUTPUT_LIMIT_EXCEEDED" ? errorInfo(error) : lookupError("CONVERSION_FAILED");
+        const failed: Job = { ...job!, status: "failed", error: info.message, error_code: info.code, error_details: info.details, expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() };
         await this.save(failed); this.jobs.set(id, failed); await this.internalAudit("conversion_failed", failed);
       });
     } finally { if (timeout) clearTimeout(timeout); }
