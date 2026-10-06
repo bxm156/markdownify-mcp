@@ -1,15 +1,17 @@
-# Remote Markdownify: milestones and single-tenant MVP
+# Remote Markdownify: milestones and current delivery status
 
 Date: 2026-10-06
 Fork: https://github.com/bxm156/markdownify-mcp
 Upstream baseline: 024f97cea9a94cd842c445eea4503c442c79bd71
-Implementation branch: remote-upload-mvp
+Current branch: `main`
+Merged delivery: PR #1 (upload MVP) and PR #3 (private-agent multi-tenant service)
+Latest implementation merge: `9f21e0051912b5ead45126a66c22bebdafa313ad`
 
 ## Goal and acceptance contract
 
-An agent runtime uploads a local document directly to the hosted service, starts an asynchronous conversion through MCP, checks status later (including from another connection), and retrieves Markdown in bounded pages. The first MVP serves a single trusted tenant with a shared bearer credential. Multiple independent users must not treat it as isolated storage.
+An agent runtime uploads a local document directly to the hosted service, starts an asynchronous conversion through MCP, checks status later (including from another connection), and retrieves Markdown in bounded pages. The first MVP delivered single-tenant uploads. The current implementation adds trusted tenant/agent identities and private files and results for every agent, including agents in the same tenant. Different credentials for the same identity intentionally share ownership for rotation; provision different agent IDs for isolation.
 
-The model chooses actions; the runtime reads file bytes and performs the upload. Large binaries and base64 must not pass through model context. Native Streamable HTTP exposes /mcp; raw PUT /uploads/{id} handles binary streaming using a short-lived upload credential. LiteLLM routes MCP calls but does not proxy this binary upload endpoint.
+The model chooses actions; the runtime reads file bytes and performs the upload. Large binaries and base64 must not pass through model context. Native Streamable HTTP exposes /mcp; raw PUT /uploads/{id} handles binary streaming using the owner's active bearer credential plus a short-lived scoped upload token. LiteLLM routes MCP calls but does not proxy this binary upload endpoint.
 
 ## Architectural decisions
 
@@ -26,13 +28,13 @@ The model chooses actions; the runtime reads file bytes and performs the upload.
 
 | Milestone | Deliverables | Exit criteria |
 | --- | --- | --- |
-| M0: repository and contract | Fork, this plan, implementation branch, explicit scope | Fork verified and plan committed |
-| M1: upload and job storage | Streaming upload, private temporary directory, durable manifests, quota reservation, expiration | Tests cover exact size, oversize, invalid ID/name/token, duplicate upload, restart and cleanup |
-| M2: background conversion | MarkItDown subprocess adapter, queue, timeout/abort, saved Markdown, status and pagination | Real sample PDF/DOCX/XLSX/PPTX conversions succeed; converter failures/timeouts are reported; jobs survive connection changes |
-| M3: remote MCP | Native HTTP transport, bearer auth, create_upload/start_conversion/get_conversion_status/get_markdown/delete_job | SDK client completes upload -> start -> poll -> retrieve; auth/validation tests pass |
-| M4: first MVP packaging | Docker/Compose, environment template, agent helper, LiteLLM example, CI, operational documentation | Portable build and remote test suite pass; deployment and LiteLLM setup are documented; source published in the fork |
-| M5: deployment verification | Deploy to a selected host, configure TLS/volume/secrets/LiteLLM | Real agent through the user's LiteLLM uploads and retrieves a document; cleanup and restart observed |
-| M6: multiple tenants and private agents | Trusted identity propagation, tenant/agent ownership and quotas, isolated access, audit | Same-tenant and cross-tenant foreign access denied; container workflow passes |
+| M0: repository and contract — complete | Fork, this plan, implementation branch, explicit scope | Fork verified and plan committed |
+| M1: upload and job storage — complete | Streaming upload, private temporary directory, durable manifests, quota reservation, expiration | Tests cover exact size, oversize, invalid ID/name/token, duplicate upload, restart and cleanup |
+| M2: background conversion — complete | MarkItDown subprocess adapter, queue, timeout/abort, saved Markdown, status and pagination | Real sample PDF/DOCX/XLSX/PPTX conversions succeed; converter failures/timeouts are reported; jobs survive connection changes |
+| M3: remote MCP — complete | Native HTTP transport, bearer auth, create_upload/start_conversion/get_conversion_status/get_markdown/delete_job | SDK client completes upload -> start -> poll -> retrieve; auth/validation tests pass |
+| M4: packaging and image publication — complete | Docker/Compose, environment template, agent helper, LiteLLM example, CI, operational documentation | Portable build and remote test suite pass; deployment and LiteLLM setup are documented; source published in the fork |
+| M5: deployment verification — pending | Deploy to a selected host, configure TLS/volume/secrets/LiteLLM | Real agent through the user's LiteLLM uploads and retrieves a document; cleanup and restart observed |
+| M6: multiple tenants and private agents — complete | Trusted identity propagation, tenant/agent ownership and quotas, isolated access, audit | Same-tenant and cross-tenant foreign access denied; container workflow passes |
 | M7: scaling (deferred) | Transactional job database, shared queue/object storage, worker isolation, retries/monitoring | Multiple workers/replicas safely operate under failure |
 
 Execution scope: M0-M4 delivered the first MVP; the user subsequently authorized M6 tenant and private-agent isolation, implemented in phase 2 below. M5 requires a hosting destination and LiteLLM instance/credentials, which have not been supplied. M7 scaling remains deferred. Record actual verification rather than claiming public deployment.
@@ -47,7 +49,7 @@ Execution scope: M0-M4 delivered the first MVP; the user subsequently authorized
 ## Public API
 
 - create_upload(filename, size_bytes): returns upload_id, upload_url, headers and expires_at.
-- PUT upload_url with returned headers and raw bytes: completes the upload; no conversion is started yet.
+- PUT upload_url with owner bearer Authorization, returned X-Upload-Token and raw bytes: completes the upload; no conversion is started yet.
 - start_conversion(upload_id): returns job_id and current status, promptly and idempotently.
 - get_conversion_status(job_id): returns status and safe error information.
 - get_markdown(job_id, offset?, max_chars?): bounded text, next_offset and total_chars.
@@ -91,7 +93,7 @@ Milestones for this phase:
 2. Private operations: require both owner IDs before upload/start/status/Markdown/delete, including before cancellation and locks. Foreign and missing jobs return the same response. Upload PUT requires both active agent bearer credential and the scoped upload token.
 3. Bounded resources: global, tenant and agent job/storage admission budgets, concurrency caps, and fair queue scheduling. Keep one process per data directory; distributed workers remain M7.
 4. Audit and migration: metadata-only bounded audit logs; existing unowned jobs require one explicit operator-selected owner, with full startup validation before ownership changes.
-5. PR #1 feedback: track the actual Copilot pagination issue in [issue #2](https://github.com/bxm156/markdownify-mcp/issues/2), replace full-result allocations with indexed bounded-memory pages, and close the issue when the fix merges.
+5. PR #1 feedback: track the actual Copilot pagination issue in [issue #2](https://github.com/bxm156/markdownify-mcp/issues/2), replace full-result allocations with indexed bounded-memory pages. Issue #2 is closed following the PR #3 merge.
 6. Agent guidance: add repository `SKILL.md` with exact MCP arguments, runtime upload authentication, finite polling, code-point pagination, and private-agent constraints.
 7. Validation and publication: unit/integration attacks from same-tenant and cross-tenant agents, restart/migration/quota/fairness checks, real documents, and three-agent workflow against the Docker image in Linux CI. Publish a reviewable PR; do not merge without user authorization.
 
@@ -99,5 +101,16 @@ M5 remains pending because a hosting destination and live LiteLLM environment ha
 
 ### Phase 2 verification
 
-M6 implementation is complete in [PR #3](https://github.com/bxm156/markdownify-mcp/pull/3). [CI run 37456711823](https://github.com/bxm156/markdownify-mcp/actions/runs/37456711823) passed the portable build, 40 tests/272 assertions, real PDF and generated Office conversions, Docker image build, compatibility workflow, and three-agent same/cross-tenant isolation workflow against the running container. [Validation details](docs/MULTITENANT-VALIDATION.md) include local and container results. Issue #2 closes when PR #3 merges; the PR remains open for user review.
+M6 is complete and [PR #3](https://github.com/bxm156/markdownify-mcp/pull/3) is merged into `main` at `9f21e0051912b5ead45126a66c22bebdafa313ad`. All three review findings were addressed and resolved; [issue #2](https://github.com/bxm156/markdownify-mcp/issues/2) is closed.
+
+[Updated PR CI](https://github.com/bxm156/markdownify-mcp/actions/runs/37458767441) passed 56 tests/415 assertions, portable build, real PDF/generated DOCX/XLSX/PPTX conversions, updated Docker image build and both container workflows. [Main-branch CI](https://github.com/bxm156/markdownify-mcp/actions/runs/37459736198) also passed after merge, including authenticated upload/conversion/retrieval/deletion and three-agent same/cross-tenant isolation. [Validation history](docs/MULTITENANT-VALIDATION.md) records earlier implementation checks.
+
+[Docker Hub publication](https://github.com/bxm156/markdownify-mcp/actions/runs/37459736243) succeeded after merge, pushing the tested `linux/amd64` image to `bryanmarty/markdownify-mcp:latest` and `bryanmarty/markdownify-mcp:sha-9f21e0051912b5ead45126a66c22bebdafa313ad`. Subsequent main pushes automatically test and publish using the configured repository secrets. Publication does not deploy a public service.
+
+## Remaining work
+
+- **M5 — public deployment and live LiteLLM verification:** choose the host and public origin, provision HTTPS routing for both MCP and binary PUT uploads, mount private persistent storage and the hashed credential registry, and provision distinct agent credentials. Verify a real agent through the user's LiteLLM can upload, poll and retrieve; verify another agent cannot access the file/result; observe retention cleanup and restart behavior in that deployment. Hosting and live LiteLLM access have not been supplied.
+- **M7 — scaling, deferred:** introduce transactional job storage, shared queue/object storage, separate worker isolation and failure handling before adding replicas. The current supported topology is one server process per private data volume; application ownership is not a hostile-document parser sandbox.
+
+No unresolved review findings or open GitHub issues remained when this status was updated. The next functional milestone is M5.
 
