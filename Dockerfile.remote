@@ -6,8 +6,20 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN bun run build:remote
 
+# Install afresh so TypeScript and other development-only packages stay out of runtime.
+FROM oven/bun:1.4.2 AS production-deps
+WORKDIR /app
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --ignore-scripts --production
+
 FROM node:22-bookworm-slim AS node
 FROM python:3.12-slim-bookworm AS runtime
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.title="Markdownify remote MCP" \
+    org.opencontainers.image.description="Authenticated temporary uploads and isolated agent Markdown conversion jobs" \
+    org.opencontainers.image.source="https://github.com/bxm156/markdownify-mcp" \
+    org.opencontainers.image.revision="${VCS_REF}" \
+    org.opencontainers.image.licenses="MIT"
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
@@ -16,8 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 ca-c
     && useradd --uid 10001 --gid markdownify --create-home markdownify
 WORKDIR /app
 COPY --from=build /app/dist ./dist
-COPY --from=build /app/node_modules ./node_modules
-COPY package.json ./
+COPY --from=production-deps /app/node_modules ./node_modules
+COPY package.json LICENSE SKILL.md ./
+COPY docs/REMOTE.md docs/MULTITENANT.md docs/CONTAINERS.md docs/QUICKSTART.md ./docs/
+COPY examples/upload-and-convert.ts ./examples/upload-and-convert.ts
 RUN mkdir /data && chown 10001:10001 /data
 ENV NODE_ENV=production MD_HOST=0.0.0.0 MD_PORT=8000 MD_DATA_DIR=/data
 USER 10001:10001

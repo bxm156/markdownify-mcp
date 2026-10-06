@@ -33,3 +33,17 @@ test("audit retention is bounded through rotation and restart", async () => {
   expect(files.sort()).toEqual(["audit.jsonl", "audit.jsonl.1", "audit.jsonl.2"]);
   for (const file of files) expect((await fs.stat(path.join(dir, file))).size).toBeLessThanOrEqual(1024);
 });
+
+test("filesystem audit failure rejects the event and later writes recover without invalid records", async () => {
+  const dir = await directory(), audit = await createAuditLogger(dir);
+  const target = path.join(dir, "audit.jsonl"), saved = path.join(dir, "saved-audit.jsonl");
+  await audit({ event: "upload_created", tenant_id: "tenantA", agent_id: "agentA" });
+  await fs.rename(target, saved);
+  await fs.mkdir(target);
+  await expect(audit({ event: "job_deleted", tenant_id: "tenantA", agent_id: "agentA" })).rejects.toThrow();
+  await fs.rmdir(target);
+  await fs.rename(saved, target);
+  await audit({ event: "read_markdown", tenant_id: "tenantA", agent_id: "agentA" });
+  const records = (await fs.readFile(target, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  expect(records.map(record => record.event)).toEqual(["upload_created", "read_markdown"]);
+});

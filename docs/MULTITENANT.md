@@ -53,11 +53,11 @@ The provisioning utility atomically replaces the registry and resets its mode to
 
 Use this Compose file by itself, rather than merging it with `compose.remote.yaml`, whose environment file selects legacy-key mode. Both configurations use the same named data volume within the same Compose project. Run one process/replica per volume. Set the public HTTPS origin and configure the proxy to preserve `Authorization` and `X-Upload-Token`, route `/mcp` and `/uploads/*`, and allow PUT. Existing host/origin checks still apply.
 
-## Upload protocol change
+## Upload protocol
 
 `create_upload` returns `required_headers` containing `X-Upload-Token` and `Content-Type`. The agent runtime adds its own `Authorization: Bearer <agent credential>` when streaming the file to the direct upload origin. The server never echoes the long-lived bearer credential in tool results. Upload tokens remain short-lived, scoped to one owner and one upload, and are invalidated after successful upload.
 
-This replaces the earlier upload protocol that used the scoped token in `Authorization`. Update older clients before upgrading. The repository's runtime example follows the new protocol:
+All new clients use the agent credential in `Authorization` and the scoped token in `X-Upload-Token`. The repository's runtime example implements this protocol:
 
 ```sh
 # Direct MCP connection; load this agent's token securely.
@@ -107,9 +107,9 @@ Global limits from [REMOTE.md](REMOTE.md) still apply. The following additional 
 
 Every value must be a positive safe integer. A reservation must fit global, tenant, and agent budgets. Even a tiny upload reserves the configured maximum output size, so storage limits can bind before job-count limits. Queue scheduling skips owners that have reached their concurrency cap, allowing another eligible owner to run; global concurrency still bounds total converters. These are admission and scheduling limits, not filesystem quotas or a distributed queue.
 
-## Existing data and operations
+## Operations
 
-New manifests persist immutable owner IDs. Startup refuses old unowned manifests until the operator explicitly supplies `MD_LEGACY_OWNER='{"tenantId":"tenant-a","agentId":"agent-a"}'`. Back up the volume, stop its previous process, and choose the one principal that should own all legacy jobs before migrating. If old jobs belong to different agents, do not assign them all to one principal: expire/delete those old jobs or migrate with an operator-reviewed process. Migration preserves the existing expiration times; it does not extend retention. Remove `MD_LEGACY_OWNER` after the manifests have been migrated. There is no automatic default owner, even in legacy-key mode.
+New manifests persist immutable owner IDs. For a fresh deployment, leave `MD_LEGACY_OWNER` unset and use a new data volume. No client or data migration is required. The server retains an explicit recovery option for unowned manifests from older test deployments; assigning an owner is an operator-only operation and never happens automatically.
 
 Audit records live in `MD_DATA_DIR/audit.jsonl`, with timestamps, tenant/agent IDs, job IDs, event/status codes, and limited reason codes. They exclude filenames, document content, and bearer/upload tokens. Rotation bounds local history to a 4 MiB active file and three archives. Export metadata to your logging system if longer retention is needed. Audit metadata itself identifies agents and should have restricted operator access.
 

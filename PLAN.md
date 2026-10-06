@@ -35,7 +35,7 @@ The model chooses actions; the runtime reads file bytes and performs the upload.
 | M6: multiple tenants and private agents | Trusted identity propagation, tenant/agent ownership and quotas, isolated access, audit | Same-tenant and cross-tenant foreign access denied; container workflow passes |
 | M7: scaling (deferred) | Transactional job database, shared queue/object storage, worker isolation, retries/monitoring | Multiple workers/replicas safely operate under failure |
 
-Execution target for this task: M0-M4. M5 requires a hosting destination and LiteLLM instance/credentials, which have not been supplied. Record its actual verification state rather than claiming deployment. M6-M7 are explicitly out of scope.
+Execution scope: M0-M4 delivered the first MVP; the user subsequently authorized M6 tenant and private-agent isolation, implemented in phase 2 below. M5 requires a hosting destination and LiteLLM instance/credentials, which have not been supplied. M7 scaling remains deferred. Record actual verification rather than claiming public deployment.
 
 ## Agent work split
 
