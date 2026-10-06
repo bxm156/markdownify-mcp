@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { JobService, type JobServiceOptions } from "./jobs.js";
+import { ServiceError } from "./errors.js";
 import type { Principal } from "./identity.js";
 
 const alice: Principal = { tenantId: "team", agentId: "alice" };
@@ -109,7 +110,7 @@ process.stdout.write(JSON.stringify(ids)+'\\n');`);
 
   test("conversion failure releases scheduler capacity for another agent", async () => {
     const gate = deferred(), entered = deferred(); let calls = 0;
-    const { instance } = await service({ converter: async (input, output) => { calls++; const text = await fs.readFile(input, "utf8"); if (text === "bad") { entered.resolve(); await gate.promise; throw new Error("document rejected"); } await fs.writeFile(output, "good result"); } });
+    const { instance } = await service({ converter: async (input, output) => { calls++; const text = await fs.readFile(input, "utf8"); if (text === "bad") { entered.resolve(); await gate.promise; throw new ServiceError(422, "Document conversion failed", "CONVERSION_FAILED"); } await fs.writeFile(output, "good result"); } });
     const failed = await uploaded(instance, alice, "bad"); await instance.startConversion(alice, failed); await bounded(entered.promise);
     const good = await uploaded(instance, bob, "good"); expect((await instance.startConversion(bob, good)).status).toBe("queued");
     gate.resolve(); expect((await status(instance, alice, failed, "failed")).error).toBe("Document conversion failed");
