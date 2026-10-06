@@ -11,7 +11,7 @@ import { prepareMarkdownIndex, readMarkdownPage } from "./markdown.js";
 import { ServiceError, errorInfo, lookupError, legacyCode, type ErrorCode, type ErrorDetails } from "./errors.js";
 export { ServiceError } from "./errors.js";
 export type JobStatus = "awaiting_upload" | "uploaded" | "queued" | "running" | "completed" | "failed" | "expired";
-type Job = { tenant_id: string; agent_id: string; id: string; filename: string; extension: string; size_bytes: number; token_hash?: string; status: JobStatus; created_at: string; expires_at: string; error?: string; error_code?: ErrorCode; error_details?: ErrorDetails };
+type Job = { tenant_id: string; agent_id: string; id: string; filename: string; extension: string; size_bytes: number; token_hash?: string; upload_auth_hash?: string; status: JobStatus; created_at: string; expires_at: string; error?: string; error_code?: ErrorCode; error_details?: ErrorDetails };
 export type AuditEvent = { event: string; tenant_id: string; agent_id: string; job_id?: string; status?: string; reason?: string };
 export type JobServiceOptions = { dataDir: string; maxUploadBytes: number; maxStorageBytes: number; maxJobs: number; retentionMs: number; uploadTtlMs: number; conversionTimeoutMs: number; maxOutputBytes: number; concurrency: number; converter?: Converter; legacyOwner?: Principal; maxTenantJobs?: number; maxTenantStorageBytes?: number; maxTenantConcurrency?: number; maxAgentJobs?: number; maxAgentStorageBytes?: number; maxAgentConcurrency?: number; audit?: (event: AuditEvent) => void | Promise<void> };
 const extensions = new Set([".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".md", ".csv", ".html", ".json"]);
@@ -96,6 +96,7 @@ export class JobService {
         throw new Error(`Unreadable job manifest: ${entry.name}`);
       }
       if (job.id !== entry.name || !extensions.has(job.extension) || !Number.isSafeInteger(job.size_bytes) || job.size_bytes < 0 || !Number.isFinite(Date.parse(job.expires_at)) || !Number.isFinite(Date.parse(job.created_at)) || (job.status === "awaiting_upload" && !/^[a-f0-9]{64}$/.test(job.token_hash ?? "")) || !["awaiting_upload", "uploaded", "queued", "running", "completed", "failed", "expired"].includes(job.status)) throw new Error("Invalid job manifest");
+      if (job.upload_auth_hash !== undefined && (typeof job.upload_auth_hash !== "string" || !/^[a-f0-9]{64}$/.test(job.upload_auth_hash))) throw new Error("Invalid upload credential manifest");
       const legacy = job.tenant_id === undefined && job.agent_id === undefined;
       if (legacy) {
         if (!this.options.legacyOwner) throw new Error("Unowned legacy jobs require an explicit legacyOwner");
@@ -131,7 +132,7 @@ export class JobService {
     this.timer.unref();
     this.pump();
   }
-  async createUpload(principal: Principal, { filename, size_bytes }: { filename: string; size_bytes: number }) {
+  async createUpload(principal: Principal, { filename, size_bytes }: { filename: string; size_bytes: number }, issueUploadCredential = false) {
     this.validPrincipal(principal);
     return this.locked("registry", async () => {
       if (this.closing) throw new ServiceError(503, "Service closing");
@@ -167,13 +168,22 @@ export class JobService {
       }
       await this.audit("create_upload", principal);
       const id = randomUUID(), token = randomBytes(32).toString("base64url");
-      const job: Job = { tenant_id: principal.tenantId, agent_id: principal.agentId, id, filename, extension, size_bytes, token_hash: tokenHash(principal, id, hash(token)), status: "awaiting_upload", created_at: new Date().toISOString(), expires_at: new Date(Date.now() + this.options.uploadTtlMs).toISOString() };
+      const uploadCredential = issueUploadCredential ? randomBytes(32).toString("base64url") : undefined;
+      const job: Job = { tenant_id: principal.tenantId, agent_id: principal.agentId, id, filename, extension, size_bytes, token_hash: tokenHash(principal, id, hash(token)), status: "awaiting_upload", created_at: new Date().toISOString(), expires_at: new Date(Date.now() + (issueUploadCredential ? Math.min(this.options.uploadTtlMs, 300000) : this.options.uploadTtlMs)).toISOString() };
+      if (uploadCredential) job.upload_auth_hash = tokenHash(principal, id, hash(uploadCredential));
       await fs.mkdir(this.dir(id), { mode: 0o700 });
       try { await this.save(job); } catch (error) { await fs.rm(this.dir(id), { recursive: true, force: true }); throw error; }
       this.jobs.set(id, job);
       await this.internalAudit("create_upload_completed", job);
-      return { upload_id: id, upload_token: token, expires_at: job.expires_at };
+      return { upload_id: id, upload_token: token, expires_at: job.expires_at, ...(uploadCredential ? { upload_auth_token: uploadCredential } : {}) };
     });
+  }
+  async authenticateUpload(id: string, token: string | undefined): Promise<Principal | null> {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "awaiting_upload" || Date.parse(job.expires_at) <= Date.now() || !job.upload_auth_hash || !/^[a-f0-9]{64}$/.test(job.upload_auth_hash) || !token || token.length > 4096) return null;
+    const principal = { tenantId: job.tenant_id, agentId: job.agent_id };
+    const candidate = Buffer.from(tokenHash(principal, id, hash(token)), "hex");
+    return timingSafeEqual(candidate, Buffer.from(job.upload_auth_hash, "hex")) ? principal : null;
   }
   async upload(principal: Principal, id: string, token: string, source: Readable) {
     const owner = await this.owned(principal, id);
@@ -206,6 +216,7 @@ export class JobService {
         await fs.rename(part, this.input(job));
         const uploaded: Job = { ...job, status: "uploaded", expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() };
         delete uploaded.token_hash;
+        delete uploaded.upload_auth_hash;
         try { await this.save(uploaded); } catch (error) { await fs.rm(this.input(job), { force: true }); throw error; }
         this.jobs.set(id, uploaded);
         await this.internalAudit("upload_completed", uploaded);
@@ -339,6 +350,7 @@ export class JobService {
         await fs.rm(path.join(this.dir(id), "output.md"), { force: true });
         await fs.rm(path.join(this.dir(id), "output.md.index.json"), { force: true });
         const expired: Job = { ...job, status: "expired", expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() }; delete expired.token_hash;
+        delete expired.upload_auth_hash;
         await this.save(expired); this.jobs.set(id, expired); await this.internalAudit("job_expired", expired);
       });
     }

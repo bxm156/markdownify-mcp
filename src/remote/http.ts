@@ -37,8 +37,11 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
       }
       const upload = /^\/uploads\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(url.pathname);
       if (!upload && url.pathname !== "/mcp") { reply(response, 404, "Not found"); return; }
-      const principal = options.authenticator.authenticate(token(request));
+      const principal = upload && options.authenticator.mode === "jwt"
+        ? await service.authenticateUpload(upload[1], token(request))
+        : await options.authenticator.authenticate(token(request));
       if (!principal) { response.setHeader("WWW-Authenticate", "Bearer"); reply(response, 401, "Authorization required"); return; }
+      if (upload && options.authenticator.mode === "jwt" && !options.authenticator.isActive?.(principal)) { reply(response, 401, "Authorization required"); return; }
       if (upload) {
         if (request.method !== "PUT") { response.setHeader("Allow", "PUT"); reply(response, 405, "Method not allowed"); return; }
         const header = request.headers["x-upload-token"];

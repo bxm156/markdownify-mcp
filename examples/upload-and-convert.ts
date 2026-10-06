@@ -23,7 +23,6 @@ const gatewayKey = process.env.LITELLM_API_KEY;
 const token = process.env.MCP_TOKEN;
 const agentToken = gatewayKey ? process.env.MARKDOWNIFY_AGENT_TOKEN : token;
 if (!gatewayKey && !token) throw new Error("Set MCP_TOKEN for direct access or LITELLM_API_KEY for gateway access");
-if (!agentToken) throw new Error("Gateway mode also requires MARKDOWNIFY_AGENT_TOKEN for this agent's upstream authentication and direct upload");
 if (gatewayKey && !process.env.MARKDOWNIFY_BASE_URL) throw new Error("Gateway mode requires MARKDOWNIFY_BASE_URL for the direct binary upload origin");
 const uploadOrigin = new URL(process.env.MARKDOWNIFY_BASE_URL ?? endpoint.origin).origin;
 function permitLocalHttp(url: URL): void {
@@ -41,7 +40,7 @@ const remaining = () => {
 };
 const alias = process.env.MARKDOWNIFY_SERVER_ALIAS ?? "markdownify";
 if (!/^[A-Za-z0-9_-]{1,64}$/.test(alias)) throw new Error("Invalid MARKDOWNIFY_SERVER_ALIAS");
-const headers: Record<string, string> = gatewayKey ? { "x-litellm-api-key": `Bearer ${gatewayKey}`, [`x-mcp-${alias}-authorization`]: `Bearer ${agentToken}` } : { Authorization: `Bearer ${agentToken}` };
+const headers: Record<string, string> = gatewayKey ? { "x-litellm-api-key": `Bearer ${gatewayKey}`, ...(agentToken ? { [`x-mcp-${alias}-authorization`]: `Bearer ${agentToken}` } : {}) } : { Authorization: `Bearer ${agentToken}` };
 const client = new Client({ name: "markdownify-upload-example", version: "0.1.0" });
 const transport = new StreamableHTTPClientTransport(endpoint, { requestInit: { headers } });
 let destination: Awaited<ReturnType<typeof open>> | undefined;
@@ -70,9 +69,11 @@ try {
   const uploadUrl = new URL(upload.upload_url);
   if (uploadUrl.origin !== uploadOrigin || uploadUrl.username || uploadUrl.password || uploadUrl.search || uploadUrl.hash || !uploadUrl.pathname.startsWith("/uploads/")) throw new Error("Unexpected upload endpoint");
   const bytes = createReadStream(input);
+  const uploadAuthorization = upload.required_headers.Authorization ?? (agentToken ? `Bearer ${agentToken}` : undefined);
+  if (!uploadAuthorization) throw new Error("Server did not issue a scoped upload credential; legacy mode requires MARKDOWNIFY_AGENT_TOKEN");
   try {
     const response = await fetch(uploadUrl, {
-      method: "PUT", headers: { ...upload.required_headers, Authorization: `Bearer ${agentToken}`, "Content-Length": String(info.size) },
+      method: "PUT", headers: { ...upload.required_headers, Authorization: uploadAuthorization, "Content-Length": String(info.size) },
       body: bytes as unknown as BodyInit, duplex: "half", redirect: "error", signal: AbortSignal.timeout(remaining()),
     } as RequestInit & { duplex: "half" });
     if (!response.ok) { const payload = await response.json().catch(() => undefined); throw new Error(`Upload failed (${response.status}): ${failureMessage(payload)}`); }
