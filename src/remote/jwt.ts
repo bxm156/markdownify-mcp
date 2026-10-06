@@ -48,7 +48,7 @@ export function createJwtAuthenticator(options: { issuer: string; audience: stri
       try {
         const { payload, protectedHeader } = await jwtVerify(token, key, { algorithms: ["RS256"], issuer: options.issuer, audience: options.audience, requiredClaims: ["iss", "aud", "sub", "iat", "exp"], maxTokenAge: maxTtl, clockTolerance: 5 });
         const now = Date.now() / 1000;
-        if (typeof protectedHeader.kid !== "string" || !protectedHeader.kid || protectedHeader.kid.length > 256 || !Number.isSafeInteger(payload.iat) || !Number.isSafeInteger(payload.exp) || payload.exp! <= now || payload.exp! <= payload.iat! || payload.exp! - payload.iat! > maxTtl || payload.iat! > now + 5) return null;
+        if (payload.aud !== options.audience || typeof protectedHeader.kid !== "string" || !protectedHeader.kid || protectedHeader.kid.length > 256 || !Number.isSafeInteger(payload.iat) || !Number.isSafeInteger(payload.exp) || payload.exp! <= now || payload.exp! <= payload.iat! || payload.exp! - payload.iat! > maxTtl || payload.iat! > now + 5) return null;
         const entry = typeof payload.sub === "string" ? subjects.get(payload.sub) : undefined;
         if (!entry || entry.disabled || typeof payload.scope !== "string" || payload.scope.length > 8192) return null;
         const scopes = payload.scope.split(/\s+/).filter(Boolean);

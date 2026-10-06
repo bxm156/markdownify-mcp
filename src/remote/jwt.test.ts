@@ -31,6 +31,7 @@ test("JWT verifies signature and bounded claims, maps only configured subjects a
   const now = Math.floor(Date.now() / 1000);
   for (const payload of [{ iss: "https://other.test" }, { aud: "other" }, { exp: now - 1 }, { exp: now + 3600 }, { iat: now + 100 }, { nbf: now + 100 }, { scope: "mcp:admin" }, { exp: undefined }, { iat: undefined }, { sub: undefined }]) expect(await auth.authenticate(await signed("machine-a", payload))).toBeNull();
   for (const subject of ["unknown", "disabled", "litellm-proxy"]) expect(await auth.authenticate(await signed(subject))).toBeNull();
+  for (const aud of [[audience], [audience, "another-service"]]) expect(await auth.authenticate(await signed("machine-a", { aud }))).toBeNull();
   const other = await generateKeyPair("RS256"); expect(await auth.authenticate(await signed("machine-a", {}, other.privateKey))).toBeNull();
   expect(await auth.authenticate(await new SignJWT({ sub: "machine-a" }).setProtectedHeader({ alg: "HS256", kid: "first" }).sign(new Uint8Array(32)))).toBeNull();
   const token = await signed(); expect(await auth.authenticate(token.slice(0, -10) + "tampered")).toBeNull();
