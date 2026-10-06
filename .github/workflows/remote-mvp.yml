@@ -44,3 +44,27 @@ jobs:
             exit 1
           fi
           MCP_TOKEN="$MD_API_KEY" bun scripts/remote-http-smoke.ts
+      - name: Prepare disposable agent registry
+        run: bun scripts/create-test-agent-registry.ts "$RUNNER_TEMP/markdownify-agents.json" "$GITHUB_ENV"
+      - name: Verify container agent isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'docker rm -f -v markdownify-agents-ci >/dev/null 2>&1 || true' EXIT
+          docker run -d --name markdownify-agents-ci -p 127.0.0.1:8000:8000 \
+            -v "$RUNNER_TEMP/markdownify-agents.json:/run/markdownify-agents.json:ro" \
+            -e MD_AUTH_FILE=/run/markdownify-agents.json \
+            -e MD_PUBLIC_BASE_URL=http://localhost:8000 markdownify-remote:ci
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --max-time 1 http://localhost:8000/healthz >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            docker logs markdownify-agents-ci
+            exit 1
+          fi
+          bun scripts/multitenant-http-smoke.ts

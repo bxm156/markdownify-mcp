@@ -2,9 +2,9 @@
 
 ## Remote uploads and asynchronous conversion
 
-This fork adds a single-tenant HTTP service for uploading documents, converting them in the background, and retrieving Markdown later through MCP. Native Streamable HTTP works with LiteLLM; file bytes stream directly to the service using a short-lived upload token.
+This fork adds an HTTP service for uploading documents, converting them in the background, and retrieving Markdown later through MCP. Each authenticated agent has isolated files, with tenant and agent resource budgets. Native Streamable HTTP works with LiteLLM; file bytes stream directly to the service using an agent credential plus a short-lived upload token.
 
-See [the milestone plan](PLAN.md), [remote setup and agent example](docs/REMOTE.md), and [MVP validation](docs/MVP-VALIDATION.md). The original local stdio tools remain available. Start the hosted service with `bun run build:remote` and `bun run start:remote` after setting `MD_API_KEY` and installing the required MarkItDown extras.
+See [the milestone plan](PLAN.md), [remote setup and agent example](docs/REMOTE.md), [multiple-agent deployment](docs/MULTITENANT.md), and [MVP validation](docs/MVP-VALIDATION.md). The original local stdio tools remain available. Start the hosted service with `bun run build:remote` and `bun run start:remote` after configuring `MD_AUTH_FILE` (or `MD_API_KEY` for a single logical agent) and installing the required MarkItDown extras.
 
 ![markdownify mcp logo](logo.jpg)
 

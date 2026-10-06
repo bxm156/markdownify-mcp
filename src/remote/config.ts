@@ -1,4 +1,6 @@
 import path from "node:path";
+import { loadAuthenticator } from "./auth.js";
+import { validatePrincipal } from "./identity.js";
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const integer = (name: string, fallback: number) => {
@@ -7,8 +9,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive safe integer`);
     return value;
   };
-  const apiKey = env.MD_API_KEY ?? "";
-  if (apiKey.length < 32 || /[\s\x00-\x1f\x7f]/.test(apiKey)) throw new Error("MD_API_KEY must contain at least 32 non-whitespace characters");
+  const authenticator = loadAuthenticator(env);
+  let legacyOwner;
+  if (env.MD_LEGACY_OWNER !== undefined) {
+    try {
+      const raw = JSON.parse(env.MD_LEGACY_OWNER);
+      if (Object.keys(raw).some(key => !["tenantId", "agentId"].includes(key))) throw new Error();
+      legacyOwner = validatePrincipal(raw);
+    } catch { throw new Error("MD_LEGACY_OWNER must be a JSON object with valid tenantId and agentId"); }
+  }
   const port = integer("MD_PORT", 8000);
   if (port > 65535) throw new Error("MD_PORT must be at most 65535");
   const publicUrl = new URL(env.MD_PUBLIC_BASE_URL ?? `http://localhost:${port}`);
@@ -17,7 +26,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const allowedHosts = env.MD_ALLOWED_HOSTS?.split(",").map(value => value.trim()).filter(Boolean) ?? [publicUrl.host, `localhost:${port}`, `127.0.0.1:${port}`];
   if (!allowedHosts.length || allowedHosts.some(host => /[\s\/\\?#@]/.test(host))) throw new Error("MD_ALLOWED_HOSTS must contain comma-separated Host header values");
   return {
-    apiKey, publicBaseUrl, allowedHosts, port, host: env.MD_HOST ?? "127.0.0.1",
+    authenticator, publicBaseUrl, allowedHosts, port, host: env.MD_HOST ?? "127.0.0.1",
     jobs: {
       dataDir: path.resolve(env.MD_DATA_DIR ?? "./data"),
       maxUploadBytes: integer("MD_MAX_UPLOAD_BYTES", 25 * 1024 * 1024),
@@ -28,6 +37,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       conversionTimeoutMs: integer("MD_CONVERSION_TIMEOUT_MS", 120_000),
       maxOutputBytes: integer("MD_MAX_OUTPUT_BYTES", 25 * 1024 * 1024),
       concurrency: integer("MD_CONCURRENCY", 2),
+      maxTenantJobs: integer("MD_MAX_TENANT_JOBS", 25),
+      maxTenantStorageBytes: integer("MD_MAX_TENANT_STORAGE_BYTES", 128 * 1024 * 1024),
+      maxTenantConcurrency: integer("MD_MAX_TENANT_CONCURRENCY", 1),
+      maxAgentJobs: integer("MD_MAX_AGENT_JOBS", 10),
+      maxAgentStorageBytes: integer("MD_MAX_AGENT_STORAGE_BYTES", 128 * 1024 * 1024),
+      maxAgentConcurrency: integer("MD_MAX_AGENT_CONCURRENCY", 1),
+      legacyOwner,
     },
   };
 }
