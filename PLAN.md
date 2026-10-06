@@ -77,7 +77,7 @@ States: awaiting_upload -> uploaded -> queued -> running -> completed / failed; 
 
 ## Verification status
 
-M0-M4 are complete. Implementation is published in [PR #1](https://github.com/bxm156/markdownify-mcp/pull/1). [Linux CI run 37454606073](https://github.com/bxm156/markdownify-mcp/actions/runs/37454606073) passed the build, 20 remote tests/97 assertions, real PDF and generated Office conversions, container image build and authenticated container upload/conversion/retrieval/deletion workflow. See [MVP validation](docs/MVP-VALIDATION.md) for local results and limits. M5 (public hosting and live LiteLLM verification) remains pending; M6-M7 are deferred.
+M0-M4 are complete and PR #1 is merged. [Linux CI run 37454606073](https://github.com/bxm156/markdownify-mcp/actions/runs/37454606073) passed the build, 20 remote tests/97 assertions, real PDF and generated Office conversions, container image build and authenticated container upload/conversion/retrieval/deletion workflow. See [MVP validation](docs/MVP-VALIDATION.md) for local results and limits. M5 (public hosting and live LiteLLM verification) remains pending. M6 implementation and verification are recorded in phase 2 below; M7 remains deferred.
 
 ## Phase 2: tenant and agent isolation
 
@@ -96,4 +96,8 @@ Milestones for this phase:
 7. Validation and publication: unit/integration attacks from same-tenant and cross-tenant agents, restart/migration/quota/fairness checks, real documents, and three-agent workflow against the Docker image in Linux CI. Publish a reviewable PR; do not merge without user authorization.
 
 M5 remains pending because a hosting destination and live LiteLLM environment have not been supplied. This phase proves application-level ownership for trusted parser/runtime deployment, not hostile-document parser sandboxing or distributed execution.
+
+### Phase 2 verification
+
+M6 implementation is complete in [PR #3](https://github.com/bxm156/markdownify-mcp/pull/3). [CI run 37456711823](https://github.com/bxm156/markdownify-mcp/actions/runs/37456711823) passed the portable build, 40 tests/272 assertions, real PDF and generated Office conversions, Docker image build, compatibility workflow, and three-agent same/cross-tenant isolation workflow against the running container. [Validation details](docs/MULTITENANT-VALIDATION.md) include local and container results. Issue #2 closes when PR #3 merges; the PR remains open for user review.
 

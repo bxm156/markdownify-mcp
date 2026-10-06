@@ -20,7 +20,9 @@ PR #1 had one unresolved Copilot finding: every Markdown page loaded and expande
 
 ## Deployment checks
 
-The workflow builds the actual Docker image and runs both compatibility and three-agent isolation smoke tests. Its result will be recorded after the branch is published. Local Docker remains inaccessible through this execution sandbox; CI is the container verification path.
+[Linux CI run 37456711823](https://github.com/bxm156/markdownify-mcp/actions/runs/37456711823) passed for implementation commit `14c856fcf1c434b2176cf3c9db1b755bc873ba22`: portable build, 40 remote tests/272 assertions, real document conversions, Docker image build, compatibility upload workflow and the three-agent isolation workflow against the actual running container. The three-agent test covers private real-PDF conversion, cross-agent/cross-tenant denial for upload/start/status/read/delete, reconnects, pagination and own-job cleanup.
+
+Repository `SKILL.md` passed the bundled skill validator. A fresh agent with no implementation history used the skill and a provisioned runtime connection to convert the real PDF, save Markdown, retain its job, and independently retrieve the exact saved result. It reported no missing guidance. CI was used for container verification; no public service was deployed.
 
 Live LiteLLM identity forwarding and public TLS hosting remain unverified without the user's deployment environment. Configuration instructions have been checked against the official LiteLLM reference via Firecrawl. Application quotas exclude bounded manifest/index/audit overhead and are not filesystem quotas. One service process per private data directory remains required.
 
