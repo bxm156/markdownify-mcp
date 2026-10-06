@@ -50,3 +50,58 @@ test("real subprocess output limit remains distinct and persisted across restart
   await custom.close(); const restarted = new JobService(options); instances.push(restarted); await restarted.init();
   expect((await restarted.getStatus(actor, job.upload_id)).error_info).toEqual(status?.error_info);
 });
+
+async function failedStatus(service: JobService, id: string) {
+  for (let i = 0; i < 200; i++) {
+    const status = await service.getStatus(actor, id);
+    if (status.status === "failed") return status;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error("Conversion did not fail");
+}
+async function startTestJob(service: JobService) {
+  const job = await service.createUpload(actor, { filename: "x.txt", size_bytes: 1 });
+  await service.upload(actor, job.upload_id, job.upload_token, Readable.from(["x"]));
+  await service.startConversion(actor, job.upload_id);
+  return job.upload_id;
+}
+test("shutdown cancellation stays cancelled when cleanup crosses the conversion deadline", async () => {
+  let entered!: () => void, aborted!: () => void, release!: () => void;
+  const running = new Promise<void>(resolve => { entered = resolve; });
+  const stopped = new Promise<void>(resolve => { aborted = resolve; });
+  const cleanup = new Promise<void>(resolve => { release = resolve; });
+  const { service } = await fixture({ conversionTimeoutMs: 1000, converter: async (_input, _output, signal) => {
+    signal.addEventListener("abort", aborted, { once: true });
+    entered();
+    await cleanup;
+    signal.throwIfAborted();
+  } });
+  const id = await startTestJob(service); await running;
+  const closing = service.close();
+  try { await stopped; await new Promise(resolve => setTimeout(resolve, 1100)); }
+  finally { release(); await closing; }
+  expect((await service.getStatus(actor, id)).error_info?.code).toBe("CONVERSION_CANCELLED");
+});
+for (const mode of ["document", "missing-executable", "index"] as const) {
+  test(`conversion failure classification and safe persisted guidance: ${mode}`, async () => {
+    const { createConverter } = await import("./converter.js");
+    const { service, options } = await fixture({ converter: mode === "index"
+      ? async (_input, output) => { await fs.writeFile(output, "ok"); await fs.mkdir(path.join(path.dirname(output), "output.md.index.json")); }
+      : async (input, output, signal) => {
+        const source = mode === "document" ? path.join(path.dirname(input), "failure.js") : input;
+        if (mode === "document") await fs.writeFile(source, "process.exit(2)");
+        await createConverter({ maxOutputBytes: 10, executable: mode === "document" ? process.execPath : path.join(path.dirname(input), "private-missing-converter") })(source, output, signal);
+      }
+    });
+    const id = await startTestJob(service);
+    const status = await failedStatus(service, id);
+    const code = mode === "document" ? "CONVERSION_FAILED" : "INTERNAL_ERROR";
+    expect(status.error_info?.code).toBe(code);
+    expect(status.error_info?.next_steps).toEqual(lookupError(code).next_steps);
+    expect(JSON.stringify(status)).not.toContain("private-missing-converter");
+    expect(JSON.stringify(status)).not.toContain(options.dataDir);
+    await service.close();
+    const restarted = new JobService(options); instances.push(restarted); await restarted.init();
+    expect((await restarted.getStatus(actor, id)).error_info).toEqual(status.error_info);
+  });
+}

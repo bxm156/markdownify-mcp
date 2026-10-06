@@ -295,7 +295,7 @@ export class JobService {
         if (value.status !== "queued") throw new Error("Job is no longer queued");
         const running: Job = { ...value, status: "running" }; await this.save(running); this.jobs.set(id, running); return running;
       });
-      timeout = setTimeout(() => { timedOut = true; controller.abort(); }, this.options.conversionTimeoutMs);
+      timeout = setTimeout(() => { if (!controller.signal.aborted) { timedOut = true; controller.abort(); } }, this.options.conversionTimeoutMs);
       await this.converter(this.input(job), part, controller.signal);
       controller.signal.throwIfAborted();
       if ((await fs.stat(part)).size > this.options.maxOutputBytes) throw new ServiceError(413, "Converted Markdown exceeds output limit", "OUTPUT_LIMIT_EXCEEDED", { limit_bytes: this.options.maxOutputBytes });
@@ -321,7 +321,7 @@ export class JobService {
         await fs.rm(part, { force: true });
         const info = timedOut ? { ...lookupError("CONVERSION_TIMEOUT"), details: { timeout_ms: this.options.conversionTimeoutMs } }
           : controller.signal.aborted ? lookupError("CONVERSION_CANCELLED")
-          : error instanceof ServiceError && error.code === "OUTPUT_LIMIT_EXCEEDED" ? errorInfo(error) : lookupError("CONVERSION_FAILED");
+          : error instanceof ServiceError && (error.code === "OUTPUT_LIMIT_EXCEEDED" || error.code === "CONVERSION_FAILED") ? errorInfo(error) : lookupError("INTERNAL_ERROR");
         const failed: Job = { ...job!, status: "failed", error: info.message, error_code: info.code, error_details: info.details, expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() };
         await this.save(failed); this.jobs.set(id, failed); await this.internalAudit("conversion_failed", failed);
       });

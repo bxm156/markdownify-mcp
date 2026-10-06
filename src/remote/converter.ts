@@ -20,7 +20,7 @@ export function createConverter(options: { maxOutputBytes: number; projectRoot?:
     signal.addEventListener("abort", stop, { once: true });
     const exited = new Promise<void>((resolve, reject) => {
       child.once("error", reject);
-      child.once("close", (code) => code === 0 ? resolve() : reject(new Error("Document conversion failed")));
+      child.once("close", (code) => code === 0 ? resolve() : reject(new ServiceError(422, "Document conversion failed", "CONVERSION_FAILED")));
     });
     const limit = new Transform({ transform(chunk, _encoding, callback) {
       bytes += chunk.length;
