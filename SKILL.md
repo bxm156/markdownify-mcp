@@ -28,6 +28,22 @@ The model cannot transfer a file by naming its local path. The runtime must read
 
 HTTP 401 means authentication failed; 404 means unknown or unauthorized. Never probe using another credential. HTTP 409 means conflicting state or Markdown not ready; 410 means expired; 507 means capacity exhausted. MCP failures use `isError` with a message, not necessarily an HTTP status. Stop on audit unavailability or repeated failures; report a sanitized error and preserve useful job IDs.
 
+## Recover from errors
+
+Tool failures (`isError: true`) contain JSON text with `error` and `error_info`. HTTP upload errors use the same body. A successful status call may report `status: failed` with `error_info`; that is a terminal conversion failure, so stop polling. `error_info` contains `code`, `message`, `retryable`, `next_steps`, and optional numeric/configured `details`.
+
+Call `lookup_error({"code":"OUTPUT_LIMIT_EXCEEDED"})` for code meanings and recovery steps. This lookup is static: use the original error's `details` for actual limits. Unknown codes return `UNKNOWN_ERROR_CODE`, not guessed guidance. `retryable: true` permits a bounded retry only after the stated preconditions; `false` requires changed input, capacity or operator intervention. Never loop indefinitely or change another agent's credentials.
+
+- `FILE_TOO_LARGE`: reduce/split the file to `details.limit_bytes`; recompute its byte count before a new reservation.
+- `JOB_LIMIT_EXCEEDED` / `STORAGE_LIMIT_EXCEEDED`: delete only your own known unneeded jobs when authorized, wait for retention expiry, or ask the operator about the reported scope. A storage reservation includes input plus maximum output; no other agent's usage is exposed.
+- `UPLOAD_SIZE_MISMATCH`: send exactly the declared bytes to a still-valid awaiting-upload reservation, or reserve the corrected file again. After an interruption, check status before retrying PUT.
+- `OUTPUT_LIMIT_EXCEEDED` / `CONVERSION_TIMEOUT`: stop polling, reduce/split the source or ask the operator to change the relevant limit. Submit a new upload for another attempt; `start_conversion` does not restart failed jobs.
+- `CONVERSION_INTERRUPTED`: after service recovery, create a new upload with bounded retries. `CONVERSION_FAILED` does not disclose parser stderr; check the document and report the code/job ID to the operator.
+- `MARKDOWN_NOT_READY`: check status, start an uploaded job if needed, or poll queued/running work with a finite deadline. Concurrency caps queue work; they are not errors requiring new jobs.
+- `AUDIT_UNAVAILABLE`, authentication and unexpected internal failures: stop and involve the operator; preserve IDs and sanitized codes, never credentials or raw document diagnostics.
+
+See [error reference](docs/ERRORS.md) for response examples and limits. The runtime helper prints known recovery guidance and numeric limits without echoing arbitrary server diagnostics.
+
 ## Runtime helper
 
 Run `bun examples/upload-and-convert.ts input.docx output.md`. It preserves existing output files. Set `MCP_URL` and `MCP_TOKEN` for direct access. Gateway mode requires `LITELLM_API_KEY`, `MARKDOWNIFY_AGENT_TOKEN`, and `MARKDOWNIFY_BASE_URL`; `MARKDOWNIFY_SERVER_ALIAS` defaults to `markdownify`. The helper leaves remote jobs to expire automatically.

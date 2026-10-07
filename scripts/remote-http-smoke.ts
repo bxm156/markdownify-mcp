@@ -22,7 +22,9 @@ async function call<T>(name: string, args: Record<string, unknown>): Promise<T> 
 try {
   await client.connect(transport, { timeout: 30000 });
   const listed = await client.listTools();
-  for (const name of ["create_upload", "start_conversion", "get_conversion_status", "get_markdown", "delete_job"]) assert(listed.tools.some(tool => tool.name === name), `Missing ${name}`);
+  for (const name of ["create_upload", "start_conversion", "get_conversion_status", "get_markdown", "delete_job", "lookup_error"]) assert(listed.tools.some(tool => tool.name === name), `Missing ${name}`);
+  const guidance = await call<{ code: string; next_steps: string[] }>("lookup_error", { code: "OUTPUT_LIMIT_EXCEEDED" });
+  assert.equal(guidance.code, "OUTPUT_LIMIT_EXCEEDED"); assert(guidance.next_steps.length > 0);
   const fixture = path.resolve("src/sample-data/test.pdf");
   const upload = await call<{ upload_id: string; upload_url: string; required_headers: Record<string, string> }>("create_upload", { filename: "test.pdf", size_bytes: (await stat(fixture)).size });
   jobId = upload.upload_id;

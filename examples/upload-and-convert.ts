@@ -4,6 +4,17 @@ import { open, stat } from "node:fs/promises";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { lookupError } from "../src/remote/errors.js";
+
+function failureMessage(payload: any): string {
+  // Render only locally known guidance and whitelisted numeric limits. Never
+  // echo arbitrary upstream messages, filenames, credentials or raw payloads.
+  const info = lookupError(typeof payload?.error_info?.code === "string" ? payload.error_info.code : "INTERNAL_ERROR");
+  const limits = ["limit_bytes", "requested_bytes", "reserved_bytes", "limit_jobs", "timeout_ms"]
+    .filter(key => Number.isSafeInteger(payload?.error_info?.details?.[key]) && payload.error_info.details[key] >= 0)
+    .map(key => `${key}=${payload.error_info.details[key]}`);
+  return `${info.code}: ${info.message}${limits.length ? ` (${limits.join(", ")})` : ""}. ${info.next_steps.join(" ")}`;
+}
 
 const [input, output] = process.argv.slice(2);
 if (!input || !output) throw new Error("Usage: bun examples/upload-and-convert.ts input.docx output.md");
@@ -51,8 +62,8 @@ try {
   async function call<T>(name: string, args: Record<string, unknown>): Promise<T> {
     const result = await client.callTool({ name: names.get(name)!, arguments: args }, undefined, { timeout: Math.min(30000, remaining()) });
     // Do not log raw tool output: create_upload contains a scoped credential.
-    if (result.isError) throw new Error(`${name} failed`);
     const text = (result.content as Array<{ type: string; text?: string }>).filter(c => c.type === "text").map(c => c.text ?? "").join("");
+    if (result.isError) { let payload; try { payload = JSON.parse(text); } catch {} throw new Error(`${name}: ${failureMessage(payload)}`); }
     return JSON.parse(text) as T;
   }
   const upload = await call<{ upload_id: string; upload_url: string; required_headers: Record<string, string> }>("create_upload", { filename: path.basename(input), size_bytes: info.size });
@@ -64,16 +75,16 @@ try {
       method: "PUT", headers: { ...upload.required_headers, Authorization: `Bearer ${agentToken}`, "Content-Length": String(info.size) },
       body: bytes as unknown as BodyInit, duplex: "half", redirect: "error", signal: AbortSignal.timeout(remaining()),
     } as RequestInit & { duplex: "half" });
-    if (!response.ok) throw new Error(`Upload failed (${response.status})`);
+    if (!response.ok) { const payload = await response.json().catch(() => undefined); throw new Error(`Upload failed (${response.status}): ${failureMessage(payload)}`); }
     await response.arrayBuffer();
   } finally { bytes.destroy(); }
   const { job_id } = await call<{ job_id: string }>("start_conversion", { upload_id: upload.upload_id });
   console.log(`Conversion queued: ${job_id}`);
   let delay = 500;
   for (;;) {
-    const status = await call<{ status: string }>("get_conversion_status", { job_id });
+    const status = await call<{ status: string; error_info?: unknown }>("get_conversion_status", { job_id });
     if (status.status === "completed") break;
-    if (["failed", "expired"].includes(status.status)) throw new Error(`Conversion ${status.status}`);
+    if (["failed", "expired"].includes(status.status)) throw new Error(`Conversion ${status.status}: ${failureMessage(status)}`);
     await new Promise(resolve => setTimeout(resolve, Math.min(delay, remaining())));
     delay = Math.min(delay * 1.5, 5000);
   }

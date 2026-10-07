@@ -172,8 +172,9 @@ For direct tool use, follow [SKILL.md](SKILL.md):
 | Poll | `get_conversion_status` | `{"job_id":"<job_id>"}` until `completed` or failure, with a finite deadline |
 | Retrieve | `get_markdown` | `{"job_id":"<job_id>","offset":0,"max_chars":50000}`; follow `next_offset` until null |
 | Clean up | `delete_job` | `{"job_id":"<job_id>"}` when the saved result and requested retention permit deletion |
+| Explain a failure | `lookup_error` | `{"code":"OUTPUT_LIMIT_EXCEEDED"}` for recovery steps; actual limits are in the original error |
 
-Check MCP `isError` before parsing JSON from text result blocks. Pagination offsets count Unicode code points. One job is one file upload, its conversion state and its result. Preserve the job ID for later retrieval; another agent cannot use it. Scanned PDFs do not carry an OCR guarantee.
+Check MCP `isError` before parsing JSON from text result blocks. Failures include `error_info` with a stable code, recovery steps, retry guidance and applicable limits. Failed status results also include `error_info`; stop polling and follow that guidance. Use `lookup_error` for explanations; see [error recovery](docs/ERRORS.md). Pagination offsets count Unicode code points. One job is one file upload, its conversion state and its result. Preserve the job ID for later retrieval; another agent cannot use it. Scanned PDFs do not carry an OCR guarantee.
 
 ## Configure agent clients
 
@@ -230,7 +231,7 @@ Add to `.cursor/mcp.json` for a project, or `~/.cursor/mcp.json` globally:
 }
 ```
 
-Cursor uses `${env:NAME}` interpolation. Enable the server in its MCP settings and confirm the five job tools are available. [Official Cursor MCP documentation](https://cursor.com/docs/mcp).
+Cursor uses `${env:NAME}` interpolation. Enable the server in its MCP settings and confirm the six remote tools are available. [Official Cursor MCP documentation](https://cursor.com/docs/mcp).
 
 ### VS Code / GitHub Copilot, local extension session
 
@@ -321,7 +322,7 @@ bun test src/remote
 
 CI tests every push and PR, including real PDF/Office conversions, Docker builds and three-agent isolation. Main-branch publication tests the image before pushing `latest` and commit-SHA tags to Docker Hub. See [containers](docs/CONTAINERS.md), [validation history](docs/MULTITENANT-VALIDATION.md) and [milestones](PLAN.md).
 
-The upstream local stdio entry point remains `dist/index.js` (`bun start`) with local-path and web conversion tools. It is separate from the remote `dist/remote/index.js` service and its five job tools. Local mode needs its own Python/dependency setup; the original `Dockerfile` builds stdio mode, while `Dockerfile.remote` builds the service documented here.
+The upstream local stdio entry point remains `dist/index.js` (`bun start`) with local-path and web conversion tools. It is separate from the remote `dist/remote/index.js` service and its six remote tools. Local mode needs its own Python/dependency setup; the original `Dockerfile` builds stdio mode, while `Dockerfile.remote` builds the service documented here.
 
 ## Further documentation
 

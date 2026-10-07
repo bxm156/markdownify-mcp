@@ -4,14 +4,15 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { JobService, ServiceError } from "./jobs.js";
 import { createRemoteServer } from "./mcp.js";
 import type { Authenticator } from "./auth.js";
+import { errorResponse } from "./errors.js";
 
 export interface HttpOptions { authenticator: Authenticator; publicBaseUrl: string; allowedHosts?: string[] }
 const MAX_JSON_BYTES = 1024 * 1024;
 
-function reply(response: ServerResponse, status: number, message: string): void {
+function reply(response: ServerResponse, status: number, message: string, error?: unknown): void {
   if (response.headersSent) { response.destroy(); return; }
   response.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
-  response.end(JSON.stringify({ error: message }));
+  response.end(JSON.stringify(errorResponse(error ?? new ServiceError(status, message, status === 401 ? "AUTH_REQUIRED" : "REQUEST_REJECTED"))));
 }
 function token(request: IncomingMessage): string | undefined {
   const value = request.headers.authorization;
@@ -80,7 +81,7 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
       await mcp.connect(transport);
       await transport.handleRequest(request, response, body);
     } catch (error) {
-      reply(response, error instanceof ServiceError ? error.statusCode : 500, error instanceof ServiceError ? error.message : "Request failed");
+      reply(response, error instanceof ServiceError ? error.statusCode : 500, "Operation failed", error);
     }
   });
   server.requestTimeout = 60_000;

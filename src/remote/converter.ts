@@ -3,6 +3,7 @@ import { createWriteStream } from "node:fs";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { resolveMarkitdownPath } from "../utils.js";
+import { ServiceError } from "./errors.js";
 
 export type Converter = (inputPath: string, outputPath: string, signal: AbortSignal) => Promise<void>;
 
@@ -19,11 +20,11 @@ export function createConverter(options: { maxOutputBytes: number; projectRoot?:
     signal.addEventListener("abort", stop, { once: true });
     const exited = new Promise<void>((resolve, reject) => {
       child.once("error", reject);
-      child.once("close", (code) => code === 0 ? resolve() : reject(new Error("Document conversion failed")));
+      child.once("close", (code) => code === 0 ? resolve() : reject(new ServiceError(422, "Document conversion failed", "CONVERSION_FAILED")));
     });
     const limit = new Transform({ transform(chunk, _encoding, callback) {
       bytes += chunk.length;
-      callback(bytes > options.maxOutputBytes ? new Error("Converted Markdown exceeds output limit") : null, chunk);
+      callback(bytes > options.maxOutputBytes ? new ServiceError(413, "Converted Markdown exceeds output limit", "OUTPUT_LIMIT_EXCEEDED", { limit_bytes: options.maxOutputBytes }) : null, chunk);
     } });
     const streamed = pipeline(child.stdout, limit, createWriteStream(outputPath, { flags: "wx", mode: 0o600 }));
     try {

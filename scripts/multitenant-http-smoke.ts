@@ -23,7 +23,8 @@ async function call<T>(agent: Agent, name: string, args: Record<string, unknown>
 async function denied(agent: Agent, name: string, args: Record<string, unknown>) {
   const result = await agent.client.callTool({ name, arguments: args }, undefined, { timeout: 30000 });
   assert.equal(result.isError, true, `${agent.name}: foreign ${name} succeeded`);
-  assert.deepEqual(result.content, [{ type: "text", text: "Job not found" }], "Foreign access must not disclose state");
+  const text = (result.content as Array<{ type: string; text?: string }>).filter(item => item.type === "text").map(item => item.text ?? "").join("");
+  assert.equal(JSON.parse(text).error_info.code, "JOB_NOT_FOUND", "Foreign access must not disclose state");
 }
 try {
   for (const name of ["a", "b", "c"]) {

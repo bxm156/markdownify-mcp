@@ -38,11 +38,29 @@ async function fixture() {
 }
 function parsed(result: any): any { expect(result.isError).not.toBe(true); return JSON.parse(result.content[0].text); }
 
+test("SDK error envelopes and static lookup guide recovery without disclosing foreign jobs", async () => {
+  const { client, request, options } = await fixture(); const a = await client(), b = await client("agent-b-secret");
+  const listed = await a.listTools(); expect(listed.tools.every(tool => tool.description && tool.description.length > 80)).toBe(true);
+  const tooLarge = await a.callTool({ name: "create_upload", arguments: { filename: "x.pdf", size_bytes: 100001 } });
+  expect(tooLarge.isError).toBe(true);
+  const failure = JSON.parse((tooLarge.content as any)[0].text);
+  expect(failure.error_info).toMatchObject({ code: "FILE_TOO_LARGE", retryable: false, details: { limit_bytes: 100000, requested_bytes: 100001 } });
+  const guidance = parsed(await a.callTool({ name: "lookup_error", arguments: { code: failure.error_info.code } }));
+  expect(guidance.next_steps.join(" ")).toContain("split");
+  expect((await a.callTool({ name: "lookup_error", arguments: { code: "__proto__" } })).isError).toBe(true);
+  const upload = parsed(await a.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } }));
+  const foreign = await b.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } });
+  const missing = await b.callTool({ name: "get_conversion_status", arguments: { job_id: crypto.randomUUID() } });
+  expect(foreign.content).toEqual(missing.content);
+  const excess = await request(`/uploads/${upload.upload_id}`, { method: "PUT", headers: { ...upload.required_headers, Authorization: `Bearer ${options.apiKey}` }, body: "too long" });
+  expect(excess.status).toBe(413); expect((await excess.json() as any).error_info.code).toBe("UPLOAD_SIZE_MISMATCH");
+});
+
 test("stateless SDK clients can upload, convert, poll and retrieve across reconnects", async () => {
   const { client, request, base, options } = await fixture();
   const first = await client();
   const tools = await first.listTools();
-  expect(tools.tools.map(tool => tool.name).sort()).toEqual(["create_upload", "delete_job", "get_conversion_status", "get_markdown", "start_conversion"]);
+  expect(tools.tools.map(tool => tool.name).sort()).toEqual(["create_upload", "delete_job", "get_conversion_status", "get_markdown", "lookup_error", "start_conversion"]);
   const upload = parsed(await first.callTool({ name: "create_upload", arguments: { filename: "example.txt", size_bytes: 5 } }));
   expect(upload.upload_url).toBe(`${base}/uploads/${upload.upload_id}`);
   await first.close();
@@ -132,13 +150,13 @@ test("each authenticated agent is isolated even within the same tenant", async (
     for (const [name, arguments_] of [["start_conversion", { upload_id: upload.upload_id }], ["get_conversion_status", { job_id: upload.upload_id }], ["get_markdown", { job_id: upload.upload_id }], ["delete_job", { job_id: upload.upload_id }]] as const) {
       const response = await foreign.callTool({ name, arguments: arguments_ });
       expect(response.isError).toBe(true);
-      expect((response.content as any)[0].text).toBe("Job not found");
+      expect(JSON.parse((response.content as any)[0].text).error).toBe("Job not found");
     }
   }
   for (const credential of ["agent-b-secret", "other-tenant-secret"]) {
     const denied = await request(`/uploads/${upload.upload_id}`, { method: "PUT", headers: { ...upload.required_headers, Authorization: `Bearer ${credential}`, "X-Tenant-Id": "tenant", "X-Agent-Id": "a" }, body: "abc" });
     expect(denied.status).toBe(404);
-    expect(await denied.json()).toEqual({ error: "Job not found" });
+    expect(await denied.json()).toMatchObject({ error: "Job not found", error_info: { code: "JOB_NOT_FOUND" } });
   }
   expect((await request(`/uploads/${upload.upload_id}`, { method: "PUT", headers: upload.required_headers, body: "abc" })).status).toBe(401);
   expect((await request(`/uploads/${upload.upload_id}`, { method: "PUT", headers: { ...upload.required_headers, Authorization: `Bearer ${options.apiKey}` }, body: "abc" })).status).toBe(204);
@@ -154,7 +172,7 @@ test("each authenticated agent is isolated even within the same tenant", async (
   for (const foreign of [sibling, outsider]) {
     const result = await foreign.callTool({ name: "get_markdown", arguments: { job_id: upload.upload_id } });
     expect(result.isError).toBe(true);
-    expect((result.content as any)[0].text).toBe("Job not found");
+    expect(JSON.parse((result.content as any)[0].text).error).toBe("Job not found");
   }
 });
 
@@ -164,6 +182,6 @@ test("tool arguments cannot override authenticated identity", async () => {
   for (const identity of [{ tenant_id: "tenant", agent_id: "a" }, { principal: { tenantId: "tenant", agentId: "a" } }]) {
     const response = await agent.callTool({ name: "create_upload", arguments: { filename: "file.txt", size_bytes: 1, ...identity } });
     expect(response.isError).toBe(true);
-    expect((response.content as any)[0].text).toBe("Invalid tool arguments");
+    expect(JSON.parse((response.content as any)[0].text).error).toBe("Invalid tool arguments");
   }
 });
