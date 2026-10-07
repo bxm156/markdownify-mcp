@@ -28,6 +28,10 @@ MCP controls the job; the runtime transfers the bytes. Connecting an MCP client 
 
 ## Install the server
 
+For agents using LiteLLM, the recommended authentication is now [short-lived LiteLLM-signed JWTs](docs/JWT.md), using its open-source outbound signer and a distinct machine user per agent. This requires no Enterprise gateway JWT login. Follow that guide for `compose.jwt.yaml`, subject mappings and gateway client configuration. Binary uploads receive separate one-job credentials valid for at most five minutes.
+
+The steps below remain the standalone per-agent credential-registry alternative. Their direct-client examples use registry tokens; use the gateway examples in the JWT guide for the recommended setup.
+
 ### 1. Get the provisioning tools
 
 Install Docker with Compose, Git and Bun 1.4.2. The server image includes Node, Python and MarkItDown; the host does not need a Python installation. Bun runs the credential utility and optional client helper.

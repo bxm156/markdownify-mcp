@@ -114,3 +114,16 @@ M6 is complete and [PR #3](https://github.com/bxm156/markdownify-mcp/pull/3) is 
 
 No unresolved review findings or open GitHub issues remained when this status was updated. The next functional milestone is M5.
 
+## Phase 3: agent recovery and short-lived authentication
+
+PR #4 adds structured error codes, numeric limits, recovery guidance, lookup_error and descriptions for all six tools. It passed 65 remote tests and Docker CI and remains independently reviewable.
+
+The user authorized replacing long-lived Markdownify agent keys with a LiteLLM-compatible approach that requires no Enterprise license. The JWT implementation is based on PR #4's agent-error-guidance branch:
+
+1. Verify short-lived RS256 JWTs using a pinned LiteLLM public JWKS, exact issuer/audience, bounded expiry/age and tool scopes. Reject unsafe URLs, unsigned/expired/wrong-audience tokens and unknown/disabled subjects. No Enterprise enable_jwt_auth gateway login is used.
+2. Map verified subjects through an operator-managed allowlist to existing tenant/agent IDs. Distinct LiteLLM machine users preserve private files; virtual-key rotation for one stable user preserves ownership.
+3. Issue separate one-job upload credentials, hashed at rest, consumed on successful PUT and capped at five minutes. Grants cannot call MCP or upload another job; disabled owners are denied after map reload.
+4. Provide JWT Compose/environment templates, client examples, updated skill/helper and Docker-bundled guidance. Registry mode stays an explicit standalone alternative with no automatic fallback from JWT verification.
+5. Validate malformed tokens, scope enforcement, same/cross-tenant isolation, key rotation, restart, revocation, upload-grant expiry/replay and bounded JWKS retrieval. Compiled-Node/real-PDF smoke also covers the gateway-only helper.
+
+LiteLLM 1.104.0's actual guardrail initializer and per-agent signer executed locally with LITELLM_LICENSE unset. Its tokens/public keys passed the compiled Node service, real three-agent PDF conversions and upload/helper checks. This proves signer compatibility without an Enterprise license; the user's full live gateway/admission/deployment remains M5. Distributed execution remains M7. See docs/JWT.md for configuration and operational limits.

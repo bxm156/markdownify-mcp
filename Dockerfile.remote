@@ -30,7 +30,7 @@ WORKDIR /app
 COPY --from=build /app/dist ./dist
 COPY --from=production-deps /app/node_modules ./node_modules
 COPY package.json LICENSE SKILL.md ./
-COPY docs/REMOTE.md docs/MULTITENANT.md docs/CONTAINERS.md docs/QUICKSTART.md docs/ERRORS.md ./docs/
+COPY docs/REMOTE.md docs/MULTITENANT.md docs/CONTAINERS.md docs/QUICKSTART.md docs/ERRORS.md docs/JWT.md ./docs/
 COPY examples/upload-and-convert.ts ./examples/upload-and-convert.ts
 RUN mkdir /data && chown 10001:10001 /data
 ENV NODE_ENV=production MD_HOST=0.0.0.0 MD_PORT=8000 MD_DATA_DIR=/data

@@ -1,8 +1,10 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DEFAULT_PRINCIPAL, validatePrincipal, type Principal } from "./identity.js";
+import { loadJwtAuthenticator } from "./jwt.js";
 
-export interface Authenticator { authenticate(token: string | undefined): Principal | null }
+export type AuthenticatedPrincipal = Principal & { scopes?: readonly string[]; toolPrefix?: string };
+export interface Authenticator { mode?: "jwt"; isActive?(principal: Principal): boolean; authenticate(token: string | undefined): AuthenticatedPrincipal | null | Promise<AuthenticatedPrincipal | null> }
 export function hashToken(token: string): string { return createHash("sha256").update(token, "utf8").digest("hex"); }
 
 export function createAuthenticator(registry: unknown): Authenticator {
@@ -33,6 +35,7 @@ export function createAuthenticator(registry: unknown): Authenticator {
 }
 
 export function loadAuthenticator(env: NodeJS.ProcessEnv = process.env): Authenticator {
+  if (Object.keys(env).some(name => name.startsWith("MD_JWT_"))) return loadJwtAuthenticator(env);
   if (env.MD_AUTH_FILE !== undefined) {
     if (!env.MD_AUTH_FILE || env.MD_API_KEY !== undefined) throw new Error("MD_AUTH_FILE requires a path and cannot be combined with MD_API_KEY");
     let registry: unknown;

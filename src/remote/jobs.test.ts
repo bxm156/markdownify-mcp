@@ -93,23 +93,29 @@ describe("durable single tenant jobs", () => {
     await waitFor(restarted, queued.upload_id, "completed");
   });
   test("expiry erases uploaded bytes and releases reservations", async () => {
-    const { instance, options } = await service({ retentionMs: 20, maxJobs: 1 });
+    const { instance, options } = await service({ retentionMs: 1000, maxJobs: 1 });
     const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
     await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"]));
-    await new Promise(resolve => setTimeout(resolve, 35)); await instance.cleanup();
-    await expect(instance.getStatus(principal, job.upload_id)).rejects.toMatchObject({ statusCode: 410 });
-    expect(await fs.readdir(path.join(options.dataDir, job.upload_id))).toEqual(["job.json"]);
+    const uploaded = await instance.getStatus(principal, job.upload_id);
+    expect(await fs.readFile(path.join(options.dataDir, job.upload_id, "input.txt"), "utf8")).toBe("a");
+    await new Promise(resolve => setTimeout(resolve, Math.max(0, Date.parse(uploaded.expires_at) - Date.now()) + 10)); await instance.cleanup();
+    const unavailable = await instance.getStatus(principal, job.upload_id).catch(error => error);
+    // The periodic sweep may already remove the tombstone; both states deny
+    // access and must leave no input/output while freeing admission capacity.
+    expect([404, 410]).toContain(unavailable.statusCode);
+    const remaining = await fs.readdir(path.join(options.dataDir, job.upload_id)).catch(error => { if (error.code === "ENOENT") return []; throw error; });
+    expect(remaining.every(name => name === "job.json")).toBe(true);
     await instance.createUpload(principal, { filename: "b.txt", size_bytes: 1 });
   });
   test("running jobs are retained beyond retention and deletion waits for converter termination", async () => {
     let stopped = false;
-    const { instance, options } = await service({ retentionMs: 20, converter: async (_input, _output, signal) => {
+    const { instance, options } = await service({ retentionMs: 1000, conversionTimeoutMs: 5000, converter: async (_input, _output, signal) => {
       await new Promise<void>(resolve => signal.addEventListener("abort", () => setTimeout(() => { stopped = true; resolve(); }, 20), { once: true }));
     } });
     const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
     await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"]));
-    await instance.startConversion(principal, job.upload_id); await waitFor(instance, job.upload_id, "running");
-    await new Promise(resolve => setTimeout(resolve, 30)); await instance.cleanup();
+    await instance.startConversion(principal, job.upload_id); const running = await waitFor(instance, job.upload_id, "running");
+    await new Promise(resolve => setTimeout(resolve, Math.max(0, Date.parse(running.expires_at) - Date.now()) + 10)); await instance.cleanup();
     expect((await instance.getStatus(principal, job.upload_id)).status).toBe("running");
     await instance.deleteJob(principal, job.upload_id); expect(stopped).toBe(true);
     await expect(fs.stat(path.join(options.dataDir, job.upload_id))).rejects.toThrow();

@@ -13,6 +13,8 @@ Use this skill when the user wants files converted through an available Markdown
 
 Have the runtime supply this agent's credential; keep credentials out of prompts and logs. Direct MCP uses `Authorization: Bearer <agent credential>`. Through LiteLLM, use the configured gateway credentials and per-server authorization forwarding described in [multi-agent deployment](docs/MULTITENANT.md).
 
+In recommended [LiteLLM JWT mode](docs/JWT.md), the runtime supplies only its own LiteLLM virtual key; LiteLLM signs MCP requests automatically. No Markdownify long-lived key or per-server credential forwarding is needed. Identity is mapped from the verified JWT subject, never selected by tool arguments. The upload response includes a separate short-lived Authorization header: use it together with X-Upload-Token for that job only. Never substitute the gateway key or a JWT for this scoped upload credential. Neither returned credential is reusable on MCP or after upload/expiry.
+
 Discover available tool names with `listTools`; gateways may prefix names. Select the configured server rather than guessing among duplicate tools. Tool results place JSON in text content blocks: check `isError` first, then concatenate text blocks and parse JSON.
 
 The model cannot transfer a file by naming its local path. The runtime must read and upload bytes. If the runtime cannot access the file or perform HTTP uploads, report that missing capability. Do not fabricate a completed upload, send base64 in tool arguments, or substitute another agent's credential.
@@ -20,7 +22,7 @@ The model cannot transfer a file by naming its local path. The runtime must read
 ## Convert a file
 
 1. Reserve using `create_upload({"filename":"report.pdf","size_bytes":12345})`. Use the actual byte count and basename. The response contains `upload_id`, `upload_url`, `expires_at`, and `required_headers`.
-2. Validate that the upload URL uses the configured Markdownify origin and HTTPS for remote hosts; local development may use loopback HTTP. Reject redirects and credential-bearing URLs. Stream the file with HTTP `PUT`, the returned `X-Upload-Token` and `Content-Type`, plus this agent's own `Authorization: Bearer <agent credential>`. Do not treat an HTTP failure as a successful upload.
+2. Validate that the upload URL uses the configured Markdownify origin and HTTPS for remote hosts; local development may use loopback HTTP. Reject redirects and credential-bearing URLs. Stream the file with HTTP `PUT` and returned headers. If required_headers contains Authorization, use that scoped bearer unchanged; otherwise registry mode requires the runtime's own agent bearer credential. Do not treat an HTTP failure as a successful upload. Expired scoped grants require a new reservation.
 3. Call `start_conversion({"upload_id":"<upload_id>"})`; retain its `job_id`. Upload and job IDs refer to the same file lifecycle.
 4. Poll `get_conversion_status({"job_id":"<job_id>"})` with a finite deadline and backoff, for example 500 milliseconds increasing to 5 seconds. Continue through `queued` and `running`; stop on `failed` or `expired`.
 5. When `completed`, call `get_markdown({"job_id":"<job_id>","offset":0,"max_chars":50000})`. Append `markdown`, then use returned `next_offset` until null. Offsets and `total_chars` count Unicode code points; do not calculate offsets from byte or JavaScript string lengths. `offset` is nonnegative; `max_chars` is 1–100000.
@@ -46,6 +48,6 @@ See [error reference](docs/ERRORS.md) for response examples and limits. The runt
 
 ## Runtime helper
 
-Run `bun examples/upload-and-convert.ts input.docx output.md`. It preserves existing output files. Set `MCP_URL` and `MCP_TOKEN` for direct access. Gateway mode requires `LITELLM_API_KEY`, `MARKDOWNIFY_AGENT_TOKEN`, and `MARKDOWNIFY_BASE_URL`; `MARKDOWNIFY_SERVER_ALIAS` defaults to `markdownify`. The helper leaves remote jobs to expire automatically.
+Run `bun examples/upload-and-convert.ts input.docx output.md`. It preserves existing output files. Set `MCP_URL` and `MCP_TOKEN` for direct access. JWT gateway mode requires `LITELLM_API_KEY` and `MARKDOWNIFY_BASE_URL`; registry gateway mode also requires `MARKDOWNIFY_AGENT_TOKEN`. `MARKDOWNIFY_SERVER_ALIAS` defaults to `markdownify`. The helper honors returned scoped upload Authorization and leaves jobs to expire automatically.
 
 See [the streaming helper](examples/upload-and-convert.ts), [remote deployment](docs/REMOTE.md), and [multi-agent configuration](docs/MULTITENANT.md) for runtime setup.
