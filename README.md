@@ -340,4 +340,6 @@ The upstream local stdio entry point remains `dist/index.js` (`bun start`) with 
 
 [MIT](LICENSE).
 
-Health monitoring: see [real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). Authenticated agents can call get_service_health for their own queue/reservation metrics and configured limits; identity-free probes never gain file access.
+## Health monitoring
+
+See [real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). Authenticated agents can call get_service_health for their own queue/reservation metrics and configured limits; identity-free probes never gain file access.

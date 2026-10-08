@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -80,3 +80,33 @@ test("real health detects missing converter and unwritable storage without leaki
     expect(JSON.stringify(h)).not.toContain(f.dataDir);
   } finally { if (previous === undefined) delete process.env.MARKITDOWN_PATH; else process.env.MARKITDOWN_PATH = previous; }
 });
+
+test("slow readiness probes remain single-flight and cache TTL starts after completion", async () => {
+  const f = await fixture();
+  const original = fs.statfs;
+  let release!: () => void, calls = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const probe = spyOn(fs, "statfs").mockImplementation(async (target: any) => {
+    calls++;
+    await gate;
+    return original(target);
+  });
+  let first: Promise<unknown> | undefined, second: Promise<unknown> | undefined;
+  try {
+    first = f.service.health();
+    await new Promise(resolve => setTimeout(resolve, 2100));
+    second = f.service.health();
+    expect(calls).toBe(1);
+    release();
+    await Promise.all([first, second]);
+    await f.service.health();
+    expect(calls).toBe(1);
+    await new Promise(resolve => setTimeout(resolve, 2100));
+    await f.service.health();
+    expect(calls).toBe(2);
+  } finally {
+    release();
+    await Promise.allSettled([first, second].filter(Boolean) as Promise<unknown>[]);
+    probe.mockRestore();
+  }
+}, 10000);

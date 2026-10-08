@@ -363,7 +363,10 @@ export class JobService {
   async health(principal?: Principal) {
     if (principal) { this.validPrincipal(principal); await this.audit("read_health", principal); }
     if (!this.healthCache || this.healthCache.until <= Date.now()) {
-      this.healthCache = { until: Date.now() + 2000, result: checkRuntime(this.options.dataDir, !!this.options.converter) };
+      const result = checkRuntime(this.options.dataDir, !!this.options.converter).finally(() => {
+        if (this.healthCache?.result === result) this.healthCache.until = Date.now() + 2000;
+      });
+      this.healthCache = { until: Infinity, result };
     }
     const runtime = await this.healthCache.result;
     const ready = this.initialized && !this.closing && runtime.storage.writable && runtime.converter.available;
