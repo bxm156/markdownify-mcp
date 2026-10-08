@@ -6,7 +6,6 @@ services:
     image: bryanmarty/markdownify-mcp:latest
     env_file: .env.jwt
     environment:
-      MD_JWT_PRINCIPALS_FILE: /run/markdownify/jwt-principals.json
       MD_HOST: 0.0.0.0
       MD_PORT: 8000
       MD_DATA_DIR: /data
@@ -14,12 +13,6 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - markdownify-data:/data
-      - type: bind
-        source: ./secrets/jwt-principals.json
-        target: /run/markdownify/jwt-principals.json
-        read_only: true
-        bind:
-          create_host_path: false
     restart: unless-stopped
     init: true
     read_only: true

@@ -41,7 +41,6 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
         ? await service.authenticateUpload(upload[1], token(request))
         : await options.authenticator.authenticate(token(request));
       if (!principal) { response.setHeader("WWW-Authenticate", "Bearer"); reply(response, 401, "Authorization required"); return; }
-      if (upload && options.authenticator.mode === "jwt" && !options.authenticator.isActive?.(principal)) { reply(response, 401, "Authorization required"); return; }
       if (upload) {
         if (request.method !== "PUT") { response.setHeader("Allow", "PUT"); reply(response, 405, "Method not allowed"); return; }
         const header = request.headers["x-upload-token"];
