@@ -4,7 +4,7 @@ import { DEFAULT_PRINCIPAL, validatePrincipal, type Principal } from "./identity
 import { loadJwtAuthenticator } from "./jwt.js";
 
 export type AuthenticatedPrincipal = Principal & { scopes?: readonly string[]; toolPrefix?: string };
-export interface Authenticator { mode?: "jwt"; isActive?(principal: Principal): boolean; authenticate(token: string | undefined): AuthenticatedPrincipal | null | Promise<AuthenticatedPrincipal | null> }
+export interface Authenticator { mode?: "jwt"; authenticate(token: string | undefined): AuthenticatedPrincipal | null | Promise<AuthenticatedPrincipal | null> }
 export function hashToken(token: string): string { return createHash("sha256").update(token, "utf8").digest("hex"); }
 
 export function createAuthenticator(registry: unknown): Authenticator {

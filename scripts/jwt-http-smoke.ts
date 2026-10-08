@@ -28,14 +28,8 @@ const directory = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-jwt-http-
 const provider = createServer((_req, res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(jwks)); });
 const jwksPort = await listen(provider);
 const probe = createServer(); const port = await listen(probe); await stop(probe); const base = `http://127.0.0.1:${port}`;
-const mapFile = path.join(directory, "principals.json");
-await fs.writeFile(mapFile, JSON.stringify({ principals: [
-  { subject: "machine-a", tenant_id: "tenant", agent_id: "a" },
-  { subject: "machine-b", tenant_id: "tenant", agent_id: "b" },
-  { subject: "machine-c", tenant_id: "other", agent_id: "c" },
-] }), { mode: 0o600 });
 const env = { ...process.env }; for (const name of Object.keys(env)) if (name.startsWith("MD_JWT_") || ["MD_API_KEY", "MD_AUTH_FILE"].includes(name)) delete env[name];
-Object.assign(env, { MD_JWT_ISSUER: issuer, MD_JWT_AUDIENCE: audience, MD_JWT_JWKS_URL: `http://127.0.0.1:${jwksPort}/jwks`, MD_JWT_PRINCIPALS_FILE: mapFile, MD_JWT_ALLOW_HTTP_LOCALHOST: "1", MD_PUBLIC_BASE_URL: base, MD_HOST: "127.0.0.1", MD_PORT: String(port), MD_DATA_DIR: path.join(directory, "data") });
+Object.assign(env, { MD_JWT_ISSUER: issuer, MD_JWT_AUDIENCE: audience, MD_JWT_JWKS_URL: `http://127.0.0.1:${jwksPort}/jwks`, MD_JWT_ALLOW_HTTP_LOCALHOST: "1", MD_PUBLIC_BASE_URL: base, MD_HOST: "127.0.0.1", MD_PORT: String(port), MD_DATA_DIR: path.join(directory, "data") });
 const child = spawn(process.env.MD_TEST_NODE ?? "node", ["dist/remote/index.js"], { env, stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
 let startupFailure = false; child.on("error", () => { startupFailure = true; }); child.stderr!.resume();
 const clients: Client[] = []; let gateway: ReturnType<typeof createServer> | undefined;
