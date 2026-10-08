@@ -19,6 +19,10 @@ Discover available tool names with `listTools`; gateways may prefix names. Selec
 
 The model cannot transfer a file by naming its local path. The runtime must read and upload bytes. If the runtime cannot access the file or perform HTTP uploads, report that missing capability. Do not fabricate a completed upload, send base64 in tool arguments, or substitute another agent's credential.
 
+## Check readiness
+
+Use get_service_health({}) with your normal identity to inspect readiness, your own job states/reserved bytes and configured limits. Queued work or a full quota is capacity pressure, not a failed process. Anonymous initialization/ping is monitoring only and never authorizes job tools; keep using normal authentication. See [health reference](docs/HEALTH.md).
+
 ## Convert a file
 
 1. Reserve using `create_upload({"filename":"report.pdf","size_bytes":12345})`. Use the actual byte count and basename. The response contains `upload_id`, `upload_url`, `expires_at`, and `required_headers`.

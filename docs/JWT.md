@@ -119,3 +119,7 @@ Token refresh does not change ownership. Use normal finite polling, Unicode pagi
 Check the public JWKS is reachable, then use two separate machine-user keys to convert real files. Cross-agent status/read/delete must return JOB_NOT_FOUND. A leaked X-Upload-Token combined with another job's scoped bearer must fail; grants must fail on MCP and after successful upload/expiry. Confirm fresh gateway tokens retain ownership, and restart/revocation work as intended. The repository's JWT tests and compiled-Node smoke cover protocol behavior; a live user gateway remains environment-specific verification.
 
 Client syntax references: [Codex](https://learn.chatgpt.com/docs/extend/mcp?surface=cli), [Claude Code](https://code.claude.com/docs/en/mcp), [Cursor](https://cursor.com/docs/mcp). See [LiteLLM's auth matrix](https://docs.litellm.ai/docs/mcp_config_reference) for the separate gateway and upstream authentication layers.
+
+## Health monitoring
+
+LiteLLM 1.104 probes MCP initialization without a user. JWT mode permits only readiness-gated initialization/ping without an owner; all job tools and discovery still require a valid agent. Use GET /healthz for real process/storage/converter readiness, and authenticated get_service_health for private per-user metrics. See [health behavior and limits](HEALTH.md).

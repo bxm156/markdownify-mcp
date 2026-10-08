@@ -6,6 +6,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Converter, createConverter } from "./converter.js";
 import { validatePrincipal, type Principal } from "./identity.js";
+import { checkRuntime, type RuntimeHealth } from "./health.js";
 import { prepareMarkdownIndex, readMarkdownPage } from "./markdown.js";
 
 import { ServiceError, errorInfo, lookupError, legacyCode, type ErrorCode, type ErrorDetails } from "./errors.js";
@@ -25,6 +26,8 @@ export class JobService {
   private active = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private uploading = new Map<string, AbortController>();
   private closing = false;
+  private initialized = false;
+  private healthCache?: { until: number; result: Promise<RuntimeHealth> };
   private lastTenant?: string;
   private lastAgent = new Map<string, string>();
   private converter: Converter;
@@ -128,6 +131,7 @@ export class JobService {
     }
     for (const id of orphans) await fs.rm(this.dir(id), { recursive: true, force: true });
     await this.cleanup();
+    this.initialized = true;
     this.timer = setInterval(() => { void this.cleanup().catch(() => undefined); }, Math.min(this.options.retentionMs, this.options.uploadTtlMs, 60_000));
     this.timer.unref();
     this.pump();
@@ -355,6 +359,29 @@ export class JobService {
       });
     }
   }
+
+  async health(principal?: Principal) {
+    if (principal) { this.validPrincipal(principal); await this.audit("read_health", principal); }
+    if (!this.healthCache || this.healthCache.until <= Date.now()) {
+      this.healthCache = { until: Date.now() + 2000, result: checkRuntime(this.options.dataDir, !!this.options.converter) };
+    }
+    const runtime = await this.healthCache.result;
+    const ready = this.initialized && !this.closing && runtime.storage.writable && runtime.converter.available;
+    const base = { status: ready ? "ok" : "unavailable", ready, checked_at: runtime.checked_at,
+      uptime_seconds: Math.floor(process.uptime()), memory_rss_bytes: process.memoryUsage().rss,
+      checks: { initialized: this.initialized, accepting_work: !this.closing, storage: runtime.storage, converter: runtime.converter } };
+    if (!principal) return base;
+    const mine = [...this.jobs.values()].filter(j => j.tenant_id === principal.tenantId && j.agent_id === principal.agentId);
+    const states = Object.fromEntries(["awaiting_upload", "uploaded", "queued", "running", "completed", "failed", "expired"].map(s => [s, mine.filter(j => j.status === s).length]));
+    const live = mine.filter(j => j.status !== "expired");
+    return { ...base, own_jobs: states, own_reserved_bytes: live.reduce((n, j) => n + j.size_bytes + this.options.maxOutputBytes, 0),
+      limits: { global_jobs: this.options.maxJobs, global_reserved_bytes: this.options.maxStorageBytes,
+        tenant_jobs: this.options.maxTenantJobs ?? this.options.maxJobs, agent_jobs: this.options.maxAgentJobs ?? this.options.maxJobs,
+        tenant_reserved_bytes: this.options.maxTenantStorageBytes ?? this.options.maxStorageBytes, agent_reserved_bytes: this.options.maxAgentStorageBytes ?? this.options.maxStorageBytes,
+        global_concurrency: this.options.concurrency, tenant_concurrency: this.options.maxTenantConcurrency ?? this.options.concurrency, agent_concurrency: this.options.maxAgentConcurrency ?? this.options.concurrency,
+        max_upload_bytes: this.options.maxUploadBytes, max_output_bytes: this.options.maxOutputBytes } };
+  }
+
   async close() {
     this.closing = true;
     if (this.timer) clearInterval(this.timer);

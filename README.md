@@ -235,7 +235,7 @@ Add to `.cursor/mcp.json` for a project, or `~/.cursor/mcp.json` globally:
 }
 ```
 
-Cursor uses `${env:NAME}` interpolation. Enable the server in its MCP settings and confirm the six remote tools are available. [Official Cursor MCP documentation](https://cursor.com/docs/mcp).
+Cursor uses `${env:NAME}` interpolation. Enable the server in its MCP settings and confirm the seven remote tools are available. [Official Cursor MCP documentation](https://cursor.com/docs/mcp).
 
 ### VS Code / GitHub Copilot, local extension session
 
@@ -326,7 +326,7 @@ bun test src/remote
 
 CI tests every push and PR, including real PDF/Office conversions, Docker builds and three-agent isolation. Main-branch publication tests the image before pushing `latest` and commit-SHA tags to Docker Hub. See [containers](docs/CONTAINERS.md), [validation history](docs/MULTITENANT-VALIDATION.md) and [milestones](PLAN.md).
 
-The upstream local stdio entry point remains `dist/index.js` (`bun start`) with local-path and web conversion tools. It is separate from the remote `dist/remote/index.js` service and its six remote tools. Local mode needs its own Python/dependency setup; the original `Dockerfile` builds stdio mode, while `Dockerfile.remote` builds the service documented here.
+The upstream local stdio entry point remains `dist/index.js` (`bun start`) with local-path and web conversion tools. It is separate from the remote `dist/remote/index.js` service and its seven remote tools. Local mode needs its own Python/dependency setup; the original `Dockerfile` builds stdio mode, while `Dockerfile.remote` builds the service documented here.
 
 ## Further documentation
 
@@ -339,3 +339,5 @@ The upstream local stdio entry point remains `dist/index.js` (`bun start`) with 
 ## License
 
 [MIT](LICENSE).
+
+Health monitoring: see [real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). Authenticated agents can call get_service_health for their own queue/reservation metrics and configured limits; identity-free probes never gain file access.
