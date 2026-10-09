@@ -28,16 +28,19 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
     try {
-      if (!request.headers.host || !hosts.has(request.headers.host.toLowerCase())) { reply(response, 403, "Host not allowed"); return; }
-      if (request.headers.origin && request.headers.origin !== publicUrl.origin) { reply(response, 403, "Origin not allowed"); return; }
       const url = new URL(request.url ?? "/", publicUrl);
+      // Probes skip Host/Origin checks: orchestrators send Host: <podIP>:port and bodies hold only public booleans.
+      const probe = ["/livez", "/healthz", "/readyz"].includes(url.pathname);
+      if (!probe && (!request.headers.host || !hosts.has(request.headers.host.toLowerCase()))) { reply(response, 403, "Host not allowed"); return; }
+      if (!probe && request.headers.origin && request.headers.origin !== publicUrl.origin) { reply(response, 403, "Origin not allowed"); return; }
       if (url.search) { reply(response, 400, "Query parameters are not supported"); return; }
       // /livez (and legacy /healthz) is liveness only; /readyz gates traffic on storage/converter/lifecycle.
-      if (["/livez", "/healthz", "/readyz"].includes(url.pathname)) {
-        if (request.method !== "GET") { response.setHeader("Allow", "GET"); reply(response, 405, "Method not allowed"); return; }
-        if (url.pathname !== "/readyz") { response.writeHead(200, { "Content-Type": "application/json" }); response.end(JSON.stringify({ status: "ok" })); return; }
-        const health = await service.publicHealth();
-        response.writeHead(health.ready ? 200 : 503, { "Content-Type": "application/json" }); response.end(JSON.stringify(health)); return;
+      if (probe) {
+        if (request.method !== "GET" && request.method !== "HEAD") { response.setHeader("Allow", "GET, HEAD"); reply(response, 405, "Method not allowed"); return; }
+        const health = url.pathname === "/readyz" ? await service.publicHealth() : undefined;
+        const body = JSON.stringify(health ?? { status: "ok" });
+        response.writeHead(health?.ready === false ? 503 : 200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
+        response.end(request.method === "HEAD" ? undefined : body); return;
       }
       const upload = /^\/uploads\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(url.pathname);
       if (!upload && url.pathname !== "/mcp") { reply(response, 404, "Not found"); return; }

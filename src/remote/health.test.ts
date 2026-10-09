@@ -11,9 +11,9 @@ import { checkRuntime } from "./health.js";
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { while (cleanup.length) await cleanup.pop()!(); });
-async function fixture(jwt = true) {
+async function fixture(jwt = true, extra: { healthTimeoutMs?: number } = {}) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-health-"));
-  const service = new JobService({ dataDir, maxUploadBytes: 100, maxOutputBytes: 100, maxStorageBytes: 10000, maxJobs: 10, retentionMs: 60000, uploadTtlMs: 60000, conversionTimeoutMs: 1000, concurrency: 1, converter: async () => {} });
+  const service = new JobService({ dataDir, maxUploadBytes: 100, maxOutputBytes: 100, maxStorageBytes: 10000, maxJobs: 10, retentionMs: 60000, uploadTtlMs: 60000, conversionTimeoutMs: 1000, concurrency: 1, converter: async () => {}, ...extra });
   await service.init();
   const registry = createAuthenticator({ credentials: [{ tenant_id: "a", agent_id: "a", token_sha256: hashToken("a") }, { tenant_id: "b", agent_id: "b", token_sha256: hashToken("b") }] });
   const auth = jwt ? { mode: "jwt" as const, authenticate: registry.authenticate } : registry;
@@ -60,7 +60,10 @@ test("health measures storage, omits foreign usage, and fails readiness during s
   const notReady = await probe("/readyz");
   expect(notReady.status).toBe(503); expect((await notReady.json()).checks.accepting_work).toBe(false);
   for (const p of ["/livez", "/healthz"]) { const r = await probe(p); expect(r.status).toBe(200); expect(await r.json()).toEqual({ status: "ok" }); }
-  expect((await fetch(f.base + "/readyz", { method: "POST", headers: { Host: "127.0.0.1" } })).headers.get("allow")).toBe("GET");
+  for (const p of ["/livez", "/healthz", "/readyz"]) {
+    const r = await fetch(f.base + p, { method: "POST", headers: { Host: "127.0.0.1" } });
+    expect(r.status).toBe(405); expect(r.headers.get("allow")).toBe("GET, HEAD");
+  }
   expect((await f.request({ jsonrpc: "2.0", id: 1, method: "ping" })).status).toBe(503);
 });
 test("authenticated health tool returns only the caller's metrics", async () => {
@@ -118,4 +121,61 @@ test("slow readiness probes remain single-flight and cache TTL starts after comp
     await Promise.allSettled([first, second].filter(Boolean) as Promise<unknown>[]);
     probe.mockRestore();
   }
+});
+
+test("probe routes accept any Host and HEAD while other routes keep the allowlist", async () => {
+  const f = await fixture();
+  const at = (p: string, init: RequestInit = {}) => fetch(f.base + p, { ...init, headers: { Host: "10.0.0.7:8000", Origin: "http://10.0.0.7:8000", ...init.headers } });
+  for (const p of ["/livez", "/healthz", "/readyz"]) {
+    const r = await at(p);
+    expect(r.status).toBe(200); expect(r.headers.get("cache-control")).toBe("no-store"); expect(r.headers.get("x-content-type-options")).toBe("nosniff");
+    const head = await at(p, { method: "HEAD" });
+    expect(head.status).toBe(200); expect(head.headers.get("content-type")).toBe("application/json"); expect(await head.text()).toBe("");
+    expect((await at(p + "?verbose=1")).status).toBe(400);
+  }
+  expect((await at("/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status).toBe(403);
+  expect((await at("/uploads/00000000-0000-0000-0000-000000000000", { method: "PUT" })).status).toBe(403);
+  await f.service.close();
+  expect((await at("/readyz")).status).toBe(503); expect((await at("/readyz", { method: "HEAD" })).status).toBe(503);
+});
+
+test("hung storage probe reports 503 within the bound and a later probe retries", async () => {
+  const f = await fixture(true, { healthTimeoutMs: 50 });
+  const original = fs.statfs;
+  let release!: () => void, calls = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const probe = spyOn(fs, "statfs").mockImplementation(async (target: any) => { calls++; await gate; return original(target); });
+  const ready = () => fetch(f.base + "/readyz", { headers: { Host: "127.0.0.1" } });
+  try {
+    const started = performance.now();
+    const [a, b] = await Promise.all([ready(), ready()]);
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect([a.status, b.status]).toEqual([503, 503]); expect(calls).toBe(1);
+    expect((await a.json()).checks).toEqual({ initialized: true, accepting_work: true, storage: { writable: false }, converter: { available: true } });
+    expect((await ready()).status).toBe(503); expect(calls).toBe(1);
+    release();
+    setSystemTime(new Date(Date.now() + 2100));
+    expect((await ready()).status).toBe(200); expect(calls).toBe(2);
+    expect((await fs.readdir(f.dataDir)).some(n => n.startsWith(".health-"))).toBe(false);
+  } finally {
+    setSystemTime();
+    release();
+    probe.mockRestore();
+  }
+});
+
+test("abandoned probe file is removed when a hung write eventually finishes", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-health-"));
+  cleanup.push(() => fs.rm(dir, { recursive: true, force: true }));
+  const original = fs.writeFile;
+  let release!: () => void, written!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; }), wrote = new Promise<void>(resolve => { written = resolve; });
+  const spy = spyOn(fs, "writeFile").mockImplementation(async (...args: any[]) => { await gate; await (original as any)(...args); written(); });
+  try {
+    const h = await checkRuntime(dir, true, 20);
+    expect(h.storage.writable).toBe(false); expect(h.converter.available).toBe(true);
+    release(); await wrote;
+    for (let i = 0; i < 100 && (await fs.readdir(dir)).length; i++) await new Promise(r => setTimeout(r, 10));
+    expect(await fs.readdir(dir)).toEqual([]); expect(h.storage.writable).toBe(false);
+  } finally { release(); spy.mockRestore(); }
 });

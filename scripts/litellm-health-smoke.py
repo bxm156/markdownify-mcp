@@ -20,6 +20,7 @@ import httpx2
 from litellm.experimental_mcp_client.client import MCPClient
 
 HTTP_STATUS_ERRORS = (httpx.HTTPStatusError, httpx2.HTTPStatusError)
+GROUPS = sys.version_info >= (3, 11)  # ExceptionGroup is built in from 3.11
 
 
 def check(condition, message):
@@ -38,8 +39,11 @@ def _walk(exc, seen=None):
     yield from _walk(exc.__cause__, seen)
     yield from _walk(exc.__context__, seen)
     # ExceptionGroup / BaseExceptionGroup (Python 3.11+); the MCP SDK and anyio raise these.
-    for inner in getattr(exc, "exceptions", None) or ():
-        yield from _walk(inner, seen)
+    # Skip a malformed .exceptions so the walk cannot raise inside an except handler and mask the diagnostic.
+    inners = getattr(exc, "exceptions", None)
+    for inner in inners if isinstance(inners, (list, tuple)) else ():
+        if isinstance(inner, BaseException):
+            yield from _walk(inner, seen)
 
 
 def http_status_codes(exc):
@@ -70,8 +74,9 @@ def self_test():
     for module in (httpx, httpx2):
         name = module.__name__
         check(has_http_401(_status_error(module, 401)), f"{name} 401 not recognised")
-        nested = ExceptionGroup("mcp", [RuntimeError("wrapper"), ExceptionGroup("inner", [_status_error(module, 401)])])
-        check(has_http_401(nested), f"{name} 401 nested in exception groups not recognised")
+        if GROUPS:
+            nested = ExceptionGroup("mcp", [RuntimeError("wrapper"), ExceptionGroup("inner", [_status_error(module, 401)])])
+            check(has_http_401(nested), f"{name} 401 nested in exception groups not recognised")
         chained = RuntimeError("session failed")
         chained.__cause__ = _status_error(module, 401)
         check(has_http_401(chained), f"{name} 401 via __cause__ not recognised")
@@ -81,7 +86,14 @@ def self_test():
         check(not has_http_401(_status_error(module, 500, "http://127.0.0.1:401/mcp")), f"{name} 500 at port 401 misclassified")
     check(not has_http_401(TimeoutError("timed out connecting to http://127.0.0.1:40123/mcp")), "timeout mentioning 401 misclassified")
     check(not has_http_401(RuntimeError("HTTP 401 Unauthorized")), "message text alone must not count as 401")
-    check(not has_http_401(ExceptionGroup("mcp", [TimeoutError("http://127.0.0.1:40123/mcp")])), "grouped timeout misclassified")
+    if GROUPS:
+        check(not has_http_401(ExceptionGroup("mcp", [TimeoutError("http://127.0.0.1:40123/mcp")])), "grouped timeout misclassified")
+    else:
+        print("Python < 3.11: skipping ExceptionGroup classifier cases")
+    for malformed in ([None, "x", 401], 401, "401"):
+        odd = RuntimeError("odd group")
+        odd.exceptions = malformed
+        check(http_status_codes(odd) == [], f"malformed .exceptions {malformed!r} not ignored")
     check(http_status_codes(TimeoutError("x")) == [], "no status codes expected for a timeout")
 
 
