@@ -398,9 +398,21 @@ describe.skipIf(!node)("compiled entry points under node", () => {
     expect(refused.stderr()).toContain("Data directory is in use: MD_DATA_DIR/.lock exists"); expect(refused.stderr()).toContain("remove MD_DATA_DIR/.lock and restart");
     await fs.rm(lock, { force: true });
     const restarted = start();
-    try { await ready(restarted); restarted.child.kill("SIGTERM"); expect(await restarted.exited).toBe(0); }
+    try {
+      await ready(restarted);
+      expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(restarted.child.pid));
+      if (process.platform === "win32") {
+        // Windows kill() terminates the child without running Node's signal handlers.
+        restarted.child.kill("SIGKILL");
+        await restarted.exited;
+        expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(restarted.child.pid));
+      } else {
+        restarted.child.kill("SIGTERM");
+        expect(await restarted.exited).toBe(0);
+        // POSIX graceful shutdown releases the lock again.
+        await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+    }
     finally { if (restarted.child.exitCode === null) restarted.child.kill("SIGKILL"); }
-    // Graceful shutdown releases the lock again.
-    await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
   }, 30_000);
 });
