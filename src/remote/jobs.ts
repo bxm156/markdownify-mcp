@@ -362,7 +362,10 @@ export class JobService {
   /** Single-flight: concurrent callers share the in-flight sweep, which then runs one more pass so their expirations are covered. */
   cleanup(): Promise<void> {
     if (this.sweep) { this.sweepAgain = true; return this.sweep; }
-    const sweep = (async () => { do { this.sweepAgain = false; await this.sweepOnce(); } while (this.sweepAgain && !this.closing); })().finally(() => { this.sweep = undefined; });
+    const sweep = (async () => {
+      try { do { this.sweepAgain = false; await this.sweepOnce(); } while (this.sweepAgain && !this.closing); }
+      finally { this.sweep = undefined; }
+    })();
     return this.sweep = sweep;
   }
   private async sweepOnce() {

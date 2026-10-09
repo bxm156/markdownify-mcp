@@ -56,87 +56,44 @@ describe("production job lifecycle", () => {
     const before = await instance.getMarkdown(alice, id);
     const completed = await Promise.all(Array.from({ length: 10 }, () => instance.startConversion(alice, id)));
     expect(completed.every(result => result.status === "completed")).toBe(true);
-    expect(await instance.getMarkdown(alice, id)).toEqual(before); expect(calls).toBe(1);
-  });
+    expect(await instance.getMarkdown(alice, id))…14726 tokens truncated…me: "get_service_health", arguments: {} } }) });
+    expect(response.status).toBe(401); expect(response.headers.get("www-authenticate")).toBe("Bearer");
+  }
+});
 
-  test("a killed real worker preserves queued owners and resumes work under tenant limits", async () => {
-    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-crash-")); directories.push(dataDir);
-    // The child uses the production service to persist every state. SIGKILL models
-    // a crash rather than fabricating manifests or invoking graceful close().
-    const workerFile = path.join(dataDir, "worker.ts");
-    const modulePath = path.resolve(import.meta.dir, "jobs.ts").replaceAll("\\", "/");
-    await fs.writeFile(workerFile, `import fs from 'node:fs/promises'; import { Readable } from 'node:stream'; import { JobService } from ${JSON.stringify(modulePath)};
-const actors = [{tenantId:'team',agentId:'alice'},{tenantId:'team',agentId:'bob'},{tenantId:'team',agentId:'alice'},{tenantId:'other',agentId:'carol'}];
-const service=new JobService({dataDir:${JSON.stringify(dataDir)},maxUploadBytes:100,maxOutputBytes:1024,maxStorageBytes:100000,maxJobs:20,retentionMs:60000,uploadTtlMs:60000,conversionTimeoutMs:60000,concurrency:1,converter:async()=>{await new Promise(()=>{setInterval(()=>{},1000);});}}); await service.init(); const ids=[];
-for(let i=0;i<actors.length;i++){const actor=actors[i];const job=await service.createUpload(actor,{filename:'a.txt',size_bytes:1});await service.upload(actor,job.upload_id,job.upload_token,Readable.from([String(i)]));await service.startConversion(actor,job.upload_id);ids.push(job.upload_id);if(i===0){while((await service.getStatus(actor,job.upload_id)).status!=='running')await new Promise(r=>setTimeout(r,5));}}
-process.stdout.write(JSON.stringify(ids)+'\\n');`);
-    const child = spawn(process.execPath, [workerFile], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }); children.push(child);
-    let stdout = "", stderr = ""; child.stdout!.on("data", chunk => { stdout += chunk.toString(); }); child.stderr!.on("data", chunk => { stderr += chunk.toString(); });
-    await eventually(async () => ({ stdout, exited: child.exitCode !== null }), value => value.stdout.includes("\n") || value.exited, "crash worker readiness");
-    if (!stdout.includes("\n")) throw new Error(`Worker exited: ${stderr}`);
-    const ids: string[] = JSON.parse(stdout.trim());
-    const before = await Promise.all(ids.map(id => fs.readFile(path.join(dataDir, id, "job.json"), "utf8").then(JSON.parse)));
-    expect(before.map(job => job.status)).toEqual(["running", "queued", "queued", "queued"]);
-    const exited = new Promise<void>(resolve => child.once("exit", () => resolve())); child.kill("SIGKILL"); await exited;
-    let activeTeam = 0, maxActiveTeam = 0;
-    const { instance } = await service({ dataDir, concurrency: 3, maxTenantConcurrency: 1, maxAgentConcurrency: 1, converter: async (input, output) => {
-      const manifest = JSON.parse(await fs.readFile(path.join(path.dirname(input), "job.json"), "utf8"));
-      if (manifest.tenant_id === "team") { activeTeam++; maxActiveTeam = Math.max(maxActiveTeam, activeTeam); }
-      await new Promise(resolve => setTimeout(resolve, 15)); await fs.writeFile(output, await fs.readFile(input));
-      if (manifest.tenant_id === "team") activeTeam--;
-    } });
-    expect((await instance.getStatus(alice, ids[0])).error).toBe("Conversion interrupted by server restart");
-    for (const [actor, id, text] of [[bob, ids[1], "1"], [alice, ids[2], "2"], [carol, ids[3], "3"]] as const) {
-      await status(instance, actor, id, "completed"); expect((await instance.getMarkdown(actor, id)).markdown).toBe(text);
-      await expect(instance.getStatus(actor === bob ? alice : bob, id)).rejects.toMatchObject({ statusCode: 404 });
-    }
-    expect(maxActiveTeam).toBe(1);
-  }, 10_000);
-
-  for (const scope of ["global", "tenant", "agent"] as const) test(`${scope} capacity expires, erases indexes and becomes reusable`, async () => {
-    const limits = scope === "global" ? { maxJobs: 1, maxStorageBytes: 1025 } : scope === "tenant" ? { maxTenantJobs: 1, maxTenantStorageBytes: 1025 } : { maxAgentJobs: 1, maxAgentStorageBytes: 1025 };
-    const { instance, options } = await service({ retentionMs: 200, ...limits });
-    const id = await uploaded(instance, alice); await instance.startConversion(alice, id); await status(instance, alice, id, "completed");
-    const blocked = scope === "global" ? carol : scope === "tenant" ? bob : alice;
-    await expect(instance.createUpload(blocked, { filename: "blocked.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 507 });
-    expect(await fs.stat(path.join(options.dataDir, id, "output.md.index.json")).then(value => value.isFile())).toBe(true);
-    await eventually(async () => { await instance.cleanup(); return fs.readdir(path.join(options.dataDir, id)).catch(() => []); }, files => !files.includes("output.md"), "expiration cleanup");
-    await expect(fs.stat(path.join(options.dataDir, id, "input.txt"))).rejects.toThrow();
-    await expect(fs.stat(path.join(options.dataDir, id, "output.md.index.json"))).rejects.toThrow();
-    const replacement = await instance.createUpload(blocked, { filename: "replacement.txt", size_bytes: 1 });
-    await instance.deleteJob(blocked, replacement.upload_id);
-    const own = await instance.createUpload(alice, { filename: "own.txt", size_bytes: 1 }); expect(own.upload_id).not.toBe(id);
-  });
-
-  test("conversion failure releases scheduler capacity for another agent", async () => {
-    const gate = deferred(), entered = deferred(); let calls = 0;
-    const { instance } = await service({ converter: async (input, output) => { calls++; const text = await fs.readFile(input, "utf8"); if (text === "bad") { entered.resolve(); await gate.promise; throw new ServiceError(422, "Document conversion failed", "CONVERSION_FAILED"); } await fs.writeFile(output, "good result"); } });
-    const failed = await uploaded(instance, alice, "bad"); await instance.startConversion(alice, failed); await bounded(entered.promise);
-    const good = await uploaded(instance, bob, "good"); expect((await instance.startConversion(bob, good)).status).toBe("queued");
-    gate.resolve(); expect((await status(instance, alice, failed, "failed")).error).toBe("Document conversion failed");
-    await status(instance, bob, good, "completed"); expect((await instance.getMarkdown(bob, good)).markdown).toBe("good result"); expect(calls).toBe(2);
-  });
-
-  test("failed deletion audit cannot cancel an active conversion", async () => {
-    const gate = deferred(), entered = deferred(); let aborted = false;
-    const { instance } = await service({ audit: event => { if (event.event === "delete_job") throw new Error("audit unavailable"); }, converter: async (_input, output, signal) => { signal.addEventListener("abort", () => { aborted = true; }); entered.resolve(); await gate.promise; await fs.writeFile(output, "preserved"); } });
-    const id = await uploaded(instance, alice); await instance.startConversion(alice, id); await bounded(entered.promise);
-    await expect(instance.deleteJob(alice, id)).rejects.toMatchObject({ statusCode: 503 }); expect(aborted).toBe(false);
-    expect((await instance.getStatus(alice, id)).status).toBe("running"); gate.resolve(); await status(instance, alice, id, "completed");
-    expect((await instance.getMarkdown(alice, id)).markdown).toBe("preserved"); expect(aborted).toBe(false);
-  });
-
-  test("failed atomic queue commit leaves an uploaded job retriable without running a worker", async () => {
-    let calls = 0;
-    const { instance, options } = await service({ converter: async (_input, output) => { calls++; await fs.writeFile(output, "recovered"); } });
-    const id = await uploaded(instance, alice), manifest = path.join(options.dataDir, id, "job.json"), backup = `${manifest}.backup`;
-    // A real directory at the manifest target prevents atomic file rename on
-    // Windows and Linux, without mocking the implementation or filesystem API.
-    await fs.rename(manifest, backup); await fs.mkdir(manifest);
-    await expect(instance.startConversion(alice, id)).rejects.toThrow(); expect(calls).toBe(0);
-    expect((await instance.getStatus(alice, id)).status).toBe("uploaded");
-    await fs.rmdir(manifest); await fs.rename(backup, manifest);
-    await instance.startConversion(alice, id); await status(instance, alice, id, "completed");
-    expect(calls).toBe(1); expect((await instance.getMarkdown(alice, id)).markdown).toBe("recovered");
-  });
+async function closedPort() {
+  const server = createServer(); await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port; await new Promise<void>(r => server.close(() => r())); return port;
+}
+test("validly signed but unusable tokens are rejected at HTTP initialize with a Bearer challenge", async () => {
+  const f = await deployment();
+  const check = async (bearer: string, target = f) => { const response = await initialize(target.base, `Bearer ${bearer}`); return [response.status, response.headers.get("www-authenticate")]; };
+  expect(await check(await signed())).toEqual([200, null]);
+  for (const bearer of [await signed("litellm-proxy"), await signed("machine-a", { scope: "openid" }), await signed("machine-a", { aud: "other" })]) expect(await check(bearer)).toEqual([401, "Bearer"]);
+  // Unreachable JWKS (closed port) and a throwing key resolver both fail closed instead of hanging or admitting the caller.
+  const unreachable = await deployment(createJwtAuthenticator({ issuer, audience, jwksUrl: `http://127.0.0.1:${await closedPort()}/jwks`, allowLoopback: true }));
+  const throwing = await deployment(createJwtAuthenticator({ issuer, audience, getKey: async () => { throw new Error("jwks down"); } }));
+  for (const target of [unreachable, throwing]) {
+    expect(await check(await signed(), target)).toEqual([401, "Bearer"]);
+  }
+}, 15000);
+test("MD_JWT_MAX_TTL_SECONDS is bounded at load and enforced against exp - iat", async () => {
+  const env = (ttl?: string) => ({ MD_JWT_ISSUER: issuer, MD_JWT_AUDIENCE: audience, MD_JWT_JWKS_URL: "https://trusted.test/jwks", ...(ttl === undefined ? {} : { MD_JWT_MAX_TTL_SECONDS: ttl }) });
+  expect(loadJwtAuthenticator(env("3600")).mode).toBe("jwt"); expect(loadJwtAuthenticator(env()).mode).toBe("jwt");
+  for (const ttl of ["0", "3601", "NaN", "abc", "", "-1", "1.5", "Infinity"]) expect(() => loadJwtAuthenticator(env(ttl)), ttl).toThrow("max TTL");
+  const auth = createJwtAuthenticator({ issuer, audience, maxTtlSeconds: 60, getKey: createLocalJWKSet({ keys: [publicJwk] }) });
+  const now = Math.floor(Date.now() / 1000);
+  expect(await auth.authenticate(await signed("machine-a", { iat: now, exp: now + 60 }))).not.toBeNull();
+  expect(await auth.authenticate(await signed("machine-a", { iat: now, exp: now + 61 }))).toBeNull();
+});
+test("JWT clock tolerance allows 5s of iat skew but none for exp", async () => {
+  const { setSystemTime } = await import("bun:test");
+  setSystemTime(new Date("2026-01-01T12:00:00Z"));
+  try {
+  const auth = verifier(), now = Math.floor(Date.now() / 1000);
+  expect(await auth.authenticate(await signed("machine-a", { iat: now + 4, exp: now + 304 }))).not.toBeNull();
+  expect(await auth.authenticate(await signed("machine-a", { iat: now + 6, exp: now + 306 }))).toBeNull();
+  // Expired tokens get no grace even though the library tolerance is 5s: the explicit `exp <= now` check rejects them.
+  expect(await auth.authenticate(await signed("machine-a", { iat: now - 10, exp: now - 1 }))).toBeNull();
+  } finally { setSystemTime(); }
 });

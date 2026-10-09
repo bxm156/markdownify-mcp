@@ -144,7 +144,7 @@ The data volume contains:
 | `audit.jsonl`, `audit.jsonl.1`–`.3` | Metadata-only audit history shared by all agents |
 | `.lock` | PID of the running service; removed on clean shutdown |
 
-Stop the service before changing the volume. One process owns each data volume and loads every manifest only at startup, so edits under a running service race its in-memory state. The service writes `.lock` at startup and refuses to start while another live process holds it; a lock left by a crashed process is replaced. The purge tool refuses to run while a live process holds the lock, and refuses a path that contains neither job manifests nor `audit.jsonl`. It follows a symlinked data directory, reads manifests and file sizes only, never document contents, and is a dry run unless `--apply` is given:
+Stop the service before changing the volume. One process owns each data volume and loads every manifest only at startup, so edits under a running service race its in-memory state. The service creates `.lock` exclusively and refuses startup whenever that file exists. Clean shutdown removes it. After a crash, stop every service/container using the volume and manually remove the leftover `.lock` before restarting or purging. Automatic PID-based reclamation is unsafe because PIDs are reused and differ between container namespaces. The purge tool refuses to run while any lock exists, and refuses a path that contains neither job manifests nor `audit.jsonl`. It follows a symlinked data directory, reads manifests and file sizes only, never document contents, and is a dry run unless `--apply` is given:
 
 ```sh
 docker compose -f compose.multitenant.yaml stop markdownify

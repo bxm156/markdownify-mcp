@@ -233,24 +233,49 @@ describe("retention cleanup resilience", () => {
 });
 
 describe("one process per data volume", () => {
-  test("a live owner is refused and a stale lock is replaced", async () => {
+  test("existing locks fail closed and crash leftovers require operator removal", async () => {
     const { instance, options } = await service(), lock = path.join(options.dataDir, ".lock");
-    expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(process.pid)); expect((await fs.stat(lock)).mode & 0o777).toBe(0o600);
+    expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(process.pid));
+    if (process.platform !== "win32") expect((await fs.stat(lock)).mode & 0o777).toBe(0o600);
     // The current test process holds the lock, so a second service on the same volume is refused.
-    await expect(new JobService(options).init()).rejects.toThrow(`in use by process ${process.pid}`);
+    await expect(new JobService(options).init()).rejects.toThrow("Data directory is in use");
     await instance.close(); await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
     const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     try {
       await fs.writeFile(lock, `${sleeper.pid}\n`);
-      await expect(new JobService(options).init()).rejects.toThrow(`in use by process ${sleeper.pid}`);
+      await expect(new JobService(options).init()).rejects.toThrow("Data directory is in use");
       expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(sleeper.pid));
     } finally { sleeper.kill("SIGKILL"); await new Promise(resolve => sleeper.once("exit", resolve)); }
-    // Dead owners, and our own pid left by an earlier process (a restarted container), are stale.
+    // Even a dead or reused PID cannot safely prove ownership across containers.
     for (const stale of [String(deadPid()), String(process.pid), "garbage"]) {
       await fs.writeFile(lock, stale);
+      await expect(new JobService(options).init()).rejects.toThrow("Data directory is in use");
+      expect(await fs.readFile(lock, "utf8")).toBe(stale);
+      await fs.rm(lock);
       const { instance: next } = await service({ dataDir: options.dataDir });
       expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(process.pid)); await next.close();
     }
+  });
+  test("concurrent acquisitions admit exactly one service", async () => {
+    const { instance, options } = await service(); await instance.close();
+    const contenders = Array.from({ length: 10 }, () => new JobService(options));
+    services.push(...contenders);
+    const results = await Promise.allSettled(contenders.map(s => s.init()));
+    expect(results.filter(r => r.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter(r => r.status === "rejected")).toHaveLength(9);
+  });
+  test("a request at sweep settlement starts another pass", async () => {
+    const { instance } = await service();
+    let calls = 0, boundary: Promise<void> | undefined;
+    const sweep = spyOn(instance as any, "sweepOnce").mockImplementation(() => Promise.resolve().then(() => {
+      if (++calls === 1) queueMicrotask(() => queueMicrotask(() => { boundary = instance.cleanup(); }));
+    }));
+    try {
+      await instance.cleanup();
+      await boundary;
+      expect(calls).toBe(2);
+      expect((instance as any).sweep).toBeUndefined();
+    } finally { sweep.mockRestore(); }
   });
 });
 
