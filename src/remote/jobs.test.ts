@@ -277,6 +277,18 @@ describe("agent isolation and tenant budgets", () => {
     fail = false; expect((await instance.getStatus(principal, job.upload_id)).status).toBe("awaiting_upload");
     expect(JSON.stringify(events)).not.toContain("secret"); expect(JSON.stringify(events)).not.toContain(job.upload_token);
   });
+  test("authenticated health reads do not write audit events but invalid principals are still rejected", async () => {
+    const events: Array<{ event: string }> = [];
+    const { instance } = await service({ audit: event => { events.push(event); } });
+    const baseline = events.length;
+    for (let i = 0; i < 3; i++) expect((await instance.health({ tenantId: "a", agentId: "a" })).status).toBe("ok");
+    expect(events.slice(baseline)).toEqual([]);
+    expect(events.some(event => event.event === "read_health")).toBe(false);
+    await expect(instance.health({ tenantId: "", agentId: "a" })).rejects.toThrow();
+    expect(events.slice(baseline)).toEqual([]);
+    await instance.createUpload(principal, { filename: "notes.txt", size_bytes: 1 });
+    expect(events.length).toBeGreaterThan(baseline);
+  });
 });
 
 test("fair scheduler rotates tenants and agents while respecting scoped concurrency", async () => {

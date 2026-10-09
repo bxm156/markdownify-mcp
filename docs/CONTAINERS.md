@@ -1,6 +1,6 @@
 # Container builds and Docker Hub publication
 
-The remote image runs the native HTTP MCP service and document converter. Supergateway is unnecessary for this entry point. It exposes `/mcp`, `/uploads/*`, and `/healthz` on port 8000. Each upload and conversion result belongs to one authenticated agent, including agents sharing a tenant.
+The remote image runs the native HTTP MCP service and document converter. Supergateway is unnecessary for this entry point. It exposes `/mcp`, `/uploads/*`, `/livez` (alias `/healthz`, used by the image HEALTHCHECK) and `/readyz` on port 8000. Each upload and conversion result belongs to one authenticated agent, including agents sharing a tenant.
 
 ## Build and run
 

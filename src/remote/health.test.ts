@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -35,8 +35,8 @@ test("LiteLLM anonymous initialize/notification/ping works while tools and batch
     expect((await f.request({ jsonrpc: "2.0", id: 5, method, params: { name: "create_upload", arguments: { filename: "a.txt", size_bytes: 1 } } })).status).toBe(401);
   }
   expect((await f.request([{ jsonrpc: "2.0", id: 1, method: "ping" }, { jsonrpc: "2.0", id: 2, method: "tools/list" }])).status).toBe(401);
-  // Missing-sub/invalid Authorization never acquires a job owner; probe methods remain public.
-  expect((await f.request({ jsonrpc: "2.0", id: 8, method: "ping" }, { Authorization: "Bearer invalid" })).status).toBe(200);
+  // A present but invalid Authorization header is rejected; only header-less probes are public.
+  expect((await f.request({ jsonrpc: "2.0", id: 8, method: "ping" }, { Authorization: "Bearer invalid" })).status).toBe(401);
   expect((await f.request({ jsonrpc: "2.0", id: 9, method: "tools/list" }, { Authorization: "Bearer invalid" })).status).toBe(401);
 });
 test("health measures storage, omits foreign usage, and fails readiness during shutdown", async () => {
@@ -48,11 +48,19 @@ test("health measures storage, omits foreign usage, and fails readiness during s
   expect((health as any).own_jobs.awaiting_upload).toBe(0);
   expect((await f.service.health(b) as any).own_reserved_bytes).toBe(101);
   expect(JSON.stringify(health)).not.toContain(job.upload_id);
-  const publicHealth = await (await fetch(f.base + "/healthz", { headers: { Host: "127.0.0.1" } })).json();
-  expect(publicHealth.own_jobs).toBeUndefined();
+  expect(health.uptime_seconds).toBeGreaterThanOrEqual(0); expect(health.memory_rss_bytes).toBeGreaterThan(0);
+  const probe = (p: string) => fetch(f.base + p, { headers: { Host: "127.0.0.1" } });
+  const ready = await probe("/readyz");
+  expect(ready.status).toBe(200);
+  const body = await ready.json();
+  for (const v of [body.free_bytes, body.checks.storage.free_bytes, body.memory_rss_bytes, body.uptime_seconds, body.checked_at, body.own_jobs]) expect(v).toBeUndefined();
+  expect(body).toEqual({ status: "ok", ready: true, checks: { initialized: true, accepting_work: true, storage: { writable: true }, converter: { available: true } } });
   expect((await fs.readdir(f.dataDir)).some(n => n.startsWith(".health-"))).toBe(false);
   await f.service.close();
-  expect((await fetch(f.base + "/healthz", { headers: { Host: "127.0.0.1" } })).status).toBe(503);
+  const notReady = await probe("/readyz");
+  expect(notReady.status).toBe(503); expect((await notReady.json()).checks.accepting_work).toBe(false);
+  for (const p of ["/livez", "/healthz"]) { const r = await probe(p); expect(r.status).toBe(200); expect(await r.json()).toEqual({ status: "ok" }); }
+  expect((await fetch(f.base + "/readyz", { method: "POST", headers: { Host: "127.0.0.1" } })).headers.get("allow")).toBe("GET");
   expect((await f.request({ jsonrpc: "2.0", id: 1, method: "ping" })).status).toBe(503);
 });
 test("authenticated health tool returns only the caller's metrics", async () => {
@@ -94,19 +102,20 @@ test("slow readiness probes remain single-flight and cache TTL starts after comp
   let first: Promise<unknown> | undefined, second: Promise<unknown> | undefined;
   try {
     first = f.service.health();
-    await new Promise(resolve => setTimeout(resolve, 2100));
+    setSystemTime(new Date(Date.now() + 2100));
     second = f.service.health();
     expect(calls).toBe(1);
     release();
     await Promise.all([first, second]);
     await f.service.health();
     expect(calls).toBe(1);
-    await new Promise(resolve => setTimeout(resolve, 2100));
+    setSystemTime(new Date(Date.now() + 2100));
     await f.service.health();
     expect(calls).toBe(2);
   } finally {
+    setSystemTime();
     release();
     await Promise.allSettled([first, second].filter(Boolean) as Promise<unknown>[]);
     probe.mockRestore();
   }
-}, 10000);
+});
