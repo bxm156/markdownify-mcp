@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -94,19 +94,20 @@ test("slow readiness probes remain single-flight and cache TTL starts after comp
   let first: Promise<unknown> | undefined, second: Promise<unknown> | undefined;
   try {
     first = f.service.health();
-    await new Promise(resolve => setTimeout(resolve, 2100));
+    setSystemTime(new Date(Date.now() + 2100));
     second = f.service.health();
     expect(calls).toBe(1);
     release();
     await Promise.all([first, second]);
     await f.service.health();
     expect(calls).toBe(1);
-    await new Promise(resolve => setTimeout(resolve, 2100));
+    setSystemTime(new Date(Date.now() + 2100));
     await f.service.health();
     expect(calls).toBe(2);
   } finally {
+    setSystemTime();
     release();
     await Promise.allSettled([first, second].filter(Boolean) as Promise<unknown>[]);
     probe.mockRestore();
   }
-}, 10000);
+});
