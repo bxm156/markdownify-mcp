@@ -19,11 +19,11 @@ export function checkRuntime(dataDir: string, customConverter: boolean, timeoutM
   return result;
 }
 /** Bounded-size write/delete probe; executable presence, not a sample conversion. No paths/diagnostics leave this function.
- * Settles within timeoutMs: a hung mount reports storage unwritable while the abandoned probe cleans up whenever it finishes. */
+ * Settles within timeoutMs: whichever check is still pending reports unavailable while the abandoned probe cleans up whenever it finishes. */
 async function runRuntime(dataDir: string, customConverter: boolean, timeoutMs: number, settled: () => void): Promise<RuntimeHealth> {
   const result: RuntimeHealth = { checked_at: new Date().toISOString(), storage: { writable: false, free_bytes: null }, converter: { available: customConverter, check: customConverter ? "custom" : "executable" } };
   const probe = path.join(dataDir, ".health-" + randomUUID());
-  let abandoned = false, timer: ReturnType<typeof setTimeout> | undefined;
+  let abandoned = false, storageDone = false, timer: ReturnType<typeof setTimeout> | undefined;
   const storage = (async () => {
     try {
       const stat = await fs.statfs(dataDir);
@@ -33,6 +33,7 @@ async function runRuntime(dataDir: string, customConverter: boolean, timeoutMs: 
       await fs.rm(probe);
       result.storage.writable = result.storage.free_bytes > 0;
     } catch { await fs.rm(probe, { force: true }).catch(() => undefined); }
+    storageDone = true;
   })();
   const converter = (async () => {
     if (customConverter) return;
@@ -51,6 +52,7 @@ async function runRuntime(dataDir: string, customConverter: boolean, timeoutMs: 
   clearTimeout(timer);
   if (done) return result;
   abandoned = true;
-  // Snapshot so late completions cannot flip a reported verdict; converter stays false unless already found.
-  return { checked_at: result.checked_at, storage: { writable: false, free_bytes: result.storage.free_bytes }, converter: { ...result.converter } };
+  // Snapshot so late completions cannot flip a reported verdict. A settled storage check keeps its result;
+  // pending storage reports unwritable, and the converter stays false unless already found.
+  return { checked_at: result.checked_at, storage: { writable: storageDone && result.storage.writable, free_bytes: result.storage.free_bytes }, converter: { ...result.converter } };
 }

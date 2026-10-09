@@ -221,19 +221,20 @@ test("hung converter-executable search also reports 503 within the bound", async
   const exe = path.join(exeDir, "markitdown");
   await fs.writeFile(exe, "#!/bin/sh\n", { mode: 0o755 });
   const previous = process.env.MARKITDOWN_PATH;
-  process.env.MARKITDOWN_PATH = exe;
-  const f = await fixture(true, { healthTimeoutMs: 50, converter: undefined });
   const original = fs.stat;
-  let release!: () => void, calls = 0;
+  let release!: () => void, calls = 0, spy: { mockRestore(): void } | undefined;
   const gate = new Promise<void>(resolve => { release = resolve; });
-  const spy = spyOn(fs, "stat").mockImplementation((async (...args: any[]) => { calls++; await gate; return (original as any)(...args); }) as any);
-  const ready = () => fetch(f.base + "/readyz", { headers: { Host: "127.0.0.1" } });
   try {
+    process.env.MARKITDOWN_PATH = exe;
+    const f = await fixture(true, { healthTimeoutMs: 250, converter: undefined }); // room for the real storage check to settle
+    spy = spyOn(fs, "stat").mockImplementation((async (...args: any[]) => { calls++; await gate; return (original as any)(...args); }) as any);
+    const ready = () => fetch(f.base + "/readyz", { headers: { Host: "127.0.0.1" } });
     const started = performance.now();
     const r = await ready();
     expect(performance.now() - started).toBeLessThan(2000);
     expect(r.status).toBe(503); expect(calls).toBe(1);
-    expect((await r.json()).checks.converter).toEqual({ available: false });
+    // Only the converter search hung, so the settled storage check keeps its writable result.
+    expect((await r.json()).checks).toEqual({ initialized: true, accepting_work: true, storage: { writable: true }, converter: { available: false } });
     release();
     await new Promise(r => setTimeout(r, 20));
     setSystemTime(new Date(Date.now() + 2100));
@@ -241,7 +242,7 @@ test("hung converter-executable search also reports 503 within the bound", async
   } finally {
     setSystemTime();
     release();
-    spy.mockRestore();
+    spy?.mockRestore();
     if (previous === undefined) delete process.env.MARKITDOWN_PATH; else process.env.MARKITDOWN_PATH = previous;
   }
 });
