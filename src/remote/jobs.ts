@@ -369,7 +369,7 @@ export class JobService {
   }
 
   async health(principal?: Principal) {
-    if (principal) { this.validPrincipal(principal); await this.audit("read_health", principal); }
+    if (principal) { this.validPrincipal(principal); }
     if (!this.healthCache || this.healthCache.until <= Date.now()) {
       const result = checkRuntime(this.options.dataDir, !!this.options.converter).finally(() => {
         if (this.healthCache?.result === result) this.healthCache.until = Date.now() + 2000;
@@ -394,6 +394,12 @@ export class JobService {
         global_concurrency: this.options.concurrency, tenant_concurrency: tenant.concurrency, agent_concurrency: own.concurrency,
         max_upload_bytes: this.options.maxUploadBytes, max_output_bytes: this.options.maxOutputBytes, agent_override: own.overridden,
         effective: { jobs: Math.min(this.options.maxJobs, tenant.jobs, own.jobs), reserved_bytes: Math.min(this.options.maxStorageBytes, tenant.bytes, own.bytes), concurrency: Math.min(this.options.concurrency, tenant.concurrency, own.concurrency) } } };
+  }
+
+  /** Unauthenticated readiness verdict: booleans only, no capacity/process metrics. */
+  async publicHealth() {
+    const { status, ready, checks: { initialized, accepting_work, storage, converter } } = await this.health();
+    return { status, ready, checks: { initialized, accepting_work, storage: { writable: storage.writable }, converter: { available: converter.available } } };
   }
 
   async close() {

@@ -65,6 +65,7 @@ describe("operator quota overrides", () => {
     expect(own.limits).toMatchObject({ agent_jobs: 3, agent_reserved_bytes: 3000, agent_override: true, effective: { jobs: 3, reserved_bytes: 3000 } });
     expect(other.limits).toMatchObject({ agent_jobs: 1, agent_override: false, effective: { jobs: 1, reserved_bytes: 1100 } });
     expect((await health(instance, bulk)).limits).toMatchObject({ agent_jobs: 5, agent_reserved_bytes: 2200, effective: { jobs: 5, reserved_bytes: 2200 } });
+    for (const anonymous of [await instance.publicHealth(), await instance.health()]) expect(JSON.stringify(anonymous)).not.toMatch(/limits|effective|override|own_/);
     for (const report of [own, other]) for (const foreign of ["user-bulk", report === own ? "user-std" : "user-vip"]) expect(JSON.stringify(report)).not.toContain(foreign);
   });
 
