@@ -13,6 +13,8 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - markdownify-data:/data
+      # Optional operator quota overrides; also set MD_QUOTA_OVERRIDES_FILE in .env.jwt.
+      # - ./secrets/quota-overrides.json:/run/markdownify/quota-overrides.json:ro
     restart: unless-stopped
     init: true
     read_only: true

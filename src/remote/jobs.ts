@@ -5,7 +5,7 @@ import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Converter, createConverter } from "./converter.js";
-import { validatePrincipal, type Principal } from "./identity.js";
+import { quotaKey, validatePrincipal, type Principal, type QuotaOverride } from "./identity.js";
 import { checkRuntime, type RuntimeHealth } from "./health.js";
 import { prepareMarkdownIndex, readMarkdownPage } from "./markdown.js";
 
@@ -14,7 +14,7 @@ export { ServiceError } from "./errors.js";
 export type JobStatus = "awaiting_upload" | "uploaded" | "queued" | "running" | "completed" | "failed" | "expired";
 type Job = { tenant_id: string; agent_id: string; id: string; filename: string; extension: string; size_bytes: number; token_hash?: string; upload_auth_hash?: string; status: JobStatus; created_at: string; expires_at: string; error?: string; error_code?: ErrorCode; error_details?: ErrorDetails };
 export type AuditEvent = { event: string; tenant_id: string; agent_id: string; job_id?: string; status?: string; reason?: string };
-export type JobServiceOptions = { dataDir: string; maxUploadBytes: number; maxStorageBytes: number; maxJobs: number; retentionMs: number; uploadTtlMs: number; conversionTimeoutMs: number; maxOutputBytes: number; concurrency: number; converter?: Converter; legacyOwner?: Principal; maxTenantJobs?: number; maxTenantStorageBytes?: number; maxTenantConcurrency?: number; maxAgentJobs?: number; maxAgentStorageBytes?: number; maxAgentConcurrency?: number; audit?: (event: AuditEvent) => void | Promise<void> };
+export type JobServiceOptions = { dataDir: string; maxUploadBytes: number; maxStorageBytes: number; maxJobs: number; retentionMs: number; uploadTtlMs: number; conversionTimeoutMs: number; maxOutputBytes: number; concurrency: number; converter?: Converter; legacyOwner?: Principal; maxTenantJobs?: number; maxTenantStorageBytes?: number; maxTenantConcurrency?: number; maxAgentJobs?: number; maxAgentStorageBytes?: number; maxAgentConcurrency?: number; quotaOverrides?: ReadonlyMap<string, QuotaOverride>; audit?: (event: AuditEvent) => void | Promise<void> };
 const extensions = new Set([".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".md", ".csv", ".html", ".json"]);
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const tokenHash = (principal: Principal, id: string, tokenDigest: string) => hash(`${principal.tenantId}:${principal.agentId}:${id}:${tokenDigest}`);
@@ -36,6 +36,7 @@ export class JobService {
     for (const [name, value] of Object.entries(options)) {
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`Invalid ${name}`);
     }
+    for (const value of options.quotaOverrides?.values() ?? []) for (const limit of Object.values(value)) if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("Invalid quotaOverrides");
     this.options.dataDir = path.resolve(options.dataDir);
     this.converter = options.converter ?? createConverter({ maxOutputBytes: options.maxOutputBytes });
   }
@@ -51,6 +52,12 @@ export class JobService {
     const job = this.jobs.get(id);
     if (!job) throw new ServiceError(404, "Job not found");
     return job;
+  }
+  /** Agent-scope caps for one principal: an operator override when configured, otherwise the defaults. */
+  private agentLimits(principal: Principal) {
+    const override = this.options.quotaOverrides?.get(quotaKey(principal));
+    return { jobs: override?.maxJobs ?? this.options.maxAgentJobs ?? this.options.maxJobs, bytes: override?.maxStorageBytes ?? this.options.maxAgentStorageBytes ?? this.options.maxStorageBytes,
+      concurrency: override?.maxConcurrency ?? this.options.maxAgentConcurrency ?? this.options.concurrency, overridden: !!override };
   }
   private validPrincipal(principal: Principal) {
     try { validatePrincipal(principal); } catch { throw new ServiceError(401, "Invalid principal"); }
@@ -157,10 +164,11 @@ export class JobService {
       const tenant = live.filter(job => job.tenant_id === principal.tenantId);
       const agent = tenant.filter(job => job.agent_id === principal.agentId);
       const reservation = size_bytes + this.options.maxOutputBytes;
+      const own = this.agentLimits(principal);
       for (const [scope, jobs, maxJobs, maxBytes] of [
         ["global", live, this.options.maxJobs, this.options.maxStorageBytes],
         ["tenant", tenant, this.options.maxTenantJobs ?? this.options.maxJobs, this.options.maxTenantStorageBytes ?? this.options.maxStorageBytes],
-        ["agent", agent, this.options.maxAgentJobs ?? this.options.maxJobs, this.options.maxAgentStorageBytes ?? this.options.maxStorageBytes],
+        ["agent", agent, own.jobs, own.bytes],
       ] as const) {
         const bytes = scope === "global" ? reserved : jobs.reduce((total, job) => total + job.size_bytes + this.options.maxOutputBytes, 0);
         if (jobs.length >= maxJobs || bytes + reservation > maxBytes) {
@@ -273,7 +281,7 @@ export class JobService {
       const activeJobs = [...this.active.keys()].map(id => this.jobs.get(id)).filter((job): job is Job => !!job);
       const eligible = [...this.jobs.values()].filter(job => job.status === "queued" && !this.active.has(job.id) && Date.parse(job.expires_at) > Date.now()
         && activeJobs.filter(active => active.tenant_id === job.tenant_id).length < (this.options.maxTenantConcurrency ?? this.options.concurrency)
-        && activeJobs.filter(active => active.tenant_id === job.tenant_id && active.agent_id === job.agent_id).length < (this.options.maxAgentConcurrency ?? this.options.concurrency));
+        && activeJobs.filter(active => active.tenant_id === job.tenant_id && active.agent_id === job.agent_id).length < this.agentLimits({ tenantId: job.tenant_id, agentId: job.agent_id }).concurrency);
       if (!eligible.length) break;
       const tenants = [...new Set(eligible.map(job => job.tenant_id))];
       const tenant = tenants[(tenants.indexOf(this.lastTenant ?? "") + 1) % tenants.length];
@@ -377,12 +385,15 @@ export class JobService {
     const mine = [...this.jobs.values()].filter(j => j.tenant_id === principal.tenantId && j.agent_id === principal.agentId);
     const states = Object.fromEntries(["awaiting_upload", "uploaded", "queued", "running", "completed", "failed", "expired"].map(s => [s, mine.filter(j => j.status === s).length]));
     const live = mine.filter(j => j.status !== "expired");
+    // agent_* include only this caller's own operator override; effective is the tightest cap admission and scheduling apply.
+    const own = this.agentLimits(principal);
+    const tenant = { jobs: this.options.maxTenantJobs ?? this.options.maxJobs, bytes: this.options.maxTenantStorageBytes ?? this.options.maxStorageBytes, concurrency: this.options.maxTenantConcurrency ?? this.options.concurrency };
     return { ...base, own_jobs: states, own_reserved_bytes: live.reduce((n, j) => n + j.size_bytes + this.options.maxOutputBytes, 0),
       limits: { global_jobs: this.options.maxJobs, global_reserved_bytes: this.options.maxStorageBytes,
-        tenant_jobs: this.options.maxTenantJobs ?? this.options.maxJobs, agent_jobs: this.options.maxAgentJobs ?? this.options.maxJobs,
-        tenant_reserved_bytes: this.options.maxTenantStorageBytes ?? this.options.maxStorageBytes, agent_reserved_bytes: this.options.maxAgentStorageBytes ?? this.options.maxStorageBytes,
-        global_concurrency: this.options.concurrency, tenant_concurrency: this.options.maxTenantConcurrency ?? this.options.concurrency, agent_concurrency: this.options.maxAgentConcurrency ?? this.options.concurrency,
-        max_upload_bytes: this.options.maxUploadBytes, max_output_bytes: this.options.maxOutputBytes } };
+        tenant_jobs: tenant.jobs, agent_jobs: own.jobs, tenant_reserved_bytes: tenant.bytes, agent_reserved_bytes: own.bytes,
+        global_concurrency: this.options.concurrency, tenant_concurrency: tenant.concurrency, agent_concurrency: own.concurrency,
+        max_upload_bytes: this.options.maxUploadBytes, max_output_bytes: this.options.maxOutputBytes, agent_override: own.overridden,
+        effective: { jobs: Math.min(this.options.maxJobs, tenant.jobs, own.jobs), reserved_bytes: Math.min(this.options.maxStorageBytes, tenant.bytes, own.bytes), concurrency: Math.min(this.options.concurrency, tenant.concurrency, own.concurrency) } } };
   }
 
   async close() {

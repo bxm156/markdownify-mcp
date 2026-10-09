@@ -21,7 +21,7 @@ The model cannot transfer a file by naming its local path. The runtime must read
 
 ## Check readiness
 
-Use get_service_health({}) with your normal identity to inspect readiness, your own job states/reserved bytes and configured limits. Queued work or a full quota is capacity pressure, not a failed process. Anonymous initialization/ping is monitoring only and never authorizes job tools; keep using normal authentication. See [health reference](docs/HEALTH.md).
+Use get_service_health({}) with your normal identity to inspect readiness, your own job states/reserved bytes, configured limits and `limits.effective` (the tightest caps that apply to you). Queued work or a full quota is capacity pressure, not a failed process. Anonymous initialization/ping is monitoring only and never authorizes job tools; keep using normal authentication. See [health reference](docs/HEALTH.md).
 
 ## Convert a file
 

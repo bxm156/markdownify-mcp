@@ -74,6 +74,8 @@ Configure HTTPS and preserve Authorization plus X-Upload-Token for `/mcp` and `/
 
 Only RS256 is accepted. Issuer, audience, signature, expiration, issued-at, bounded lifetime, subject format and scopes are checked. JWKS requests have a five-second timeout, no redirect following, 256 KiB body cap, 60-second cache and five-second refresh cooldown. Key rotation is supported; cached public keys and issued JWTs are not instantly revoked. Avoid sharing virtual keys or service identities. `MD_JWT_ALLOW_HTTP_LOCALHOST=1` permits loopback-only JWKS HTTP for tests; keep it unset in remote deployments.
 
+Each LiteLLM user ID is both tenant and agent, so `MD_MAX_TENANT_*` and `MD_MAX_AGENT_*` both constrain it. To give particular users different caps, list each user ID as both `tenant_id` and `agent_id` in `MD_QUOTA_OVERRIDES_FILE`; see [operator quota overrides](MULTITENANT.md#operator-quota-overrides). Users not listed keep the defaults; the file is not an access allowlist.
+
 ## 4. Configure agents and upload files
 
 Clients connect to `https://litellm.example.com/markdownify/mcp` with their own LiteLLM virtual key. No Markdownify credential forwarding is needed.

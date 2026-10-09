@@ -104,8 +104,32 @@ Global limits from [REMOTE.md](REMOTE.md) still apply. The following additional 
 | `MD_MAX_AGENT_JOBS` | 10 | Live jobs for one agent |
 | `MD_MAX_AGENT_STORAGE_BYTES` | 134,217,728 (128 MiB) | Input plus maximum-output reservations for one agent |
 | `MD_MAX_AGENT_CONCURRENCY` | 1 | Active conversions for one agent |
+| `MD_QUOTA_OVERRIDES_FILE` | unset | Optional per-principal agent caps; see [operator quota overrides](#operator-quota-overrides) |
 
 Every value must be a positive safe integer. A reservation must fit global, tenant, and agent budgets. Even a tiny upload reserves the configured maximum output size, so storage limits can bind before job-count limits. Queue scheduling skips owners that have reached their concurrency cap, allowing another eligible owner to run; global concurrency still bounds total converters. These are admission and scheduling limits, not filesystem quotas or a distributed queue.
+
+### Operator quota overrides
+
+Operators can give specific principals different agent-scope caps with a JSON file named by `MD_QUOTA_OVERRIDES_FILE`:
+
+```json
+{
+  "overrides": [
+    { "tenant_id": "tenant-a", "agent_id": "batch-agent", "max_jobs": 40, "max_storage_bytes": 1073741824, "max_concurrency": 2 },
+    { "tenant_id": "markdownify-agent-b", "agent_id": "markdownify-agent-b", "max_jobs": 2 }
+  ]
+}
+```
+
+Each entry replaces the `MD_MAX_AGENT_JOBS`, `MD_MAX_AGENT_STORAGE_BYTES` and/or `MD_MAX_AGENT_CONCURRENCY` defaults for exactly that `(tenant_id, agent_id)` pair; omitted fields keep the default. An override may lower or raise a cap. Global and tenant caps still apply, so the effective cap is the minimum of the global, tenant and agent values. In [JWT mode](JWT.md) the tenant and agent are both the LiteLLM user ID, so use that ID for both fields; the tenant defaults (`MD_MAX_TENANT_*`) also constrain that user, and raising a user above them requires raising those defaults too.
+
+This is not an allowlist. Principals that are not listed keep the configured defaults, and an entry never grants or denies access to files or tools. Identity still comes only from the authenticator; a quota entry does not provision credentials or LiteLLM users.
+
+The file is read once at startup and validated strictly. Startup fails with an `MD_QUOTA_OVERRIDES_FILE` error if the file is missing, not a regular file, larger than 1 MiB or not JSON; if the top level has keys other than `overrides`; or if an entry has an invalid or duplicate principal, an unknown field, no limit field, or a limit that is not a positive safe integer. A limit above the matching global cap (`MD_MAX_JOBS`, `MD_MAX_STORAGE_BYTES` or `MD_CONCURRENCY`) is rejected rather than silently clamped. Restart the service after editing the file. In Docker, mount the file read-only and readable by UID/GID 10001, as for the credential registry.
+
+Agents cannot change quotas. No tool accepts tenant, agent or quota arguments. `get_service_health` shows each caller only its own job states, `own_reserved_bytes` and `limits`: `agent_*` include that caller's override, `agent_override` says whether one applies, and `limits.effective` gives the tightest `jobs`, `reserved_bytes` and `concurrency` that admission and scheduling enforce. It never reveals other principals' overrides, usage or IDs. Quota errors keep the existing `JOB_LIMIT_EXCEEDED` and `STORAGE_LIMIT_EXCEEDED` codes; with `scope: "agent"`, `limit_jobs` or `limit_bytes` is the overridden value.
+
+Reservations count input bytes plus the maximum output size for every non-expired job, including queued and running work. Deleting a job releases its reservation immediately; an expired job releases it when periodic cleanup marks it expired, within a minute of its expiry time. They are admission limits, not a filesystem hard quota: manifests, indexes and audit logs add overhead outside the budget.
 
 ## Operations
 

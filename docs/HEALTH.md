@@ -18,7 +18,7 @@ Use get_service_health({}) with the normal authenticated agent and its per-tool 
 
 - own_jobs: counts for the caller's job states, including retained expired tombstones.
 - own_reserved_bytes: the caller's current input-plus-maximum-output reservation, using the same non-expired-state accounting as admission.
-- limits: configured global/tenant/agent job, storage and concurrency caps, and per-file/output limits.
+- limits: configured global/tenant/agent job, storage and concurrency caps (agent caps include any [operator override](MULTITENANT.md#operator-quota-overrides) for the caller, flagged by agent_override), per-file/output limits, and effective: the tightest jobs, reserved_bytes and concurrency caps that apply to the caller.
 
 There is no foreign-user usage, job ID or tenant list. Global limits are configuration, not global usage. When JWT tenant and agent IDs both equal the user ID, both caps constrain that user. A full quota or queued work is normal capacity pressure and does not make readiness fail. Quotas exclude metadata/index/audit overhead; disk free space is a filesystem metric, not reserved storage.
 

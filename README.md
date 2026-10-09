@@ -302,7 +302,7 @@ Verify forwarding with two distinct agents in your own LiteLLM deployment. [Iden
 
 ## Limits and troubleshooting
 
-Defaults are 25 MiB per input and output, 24-hour retention, 15-minute upload tokens and a 120-second conversion timeout. Global, tenant and agent budgets also limit job admission and concurrent conversions. Small inputs reserve the maximum output budget. Configure limits in [.env.multitenant.example](.env.multitenant.example); [quota details](docs/MULTITENANT.md#budgets-and-scheduling).
+Defaults are 25 MiB per input and output, 24-hour retention, 15-minute upload tokens and a 120-second conversion timeout. Global, tenant and agent budgets also limit job admission and concurrent conversions. Small inputs reserve the maximum output budget. Configure limits in [.env.multitenant.example](.env.multitenant.example); [quota details](docs/MULTITENANT.md#budgets-and-scheduling). Operators can set per-agent caps with `MD_QUOTA_OVERRIDES_FILE` ([operator quota overrides](docs/MULTITENANT.md#operator-quota-overrides)).
 
 | Symptom | Check |
 | --- | --- |
@@ -342,4 +342,4 @@ The upstream local stdio entry point remains `dist/index.js` (`bun start`) with 
 
 ## Health monitoring
 
-See [real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). Authenticated agents can call get_service_health for their own queue/reservation metrics and configured limits; identity-free probes never gain file access.
+See [real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). Authenticated agents can call get_service_health for their own queue/reservation metrics, configured limits and effective limits; identity-free probes never gain file access.
