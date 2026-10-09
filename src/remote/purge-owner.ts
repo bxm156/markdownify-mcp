@@ -4,7 +4,7 @@ import path from "node:path";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { validatePrincipal, type Principal } from "./identity.js";
-import { LOCK_REMOVAL_HINT, readLock } from "./lock.js";
+import { LOCK_REMOVAL_HINT, LockHeldError, acquireLock, releaseLock } from "./lock.js";
 
 export type PurgedJob = { job_id: string; status: string; bytes: number | null; result: "listed" | "deleted" | "failed"; code?: string };
 export type PurgeReport = { applied: boolean; tenant_id: string; agent_id: string; jobs: PurgedJob[]; skipped: { job_id: string; reason: "missing_manifest" | "legacy_unowned" | "malformed_owner" | "id_mismatch" }[]; unreadable: string[] };
@@ -17,16 +17,21 @@ async function directoryBytes(directory: string) { let bytes = 0; for (const nam
  * Privileged operator maintenance for one data volume while the service is STOPPED: list (default) or remove every job
  * directory whose manifest names this tenant/agent. Reads manifests and file sizes only, never document contents or credentials.
  * Each job is handled independently, so the report always says which jobs were deleted, which failed and which were skipped.
+ * It holds the service's lock for the whole run, so the service cannot start and load half-deleted directories meanwhile.
  */
 export async function purgeOwnerJobs(dataDir: string, owner: Principal, apply = false): Promise<PurgeReport> {
   try { validatePrincipal(owner); } catch { throw new PurgeRefused("Invalid tenant_id or agent_id"); }
   let root: string;
   try { root = await fs.realpath(dataDir); if (!(await fs.stat(root)).isDirectory()) throw new Error(); } catch { throw new PurgeRefused("Data directory not found"); }
-  if (await readLock(root)) throw new PurgeRefused(`A lock file exists (MD_DATA_DIR/.lock). Stop the service if it is running. ${LOCK_REMOVAL_HINT}`);
   const entries = await fs.readdir(root, { withFileTypes: true });
   const candidates = entries.filter(entry => entry.isDirectory() && /^[0-9a-f-]{36}$/.test(entry.name)).map(entry => entry.name);
   const manifests = await Promise.all(candidates.map(name => fs.lstat(path.join(root, name, "job.json")).then(stat => stat.isFile(), () => false)));
   if (!entries.some(entry => entry.isFile() && entry.name === "audit.jsonl") && !manifests.some(Boolean)) throw new PurgeRefused("Not a markdownify data directory (no job manifests or audit.jsonl)");
+  try { await acquireLock(root); }
+  catch (error) { if (error instanceof LockHeldError) throw new PurgeRefused(`A lock file exists (MD_DATA_DIR/.lock). Stop the service if it is running. ${LOCK_REMOVAL_HINT}`); throw error; }
+  try { return await scan(root, candidates, owner, apply); } finally { await releaseLock(root); }
+}
+async function scan(root: string, candidates: string[], owner: Principal, apply: boolean) {
   const report: PurgeReport = { applied: apply, tenant_id: owner.tenantId, agent_id: owner.agentId, jobs: [], skipped: [], unreadable: [] };
   for (const name of candidates) {
     const directory = path.join(root, name);

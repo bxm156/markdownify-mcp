@@ -156,15 +156,16 @@ The data volume contains:
 | `audit.jsonl`, `audit.jsonl.1`–`.3` | Metadata-only audit history shared by all agents |
 | `.lock` | PID of the running service (informational only); removed whenever the process exits, but left behind by SIGKILL, an OOM kill or a host crash |
 
-Stop the service before changing the volume. One process owns each data volume and loads every manifest only at startup, so edits under a running service race its in-memory state. The service creates `.lock` exclusively and refuses startup whenever that file exists, with `Data directory is in use: MD_DATA_DIR/.lock exists`. Graceful shutdown removes it, and so does every other process exit the runtime can observe: the forced exit when shutdown exceeds its 10-second deadline, an uncaught exception, or a startup failure. A SIGKILL (`docker kill`, or `docker stop` exceeding `stop_grace_period`), an OOM kill or a host crash leaves it behind, and every restart then fails with that message. Automatic PID-based reclamation is unsafe because PIDs are reused and differ between container namespaces, so remove a leftover lock manually. First confirm that no service, container or replica is using the volume:
+Stop the service before changing the volume. One process owns each data volume and loads every manifest only at startup, so edits under a running service race its in-memory state. The service creates `.lock` exclusively and refuses startup whenever that file exists, with `Data directory is in use: MD_DATA_DIR/.lock exists`. Graceful shutdown on SIGTERM, SIGINT or SIGHUP removes it, and so does every other process exit the runtime can observe: the forced exit when shutdown exceeds its 10-second deadline, an uncaught exception, or a startup failure. A SIGKILL (`docker kill`, or `docker stop` exceeding `stop_grace_period`), an OOM kill or a host crash leaves it behind, and every restart then fails with that message. With `restart: unless-stopped` the container then keeps restarting and failing, so stop it explicitly before removing the lock. A process only ever removes a lock whose contents (its PID plus a random per-start token) it wrote itself, so a hung old process cannot remove a newer service's lock. Automatic PID-based reclamation is unsafe because PIDs are reused and differ between container namespaces, so remove a leftover lock manually:
 
 ```sh
-docker compose -f compose.multitenant.yaml ps --all   # markdownify must not be running
+docker compose -f compose.multitenant.yaml stop markdownify   # also stops a crash-restart loop
+docker compose -f compose.multitenant.yaml ps --all              # confirm no markdownify container is running or restarting
 docker compose -f compose.multitenant.yaml run --rm --no-deps --entrypoint rm markdownify -f /data/.lock
 docker compose -f compose.multitenant.yaml start markdownify
 ```
 
-For a native process, confirm that it is stopped and run `rm -f "$MD_DATA_DIR/.lock"`. The purge tool refuses to run while any lock exists, and refuses a path that contains neither job manifests nor `audit.jsonl`. It follows a symlinked data directory, reads manifests and file sizes only, never document contents, and is a dry run unless `--apply` is given:
+For a native process, stop it (and any supervisor that restarts it), confirm that it is not running, and run `rm -f "$MD_DATA_DIR/.lock"`. The purge tool refuses to run while any lock exists and holds the lock itself for the whole run, so the service cannot start and load half-deleted directories during a purge; it refuses a path that contains neither job manifests nor `audit.jsonl`. It follows a symlinked data directory, reads manifests and file sizes only, never document contents, and is a dry run unless `--apply` is given:
 
 ```sh
 docker compose -f compose.multitenant.yaml stop markdownify

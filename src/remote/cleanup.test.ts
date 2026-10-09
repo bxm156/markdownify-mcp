@@ -7,6 +7,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { JobService, type JobServiceOptions } from "./jobs.js";
 import { purgeOwnerJobs } from "./purge-owner.js";
+import { acquireLock, readLock, releaseLock } from "./lock.js";
 import type { Principal } from "./identity.js";
 
 const alice: Principal = { tenantId: "team", agentId: "alice" }, bob: Principal = { tenantId: "team", agentId: "bob" }, carol: Principal = { tenantId: "other", agentId: "carol" };
@@ -236,7 +237,7 @@ describe("retention cleanup resilience", () => {
 describe("one process per data volume", () => {
   test("existing locks fail closed and crash leftovers require operator removal", async () => {
     const { instance, options } = await service(), lock = path.join(options.dataDir, ".lock");
-    expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(process.pid));
+    expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(process.pid));
     if (process.platform !== "win32") expect((await fs.stat(lock)).mode & 0o777).toBe(0o600);
     // The current test process holds the lock, so a second service on the same volume is refused.
     await expect(new JobService(options).init()).rejects.toThrow("Data directory is in use");
@@ -245,7 +246,7 @@ describe("one process per data volume", () => {
     try {
       await fs.writeFile(lock, `${sleeper.pid}\n`);
       await expect(new JobService(options).init()).rejects.toThrow("Data directory is in use");
-      expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(sleeper.pid));
+      expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(sleeper.pid));
     } finally { sleeper.kill("SIGKILL"); await new Promise(resolve => sleeper.once("exit", resolve)); }
     // Even a dead or reused PID cannot safely prove ownership across containers.
     for (const stale of [String(deadPid()), String(process.pid), "garbage"]) {
@@ -254,9 +255,22 @@ describe("one process per data volume", () => {
       expect(await fs.readFile(lock, "utf8")).toBe(stale);
       await fs.rm(lock);
       const { instance: next } = await service({ dataDir: options.dataDir });
-      expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(process.pid)); await next.close();
+      expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(process.pid)); await next.close();
     }
   });
+  test("release never removes a lock this process did not write", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-foreign-lock-")); directories.push(dataDir);
+    const real = await acquireLock(dataDir), lock = path.join(real, ".lock");
+    const mine = await readLock(dataDir);
+    expect(mine).toEqual({ pid: process.pid, token: expect.stringMatching(/^[0-9a-f-]{36}$/) });
+    // An operator removed the lock of a hung process and another process acquired a fresh one.
+    const foreign = `${process.pid}\n00000000-0000-0000-0000-000000000000\n`;
+    await fs.writeFile(lock, foreign); await releaseLock(real);
+    expect(await fs.readFile(lock, "utf8")).toBe(foreign);
+    await fs.rm(lock); const again = await acquireLock(dataDir); await releaseLock(again);
+    await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("concurrent acquisitions admit exactly one service", async () => {
     const { instance, options } = await service(); await instance.close();
     const contenders = Array.from({ length: 10 }, () => new JobService(options));
@@ -300,6 +314,7 @@ describe("retired owner purge tool", () => {
     const rm = spyOn(fs, "rm").mockImplementation(((target: any, opts: any) => String(target) === failingDir ? denied(target) : realRm(target, opts)) as typeof fs.rm);
     let applied;
     try { applied = await purgeOwnerJobs(options.dataDir, alice, true); } finally { rm.mockRestore(); }
+    await expect(fs.stat(path.join(options.dataDir, ".lock"))).rejects.toMatchObject({ code: "ENOENT" });
     expect(applied.jobs.find(job => job.job_id === mine[0])).toMatchObject({ result: "failed", code: "EACCES" });
     expect(applied.jobs.filter(job => job.result === "deleted").map(job => job.job_id).sort()).toEqual([mine[1], mine[2]].sort());
     for (const id of [mine[1], mine[2]]) await expect(fs.stat(path.join(options.dataDir, id))).rejects.toMatchObject({ code: "ENOENT" });
@@ -309,6 +324,24 @@ describe("retired owner purge tool", () => {
     const { instance: restarted } = await service({ dataDir: options.dataDir });
     await expect(restarted.getStatus(alice, mine[0])).rejects.toMatchObject({ statusCode: 404 });
     expect((await restarted.getStatus(bob, theirs[0])).status).toBe("uploaded"); expect((await restarted.getStatus(carol, theirs[1])).status).toBe("uploaded");
+  });
+
+  test("a running purge holds the volume lock so the service cannot start mid-deletion", async () => {
+    const { instance, options } = await service();
+    const id = await uploaded(instance, alice); await instance.close();
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; }), reached = new Promise<void>(resolve => { entered = resolve; });
+    const target = path.join(options.dataDir, id);
+    const rm = spyOn(fs, "rm").mockImplementation((async (path: any, opts: any) => { if (String(path) === target) { entered(); await gate; } return realRm(path, opts); }) as typeof fs.rm);
+    let purge: Promise<unknown> | undefined;
+    try {
+      purge = purgeOwnerJobs(options.dataDir, alice, true); await reached;
+      await expect(new JobService(options).init()).rejects.toThrow("Data directory is in use: MD_DATA_DIR/.lock exists");
+      release(); expect(await purge).toMatchObject({ jobs: [{ job_id: id, result: "deleted" }] });
+    } finally { release(); await purge?.catch(() => undefined); rm.mockRestore(); }
+    await expect(fs.stat(path.join(options.dataDir, ".lock"))).rejects.toMatchObject({ code: "ENOENT" });
+    const { instance: restarted } = await service({ dataDir: options.dataDir });
+    await expect(restarted.getStatus(alice, id)).rejects.toMatchObject({ statusCode: 404 });
   });
 
   test("refuses invalid owners, missing paths and directories that are not a data volume", async () => {
@@ -335,7 +368,8 @@ describe("retired owner purge tool", () => {
 });
 
 const node = Bun.which("node"), root = path.resolve(import.meta.dir, "../..");
-const freePort = () => new Promise<number>((resolve, reject) => { const server = net.createServer(); server.once("error", reject); server.listen(0, "127.0.0.1", () => { const { port } = server.address() as net.AddressInfo; server.close(() => resolve(port)); }); });
+// Hold an ephemeral port until just before the first spawn to narrow the window in which another process could take it.
+const reservePort = () => new Promise<{ port: number; release: () => Promise<void> }>((resolve, reject) => { const server = net.createServer(); server.once("error", reject); server.listen(0, "127.0.0.1", () => resolve({ port: (server.address() as net.AddressInfo).port, release: () => new Promise<void>(done => server.close(() => done())) })); });
 describe.skipIf(!node)("compiled entry points under node", () => {
   beforeAll(() => { const build = spawnSync(process.execPath, ["run", "build:remote"], { cwd: root, encoding: "utf8" }); if (build.status !== 0) throw new Error(`build failed: ${build.stdout}${build.stderr}`); }, 60_000);
 
@@ -367,19 +401,22 @@ describe.skipIf(!node)("compiled entry points under node", () => {
     expect(await fs.readFile(path.join(options.dataDir, corrupt, "job.json"), "utf8")).toBe("{not json");
   }, 30_000);
 
-  test("process.exit and uncaught exceptions release the lock", async () => {
+  test("process.exit and uncaught exceptions release the lock, but never a lock replaced by another process", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-exit-lock-")); directories.push(dataDir);
-    const lockModule = JSON.stringify(path.join(root, "dist/remote/lock.js"));
+    const lockModule = JSON.stringify(path.join(root, "dist/remote/lock.js")), lock = path.join(dataDir, ".lock"), foreign = "4242\n00000000-0000-0000-0000-000000000000\n";
+    const run = (body: string) => spawnSync(node!, ["--input-type=module", "-e", `import { acquireLock } from ${lockModule}; import fs from 'node:fs'; await acquireLock(${JSON.stringify(dataDir)}); if (!fs.existsSync(${JSON.stringify(lock)})) process.exit(9); ${body}`], { encoding: "utf8" });
     for (const ending of ["process.exit(1);", "throw new Error('boom');"]) {
-      const child = spawnSync(node!, ["--input-type=module", "-e", `import { acquireLock } from ${lockModule}; import fs from 'node:fs'; await acquireLock(${JSON.stringify(dataDir)}); if (!fs.existsSync(${JSON.stringify(path.join(dataDir, ".lock"))})) process.exit(9); ${ending}`], { encoding: "utf8" });
-      expect(child.status).toBe(1);
-      await expect(fs.stat(path.join(dataDir, ".lock"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(run(ending).status).toBe(1);
+      await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+      // The lock was removed and re-acquired by someone else before this process exited: the exit hook leaves it alone.
+      expect(run(`fs.writeFileSync(${JSON.stringify(lock)}, ${JSON.stringify(foreign)}); ${ending}`).status).toBe(1);
+      expect(await fs.readFile(lock, "utf8")).toBe(foreign); await fs.rm(lock);
     }
   });
 
   test("a SIGKILLed server leaves its lock, restarts fail with the removal step, and removing it allows restart", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-sigkill-")); directories.push(dataDir);
-    const port = await freePort(), lock = path.join(dataDir, ".lock");
+    const { port, release } = await reservePort(), lock = path.join(dataDir, ".lock");
     const env = { ...process.env, MD_API_KEY: "k".repeat(40), MD_DATA_DIR: dataDir, MD_HOST: "127.0.0.1", MD_PORT: String(port), MD_PUBLIC_BASE_URL: `http://127.0.0.1:${port}`, MARKITDOWN_PATH: node! };
     const start = () => { const child = spawn(node!, [path.join(root, "dist/remote/index.js")], { env, stdio: ["ignore", "ignore", "pipe"] }); let stderr = ""; child.stderr!.on("data", chunk => { stderr += chunk; }); const exited = new Promise<number | null>(resolve => child.once("exit", code => resolve(code))); return { child, exited, stderr: () => stderr }; };
     const ready = async (server: ReturnType<typeof start>) => {
@@ -390,29 +427,31 @@ describe.skipIf(!node)("compiled entry points under node", () => {
       }
       throw new Error("server never became ready");
     };
-    const first = start();
-    try { await ready(first); expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(first.child.pid)); first.child.kill("SIGKILL"); await first.exited; }
+    await release(); const first = start();
+    try { await ready(first); expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(first.child.pid)); first.child.kill("SIGKILL"); await first.exited; }
     finally { if (first.child.exitCode === null) first.child.kill("SIGKILL"); }
-    expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(first.child.pid));
-    const refused = start(); expect(await refused.exited).toBe(1);
+    expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(first.child.pid));
+    const refused = start();
+    try { expect(await refused.exited).toBe(1); } finally { if (refused.child.exitCode === null) refused.child.kill("SIGKILL"); }
     expect(refused.stderr()).toContain("Data directory is in use: MD_DATA_DIR/.lock exists"); expect(refused.stderr()).toContain("remove MD_DATA_DIR/.lock and restart");
     await fs.rm(lock, { force: true });
-    const restarted = start();
-    try {
-      await ready(restarted);
-      expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(restarted.child.pid));
-      if (process.platform === "win32") {
-        // Windows kill() terminates the child without running Node's signal handlers.
-        restarted.child.kill("SIGKILL");
-        await restarted.exited;
-        expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(restarted.child.pid));
-      } else {
-        restarted.child.kill("SIGTERM");
-        expect(await restarted.exited).toBe(0);
-        // POSIX graceful shutdown releases the lock again.
-        await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
-      }
+    for (const signal of process.platform === "win32" ? ["SIGKILL"] as const : ["SIGTERM", "SIGHUP"] as const) {
+      const restarted = start();
+      try {
+        await ready(restarted);
+        expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(restarted.child.pid));
+        if (process.platform === "win32") {
+          // Windows kill() terminates the child without running Node's signal handlers.
+          restarted.child.kill("SIGKILL");
+          await restarted.exited;
+          expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(restarted.child.pid));
+        } else {
+          restarted.child.kill(signal);
+          expect(await restarted.exited).toBe(0);
+          // POSIX graceful shutdown on SIGTERM and SIGHUP releases the lock again.
+          await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+        }
+      } finally { if (restarted.child.exitCode === null) restarted.child.kill("SIGKILL"); }
     }
-    finally { if (restarted.child.exitCode === null) restarted.child.kill("SIGKILL"); }
   }, 30_000);
 });
