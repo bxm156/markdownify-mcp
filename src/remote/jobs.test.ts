@@ -156,7 +156,7 @@ describe("durable single tenant jobs", () => {
       const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
       await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"]));
       await new Promise(resolve => setTimeout(resolve, 25)); await instance.cleanup();
-      expect((await fs.readdir(options.dataDir)).length).toBeLessThanOrEqual(1);
+      expect((await fs.readdir(options.dataDir)).filter(name => !name.startsWith(".")).length).toBeLessThanOrEqual(1);
     }
   });
   test("subprocess adapter bounds stdout and terminates on abort", async () => {

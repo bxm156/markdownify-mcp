@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -33,6 +33,8 @@ const manifest = async (dataDir: string, id: string) => JSON.parse(await fs.read
 const files = async (dataDir: string, id: string) => (await fs.readdir(path.join(dataDir, id))).sort();
 const health = async (instance: JobService, actor = alice) => await instance.health(actor) as any;
 const advance = (ms: number) => setSystemTime(new Date(Date.now() + ms));
+const lines = (spy: { mock: { calls: unknown[][] } }, message: string) => spy.mock.calls.filter(call => call[0] === message);
+const deadPid = () => spawnSync(process.execPath, ["-e", ""]).pid!;
 afterEach(async () => {
   setSystemTime();
   await Promise.all(services.splice(0).map(instance => instance.close()));
@@ -40,39 +42,46 @@ afterEach(async () => {
 });
 
 describe("retention cleanup resilience", () => {
-  test("a remove failure is isolated to one job, logged without paths and retried until a later sweep recovers", async () => {
+  test("a remove failure is isolated to one job, visible only to its owner, logged without paths and retried until recovery", async () => {
     const { instance, options } = await service();
     const failing = await completed(instance, alice), other = await completed(instance, carol), failingDir = path.join(options.dataDir, failing);
     const rm = spyOn(fs, "rm").mockImplementation(((target: any, opts: any) => String(target).startsWith(failingDir) ? denied(target) : realRm(target, opts)) as typeof fs.rm);
     const logged = spyOn(console, "error").mockImplementation(() => undefined);
     try {
       advance(120_000); await instance.cleanup();
-      // The failure on the first job did not stop the sweep: another owner's job is erased and tombstoned.
+      // The failure on the first job did not stop the sweep: another tenant's job is erased and tombstoned.
       expect(await files(options.dataDir, other)).toEqual(["job.json"]);
       expect((await manifest(options.dataDir, other)).status).toBe("expired");
       // The failed job keeps its committed state and reservation, and stays inaccessible after expiry.
       expect((await manifest(options.dataDir, failing)).status).toBe("completed");
       expect(await files(options.dataDir, failing)).toEqual(["input.txt", "job.json", "output.md", "output.md.index.json"]);
       await expect(instance.getMarkdown(alice, failing)).rejects.toMatchObject({ statusCode: 410 });
-      expect((await health(instance)).own_reserved_bytes).toBe(1 + options.maxOutputBytes);
-      expect((await health(instance)).cleanup).toMatchObject({ jobs_failed_last_sweep: 1, failures_total: 1, consecutive_failed_sweeps: 1, last_error_code: "EACCES" });
-      expect(logged).toHaveBeenCalledTimes(1);
+      const owner = await health(instance);
+      expect(owner.own_reserved_bytes).toBe(1 + options.maxOutputBytes);
+      expect(owner.cleanup).toMatchObject({ own_jobs_failed_last_sweep: 1, own_jobs_pending_retry: 1, last_sweep_started_at: expect.any(String), last_sweep_finished_at: expect.any(String) });
+      // Other tenants and agents never see failures caused by someone else's job.
+      for (const actor of [carol, bob]) {
+        const foreign = await health(instance, actor);
+        expect(foreign.cleanup).toMatchObject({ own_jobs_failed_last_sweep: 0, own_jobs_pending_retry: 0 });
+        expect(JSON.stringify(foreign)).not.toContain("EACCES"); expect(JSON.stringify(foreign)).not.toContain(failing);
+      }
+      expect(lines(logged, "Job cleanup failed")).toHaveLength(1); expect(lines(logged, "Job cleanup sweep incomplete")).toHaveLength(1);
+      expect(lines(logged, "Job cleanup sweep incomplete")[0][1]).toMatchObject({ jobs_failed: 1, failures_total: 1, consecutive_failed_sweeps: 1, last_error_code: "EACCES" });
       const log = JSON.stringify(logged.mock.calls);
       expect(log).toContain(failing); expect(log).toContain("EACCES"); expect(log).not.toContain(options.dataDir); expect(log).not.toContain("permission denied");
-      // Repeated sweeps keep retrying the failed job and still remove the other owner's expired tombstone.
+      // Repeated sweeps keep retrying the failed job and still remove the other tenant's expired tombstone.
       advance(120_000); await instance.cleanup();
       await expect(fs.stat(path.join(options.dataDir, other))).rejects.toMatchObject({ code: "ENOENT" });
-      expect((await health(instance)).cleanup).toMatchObject({ jobs_failed_last_sweep: 1, failures_total: 2, consecutive_failed_sweeps: 2 });
-      expect(logged).toHaveBeenCalledTimes(2);
+      expect(lines(logged, "Job cleanup failed")).toHaveLength(2);
+      expect(lines(logged, "Job cleanup sweep incomplete")[1][1]).toMatchObject({ failures_total: 2, consecutive_failed_sweeps: 2 });
       rm.mockRestore(); await instance.cleanup();
       expect(await files(options.dataDir, failing)).toEqual(["job.json"]);
       expect((await manifest(options.dataDir, failing)).status).toBe("expired");
       const after = await health(instance);
       expect(after.own_reserved_bytes).toBe(0); expect(after.ready).toBe(true);
-      expect(after.cleanup).toMatchObject({ jobs_failed_last_sweep: 0, failures_total: 2, consecutive_failed_sweeps: 0, last_error_code: "EACCES" });
-      expect(typeof after.cleanup.last_failure_at).toBe("string"); expect(after.cleanup.last_duration_ms).toBeGreaterThanOrEqual(0);
-      expect(JSON.stringify(after.cleanup)).not.toContain(options.dataDir); expect(logged).toHaveBeenCalledTimes(2);
-      // Cleanup counters stay on the authenticated health result; public probes never expose them.
+      expect(after.cleanup).toMatchObject({ own_jobs_failed_last_sweep: 0, own_jobs_pending_retry: 0 });
+      expect(logged).toHaveBeenCalledTimes(4);
+      // Cleanup state stays on the authenticated health result; public probes never expose it.
       expect(await instance.health()).not.toHaveProperty("cleanup"); expect(await instance.publicHealth()).not.toHaveProperty("cleanup");
     } finally { rm.mockRestore(); logged.mockRestore(); setSystemTime(); }
   });
@@ -92,82 +101,103 @@ describe("retention cleanup resilience", () => {
       expect((await manifest(options.dataDir, other)).status).toBe("expired");
       const pending = await health(instance);
       expect(pending.own_jobs.uploaded).toBe(1); expect(pending.own_reserved_bytes).toBe(1 + options.maxOutputBytes);
-      expect(pending.cleanup).toMatchObject({ jobs_failed_last_sweep: 1, failures_total: 1, last_error_code: "EACCES" });
+      expect(pending.cleanup).toMatchObject({ own_jobs_failed_last_sweep: 1, own_jobs_pending_retry: 1 });
       // The reservation is not released before the tombstone commit succeeds.
       await expect(instance.createUpload(alice, { filename: "next.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 507 });
-      expect(logged).toHaveBeenCalledTimes(1); expect(JSON.stringify(logged.mock.calls)).not.toContain(options.dataDir);
+      expect(lines(logged, "Job cleanup failed")).toHaveLength(1); expect(JSON.stringify(logged.mock.calls)).not.toContain(options.dataDir);
       spy.mockRestore(); await instance.cleanup();
       const tombstone = await manifest(options.dataDir, failing);
       expect(tombstone.status).toBe("expired"); expect(tombstone).not.toHaveProperty("token_hash"); expect(tombstone).not.toHaveProperty("upload_auth_hash");
-      expect((await health(instance)).own_reserved_bytes).toBe(0); expect((await health(instance)).cleanup.consecutive_failed_sweeps).toBe(0);
+      expect((await health(instance)).own_reserved_bytes).toBe(0); expect((await health(instance)).cleanup.own_jobs_pending_retry).toBe(0);
       await instance.createUpload(alice, { filename: "next.txt", size_bytes: 1 });
     } finally { spy.mockRestore(); logged.mockRestore(); setSystemTime(); }
   });
 
-  test("a failed tombstone removal during upload admission is reported without blocking the upload", async () => {
+  test("tombstone removal failures are skipped silently by upload admission and retried by sweeps until they recover", async () => {
     const { instance, options } = await service();
-    const expired = await uploaded(instance, bob); advance(120_000); await instance.cleanup(); setSystemTime();
-    const rm = spyOn(fs, "rm").mockImplementation(((target: any, opts: any) => String(target) === path.join(options.dataDir, expired) ? denied(target) : realRm(target, opts)) as typeof fs.rm);
+    const expired = await uploaded(instance, bob); advance(120_000); await instance.cleanup();
+    const tombstoneDir = path.join(options.dataDir, expired);
+    const rm = spyOn(fs, "rm").mockImplementation(((target: any, opts: any) => String(target) === tombstoneDir ? denied(target) : realRm(target, opts)) as typeof fs.rm);
     const logged = spyOn(console, "error").mockImplementation(() => undefined);
     try {
-      await instance.createUpload(alice, { filename: "a.txt", size_bytes: 1 });
+      for (let index = 0; index < 5; index++) await instance.deleteJob(alice, (await instance.createUpload(alice, { filename: "a.txt", size_bytes: 1 })).upload_id);
       expect((await manifest(options.dataDir, expired)).status).toBe("expired");
-      expect((await health(instance)).cleanup).toMatchObject({ failures_total: 1, last_error_code: "EACCES" }); expect(logged).toHaveBeenCalledTimes(1);
-      rm.mockRestore(); await instance.createUpload(alice, { filename: "b.txt", size_bytes: 1 });
-      await expect(fs.stat(path.join(options.dataDir, expired))).rejects.toMatchObject({ code: "ENOENT" });
-    } finally { rm.mockRestore(); logged.mockRestore(); }
+      expect(logged).not.toHaveBeenCalled(); expect((await health(instance, bob)).cleanup.own_jobs_pending_retry).toBe(0);
+      // Once the tombstone itself expires, the sweep reports the failure once and keeps the tombstone for the next attempt.
+      advance(120_000); await instance.cleanup();
+      expect((await manifest(options.dataDir, expired)).status).toBe("expired");
+      expect(lines(logged, "Job cleanup failed")).toHaveLength(1); expect(lines(logged, "Job cleanup failed")[0][1]).toMatchObject({ status: "expired", code: "EACCES" });
+      expect((await health(instance, bob)).cleanup).toMatchObject({ own_jobs_failed_last_sweep: 1, own_jobs_pending_retry: 1 });
+      expect((await health(instance, bob)).own_jobs.expired).toBe(1);
+      rm.mockRestore(); await instance.cleanup();
+      await expect(fs.stat(tombstoneDir)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await health(instance, bob)).cleanup).toMatchObject({ own_jobs_failed_last_sweep: 0, own_jobs_pending_retry: 0 });
+    } finally { rm.mockRestore(); logged.mockRestore(); setSystemTime(); }
   });
 
-  test("concurrent cleanup calls share one in-flight sweep that never overlaps itself", async () => {
+  test("audit failures during cleanup still commit the tombstone", async () => {
+    const { instance, options } = await service({ audit: event => { if (event.event === "job_expired") throw new Error("audit unavailable"); } });
+    const id = await completed(instance, alice);
+    const logged = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      advance(120_000); await instance.cleanup();
+      expect(await files(options.dataDir, id)).toEqual(["job.json"]); expect((await manifest(options.dataDir, id)).status).toBe("expired");
+      expect(logged).toHaveBeenCalledTimes(1); expect(logged.mock.calls[0][0]).toBe("Job audit unavailable");
+      expect((await health(instance)).cleanup).toMatchObject({ own_jobs_failed_last_sweep: 0, own_jobs_pending_retry: 0 });
+    } finally { logged.mockRestore(); setSystemTime(); }
+  });
+
+  test("concurrent cleanup calls and timer ticks share one in-flight sweep that never overlaps itself", async () => {
     const { instance, options } = await service();
-    const broken = await uploaded(instance, carol), slow = await uploaded(instance, alice), other = await uploaded(instance, bob);
+    const slow = await uploaded(instance, alice), broken = await uploaded(instance, carol), other = await uploaded(instance, bob);
     const brokenDir = path.join(options.dataDir, broken), slowInput = path.join(options.dataDir, slow, "input.txt");
     let release!: () => void, entered!: () => void, slowCalls = 0;
     const gate = new Promise<void>(resolve => { release = resolve; }), reached = new Promise<void>(resolve => { entered = resolve; });
-    // The first job fails on every pass, so failures_total counts sweep passes; the second job holds the sweep open.
+    // The first job holds the sweep open; the second fails on every pass, so its log lines count sweep passes.
     const rm = spyOn(fs, "rm").mockImplementation((async (target: any, opts: any) => {
       if (String(target).startsWith(brokenDir)) return denied(target);
       if (String(target) === slowInput) { slowCalls++; entered(); await gate; }
       return realRm(target, opts);
     }) as typeof fs.rm);
     const logged = spyOn(console, "error").mockImplementation(() => undefined);
+    const passes = () => lines(logged, "Job cleanup failed").length;
     let first: Promise<void> | undefined;
     try {
       advance(120_000); first = instance.cleanup(); await reached;
-      const second = instance.cleanup(), third = instance.cleanup();
-      expect(second).toBe(first); expect(third).toBe(first);
+      // Periodic ticks during a long sweep are skipped: they neither start a sweep nor queue another pass.
+      for (let index = 0; index < 3; index++) (instance as any).tick();
       await new Promise(resolve => setTimeout(resolve, 20));
-      // An overlapping sweep would already have retried the first job and processed the third.
-      expect((await health(instance)).cleanup.failures_total).toBe(1);
-      expect((await manifest(options.dataDir, other)).status).toBe("uploaded"); expect(slowCalls).toBe(1);
+      expect(passes()).toBe(0); expect(slowCalls).toBe(1); expect((await manifest(options.dataDir, other)).status).toBe("uploaded");
       release(); await first;
+      expect(passes()).toBe(1);
       expect((await manifest(options.dataDir, slow)).status).toBe("expired"); expect((await manifest(options.dataDir, other)).status).toBe("expired");
-      // Callers that joined late are covered by exactly one follow-up pass, not one pass each.
-      expect((await health(instance)).cleanup).toMatchObject({ failures_total: 2, consecutive_failed_sweeps: 2 }); expect(slowCalls).toBe(1);
-      const next = instance.cleanup(); expect(next).not.toBe(first); await next;
+      // Explicit callers that join an in-flight sweep share its promise and get exactly one follow-up pass, not one each.
+      let hold!: () => void; const held = new Promise<void>(resolve => { hold = resolve; });
+      rm.mockImplementation((async (target: any, opts: any) => { if (String(target).startsWith(brokenDir)) { await held; return denied(target); } return realRm(target, opts); }) as typeof fs.rm);
+      const second = instance.cleanup(), third = instance.cleanup(), fourth = instance.cleanup();
+      expect(third).toBe(second); expect(fourth).toBe(second);
+      hold(); await second;
+      expect(passes()).toBe(3); expect(slowCalls).toBe(1);
+      const next = instance.cleanup(); expect(next).not.toBe(second); await next; expect(passes()).toBe(4);
     } finally { release(); await first?.catch(() => undefined); rm.mockRestore(); logged.mockRestore(); setSystemTime(); }
   });
 
-  test("periodic ticks skip while a long sweep is still running", async () => {
-    let slowInput = "", brokenDir = "", release!: () => void, entered!: () => void;
+  test("close during an in-flight sweep stops before the next job and waits for the sweep to finish", async () => {
+    const { instance, options } = await service();
+    const slow = await uploaded(instance, alice), next = await uploaded(instance, bob), slowInput = path.join(options.dataDir, slow, "input.txt");
+    let release!: () => void, entered!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; }), reached = new Promise<void>(resolve => { entered = resolve; });
-    const rm = spyOn(fs, "rm").mockImplementation((async (target: any, opts: any) => {
-      if (brokenDir && String(target).startsWith(brokenDir)) return denied(target);
-      if (slowInput && String(target) === slowInput) { entered(); await gate; }
-      return realRm(target, opts);
-    }) as typeof fs.rm);
-    const logged = spyOn(console, "error").mockImplementation(() => undefined);
+    const rm = spyOn(fs, "rm").mockImplementation((async (target: any, opts: any) => { if (String(target) === slowInput) { entered(); await gate; } return realRm(target, opts); }) as typeof fs.rm);
     try {
-      // A 30 ms retention also makes the cleanup interval 30 ms, so real timer ticks drive these sweeps.
-      const { instance, options } = await service({ retentionMs: 30 });
-      const broken = await instance.createUpload(carol, { filename: "a.txt", size_bytes: 1 });
-      const slow = await instance.createUpload(alice, { filename: "b.txt", size_bytes: 1 }); slowInput = path.join(options.dataDir, slow.upload_id, "input.txt");
-      await instance.upload(carol, broken.upload_id, broken.upload_token, Readable.from(["a"])); brokenDir = path.join(options.dataDir, broken.upload_id);
-      await instance.upload(alice, slow.upload_id, slow.upload_token, Readable.from(["b"]));
-      await reached; const atGate = (await health(instance)).cleanup.failures_total;
-      await new Promise(resolve => setTimeout(resolve, 150));
-      expect((await health(instance)).cleanup.failures_total).toBe(atGate);
-    } finally { release(); rm.mockRestore(); logged.mockRestore(); }
+      advance(120_000); const sweep = instance.cleanup(); await reached;
+      let closed = false; const closing = instance.close().then(() => { closed = true; });
+      await new Promise(resolve => setTimeout(resolve, 20)); expect(closed).toBe(false);
+      release(); await closing;
+      expect((instance as any).sweep).toBeUndefined(); await sweep;
+      expect((await manifest(options.dataDir, slow)).status).toBe("expired");
+      expect((await manifest(options.dataDir, next)).status).toBe("uploaded");
+      await expect(fs.stat(path.join(options.dataDir, ".lock"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { release(); rm.mockRestore(); setSystemTime(); }
   });
 
   test("expiry erases every artifact, leaves credential-free tombstones and skips active workers", async () => {
@@ -188,7 +218,7 @@ describe("retention cleanup resilience", () => {
       // The active worker is excluded even though its retention deadline passed.
       expect((await instance.getStatus(carol, running)).status).toBe("running"); expect(await files(options.dataDir, running)).toContain("input.txt");
       release(); await until(instance, carol, running, "completed");
-      expect((await instance.getMarkdown(carol, running)).markdown).toBe("hold"); expect((await health(instance)).cleanup.jobs_failed_last_sweep).toBe(0);
+      expect((await instance.getMarkdown(carol, running)).markdown).toBe("hold"); expect((await health(instance, carol)).cleanup.own_jobs_failed_last_sweep).toBe(0);
     } finally { release(); setSystemTime(); }
   });
 
@@ -202,22 +232,94 @@ describe("retention cleanup resilience", () => {
   });
 });
 
+describe("one process per data volume", () => {
+  test("a live owner is refused and a stale lock is replaced", async () => {
+    const { instance, options } = await service(), lock = path.join(options.dataDir, ".lock");
+    expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(process.pid)); expect((await fs.stat(lock)).mode & 0o777).toBe(0o600);
+    // The current test process holds the lock, so a second service on the same volume is refused.
+    await expect(new JobService(options).init()).rejects.toThrow(`in use by process ${process.pid}`);
+    await instance.close(); await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+    const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    try {
+      await fs.writeFile(lock, `${sleeper.pid}\n`);
+      await expect(new JobService(options).init()).rejects.toThrow(`in use by process ${sleeper.pid}`);
+      expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(sleeper.pid));
+    } finally { sleeper.kill("SIGKILL"); await new Promise(resolve => sleeper.once("exit", resolve)); }
+    // Dead owners, and our own pid left by an earlier process (a restarted container), are stale.
+    for (const stale of [String(deadPid()), String(process.pid), "garbage"]) {
+      await fs.writeFile(lock, stale);
+      const { instance: next } = await service({ dataDir: options.dataDir });
+      expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(process.pid)); await next.close();
+    }
+  });
+});
+
 describe("retired owner purge tool", () => {
-  test("dry run lists only the owner's jobs and apply removes them without touching other owners", async () => {
+  test("dry run lists only the owner's jobs, apply reports each job and other owners are untouched", async () => {
     const { instance, options } = await service();
-    const mine = [await completed(instance, alice), await uploaded(instance, alice)], theirs = [await uploaded(instance, bob), await uploaded(instance, carol)];
+    const mine = [await completed(instance, alice), await uploaded(instance, alice), await uploaded(instance, alice)], theirs = [await uploaded(instance, bob), await uploaded(instance, carol)];
+    // The service is still running, so purging is refused.
+    await expect(purgeOwnerJobs(options.dataDir, alice)).rejects.toThrow("stop it first");
     await instance.close();
+    const mismatch = "22222222-2222-2222-2222-222222222222", legacy = "33333333-3333-3333-3333-333333333333";
+    await fs.mkdir(path.join(options.dataDir, mismatch)); await fs.writeFile(path.join(options.dataDir, mismatch, "job.json"), JSON.stringify({ ...await manifest(options.dataDir, mine[1]), id: mine[1] }));
+    await fs.mkdir(path.join(options.dataDir, legacy)); await fs.writeFile(path.join(options.dataDir, legacy, "job.json"), JSON.stringify({ id: legacy, status: "completed" }));
     const dry = await purgeOwnerJobs(options.dataDir, alice);
     expect(dry.applied).toBe(false); expect(dry.jobs.map(job => job.job_id).sort()).toEqual([...mine].sort()); expect(dry.unreadable).toEqual([]);
-    expect(dry.jobs.every(job => job.bytes > 0 && ["completed", "uploaded"].includes(job.status))).toBe(true);
+    expect(dry.jobs.every(job => job.result === "listed" && job.bytes! > 0)).toBe(true);
+    expect(dry.skipped).toEqual(expect.arrayContaining([{ job_id: mismatch, reason: "id_mismatch" }, { job_id: legacy, reason: "legacy_unowned" }]));
     for (const id of mine) expect((await manifest(options.dataDir, id)).agent_id).toBe("alice");
-    // Same-tenant and cross-tenant jobs are untouched; the CLI applies the same selection.
-    const cli = spawnSync(process.execPath, [path.join(import.meta.dir, "purge-owner.ts"), options.dataDir, alice.tenantId, alice.agentId, "--apply"], { encoding: "utf8" });
-    expect(cli.status).toBe(0); expect(JSON.parse(cli.stdout).jobs).toHaveLength(2);
-    for (const id of mine) await expect(fs.stat(path.join(options.dataDir, id))).rejects.toMatchObject({ code: "ENOENT" });
+    // One failed removal does not stop the others, and the report says exactly which jobs were deleted.
+    const failingDir = path.join(options.dataDir, mine[0]);
+    const rm = spyOn(fs, "rm").mockImplementation(((target: any, opts: any) => String(target) === failingDir ? denied(target) : realRm(target, opts)) as typeof fs.rm);
+    let applied;
+    try { applied = await purgeOwnerJobs(options.dataDir, alice, true); } finally { rm.mockRestore(); }
+    expect(applied.jobs.find(job => job.job_id === mine[0])).toMatchObject({ result: "failed", code: "EACCES" });
+    expect(applied.jobs.filter(job => job.result === "deleted").map(job => job.job_id).sort()).toEqual([mine[1], mine[2]].sort());
+    for (const id of [mine[1], mine[2]]) await expect(fs.stat(path.join(options.dataDir, id))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await manifest(options.dataDir, mismatch)).id).toBe(mine[1]); expect(await files(options.dataDir, mine[0])).toContain("output.md");
+    expect((await purgeOwnerJobs(options.dataDir, alice, true)).jobs).toMatchObject([{ job_id: mine[0], result: "deleted" }]);
+    await realRm(path.join(options.dataDir, mismatch), { recursive: true }); await realRm(path.join(options.dataDir, legacy), { recursive: true });
     const { instance: restarted } = await service({ dataDir: options.dataDir });
     await expect(restarted.getStatus(alice, mine[0])).rejects.toMatchObject({ statusCode: 404 });
     expect((await restarted.getStatus(bob, theirs[0])).status).toBe("uploaded"); expect((await restarted.getStatus(carol, theirs[1])).status).toBe("uploaded");
-    expect(spawnSync(process.execPath, [path.join(import.meta.dir, "purge-owner.ts"), options.dataDir, "bad tenant", "x"], { encoding: "utf8" }).status).toBe(1);
   });
+
+  test("refuses invalid owners, missing paths and directories that are not a data volume", async () => {
+    const empty = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-not-data-")); directories.push(empty);
+    await expect(purgeOwnerJobs(empty, alice)).rejects.toThrow("Not a markdownify data directory");
+    await expect(purgeOwnerJobs(path.join(empty, "missing"), alice)).rejects.toThrow("Data directory not found");
+    await expect(purgeOwnerJobs(empty, { tenantId: "bad tenant", agentId: "x" })).rejects.toThrow("Invalid tenant_id or agent_id");
+    await fs.writeFile(path.join(empty, "audit.jsonl"), "");
+    expect((await purgeOwnerJobs(empty, alice)).jobs).toEqual([]);
+  });
+
+  const node = Bun.which("node");
+  test.skipIf(!node)("compiled CLI reports usage, refusals, unreadable manifests and follows a symlinked data directory", async () => {
+    const root = path.resolve(import.meta.dir, "../..");
+    const build = spawnSync(process.execPath, ["run", "build:remote"], { cwd: root, encoding: "utf8" });
+    expect(build.status).toBe(0);
+    const cli = (...args: string[]) => spawnSync(node!, [path.join(root, "dist/remote/purge-owner.js"), ...args], { encoding: "utf8" });
+    expect(cli().status).toBe(2); expect(cli().stderr).toContain("Usage:");
+    const { instance, options } = await service();
+    const mine = await uploaded(instance, alice);
+    // A live service holds the lock (this test process), so the CLI refuses.
+    const live = cli(options.dataDir, alice.tenantId, alice.agentId);
+    expect(live.status).toBe(1); expect(live.stderr).toContain("stop it first"); expect(live.stdout).toBe("");
+    await instance.close();
+    const missing = cli(path.join(options.dataDir, "missing"), alice.tenantId, alice.agentId);
+    expect(missing.status).toBe(1); expect(missing.stderr).toContain("Data directory not found");
+    const linkParent = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-link-")); directories.push(linkParent);
+    const link = path.join(linkParent, "data"); await fs.symlink(options.dataDir, link, "dir");
+    const linked = cli(link, alice.tenantId, alice.agentId);
+    expect(linked.status).toBe(0); expect(JSON.parse(linked.stdout).jobs).toMatchObject([{ job_id: mine, result: "listed" }]);
+    const corrupt = "44444444-4444-4444-4444-444444444444";
+    await fs.mkdir(path.join(options.dataDir, corrupt)); await fs.writeFile(path.join(options.dataDir, corrupt, "job.json"), "{not json");
+    const unreadable = cli(options.dataDir, alice.tenantId, alice.agentId, "--apply");
+    expect(unreadable.status).toBe(1);
+    const report = JSON.parse(unreadable.stdout);
+    expect(report.unreadable).toEqual([corrupt]); expect(report.jobs).toMatchObject([{ job_id: mine, result: "deleted" }]);
+    await expect(fs.stat(path.join(options.dataDir, mine))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(path.join(options.dataDir, corrupt, "job.json"), "utf8")).toBe("{not json");
+  }, 60_000);
 });
