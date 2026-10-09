@@ -131,12 +131,18 @@ describe("validateUrl", () => {
     "http://[fec0::1]/", // site-local
     "http://[64:ff9b::7f00:1]/", // NAT64 of 127.0.0.1
     "http://[64:ff9b::169.254.169.254]/",
+    "http://[::ffff:0:7f00:1]/", // IPv4-translated (SIIT) 127.0.0.1
+    "http://[::ffff:0:a9fe:a9fe]/",
+    "http://[64:ff9b:1::7f00:1]/", // local-use NAT64 of 127.0.0.1
+    "http://[64:ff9b:1::a9fe:a9fe]/",
   ])("rejects %s", async (url) => {
     await expect(validateUrl(url)).rejects.toThrow("potentially dangerous");
   });
 
-  test("accepts NAT64 and IPv4-mapped forms of public addresses", async () => {
+  test("accepts NAT64, IPv4-translated and IPv4-mapped forms of public addresses", async () => {
     await expect(validateUrl("http://[64:ff9b::808:808]/")).resolves.toBeUndefined();
+    await expect(validateUrl("http://[64:ff9b:1::808:808]/")).resolves.toBeUndefined();
+    await expect(validateUrl("http://[::ffff:0:808:808]/")).resolves.toBeUndefined();
     await expect(validateUrl("http://[::ffff:8.8.8.8]/")).resolves.toBeUndefined();
   });
 
