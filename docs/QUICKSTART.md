@@ -45,7 +45,7 @@ docker compose -f compose.multitenant.yaml up --build -d
 Invoke-RestMethod http://localhost:8000/healthz
 ```
 
-The default listener is bound to localhost through Docker. The expected health response is `{"status":"ok"}`. Inspect `docker compose -f compose.multitenant.yaml logs` if startup fails. Remove `MD_API_KEY` entirely from this server's environment; registry authentication uses `MD_AUTH_FILE` and rejects a simultaneous shared key. Use this Compose file on its own.
+The default listener is bound to localhost through Docker. The expected health response is `{"status":"ok"}` (`/healthz` aliases the `/livez` liveness probe); `/readyz` returns 200 once storage and the converter are ready. Inspect `docker compose -f compose.multitenant.yaml logs` if startup fails. Remove `MD_API_KEY` entirely from this server's environment; registry authentication uses `MD_AUTH_FILE` and rejects a simultaneous shared key. Use this Compose file on its own.
 
 For public hosting, configure HTTPS and routing as described in [containers](CONTAINERS.md) and [remote deployment](REMOTE.md). Configure `MD_PUBLIC_BASE_URL` to your server origin before accepting remote clients. Run one replica per data volume. The Docker Hub image `bryanmarty/markdownify-mcp` becomes available after the configured publication workflow succeeds; local builds do not require Docker Hub credentials.
 
@@ -71,7 +71,7 @@ Remove-Item Env:MCP_TOKEN
 
 Repeat using `agent-b.token` and a different output filename for agent B. Successful output contains `Test PDF content`. Existing output files are preserved; choose a new filename when retrying. The helper streams bytes directly with the agent's bearer credential and returned upload token, starts conversion, polls with a deadline, and retrieves code-point pages. Jobs remain until temporary retention expires.
 
-For agents using MCP tools directly, load [SKILL.md](../SKILL.md). It describes all six tools, including error lookup/recovery, JSON result parsing, scoped binary upload, finite polling, pagination, and authorized cleanup. A runtime capable of HTTP file upload is necessary; a model passing a local path cannot transfer bytes.
+For agents using MCP tools directly, load [SKILL.md](../SKILL.md). It describes all seven tools, including error lookup/recovery, JSON result parsing, scoped binary upload, finite polling, pagination, and authorized cleanup. A runtime capable of HTTP file upload is necessary; a model passing a local path cannot transfer bytes.
 
 ## 4. Verify isolation before granting access
 

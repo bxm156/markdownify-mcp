@@ -34,7 +34,7 @@ const child = spawn(process.env.MD_TEST_NODE ?? "node", ["dist/remote/index.js"]
 let startupFailure = false; child.on("error", () => { startupFailure = true; }); child.stderr!.resume();
 const clients: Client[] = []; let gateway: ReturnType<typeof createServer> | undefined;
 try {
-  let ready = false; for (let i = 0; i < 100; i++) { if (startupFailure || child.exitCode !== null) throw new Error("Compiled JWT service failed to start"); try { if ((await fetch(`${base}/healthz`)).ok) { ready = true; break; } } catch {} await new Promise(r => setTimeout(r, 100)); } assert(ready, "JWT service readiness timeout");
+  let ready = false; for (let i = 0; i < 100; i++) { if (startupFailure || child.exitCode !== null) throw new Error("Compiled JWT service failed to start"); try { if ((await fetch(`${base}/readyz`)).ok) { ready = true; break; } } catch {} await new Promise(r => setTimeout(r, 100)); } assert(ready, "JWT service readiness timeout");
   async function client(subject: string) {
     const c = new Client({ name: "jwt-smoke", version: "1" }); clients.push(c);
     await c.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { fetch: async (input, init) => {
