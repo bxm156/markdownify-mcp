@@ -28,6 +28,7 @@ const TRY_NEXT_ADDRESS_ERRORS = new Set([
   "ETIMEDOUT",
   "EADDRNOTAVAIL",
   "EAFNOSUPPORT", // e.g. an IPv6 address on a host without IPv6
+  "EINVAL", // Node: the address does not match the socket family it was given
 ]);
 
 const NO_BODY_STATUSES = [204, 205, 304];

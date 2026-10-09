@@ -65,6 +65,31 @@ test("the exchange deadline also terminates a stalled response body", async () =
   await promisify(execFile)("node", ["--experimental-strip-types", "--input-type=module", "-e", script], { timeout: 5000 });
 });
 
+test("an immediate connect error from the pinned lookup falls through instead of crashing Node", async () => {
+  // Runs under Node, where a synchronous lookup answer emitted this error
+  // before ClientRequest listened for it and crashed the process. The
+  // family-6 entry for an IPv4 address fails deterministically (EINVAL)
+  // without needing IPv6 on the host. Bun ignores the family, so it cannot
+  // show the crash.
+  const script = `
+    import assert from 'node:assert/strict';
+    import http from 'node:http';
+    import {download} from ${JSON.stringify(new URL("./download.ts", import.meta.url).href)};
+    const realRequest = http.request;
+    let attempts = 0;
+    http.request = (...args) => { attempts++; return realRequest(...args); };
+    const server = http.createServer((req, res) => res.end('fallback'));
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    try {
+      const response = await download.fetch('http://mismatch.invalid:' + server.address().port,
+        [{address: '127.0.0.1', family: 6}, {address: '127.0.0.1', family: 4}], AbortSignal.timeout(2000));
+      assert.equal(await response.text(), 'fallback');
+      assert.equal(attempts, 2);
+    } finally {server.closeAllConnections(); await new Promise(r => server.close(r));}
+  `;
+  await promisify(execFile)("node", ["--experimental-strip-types", "--input-type=module", "-e", script], { timeout: 5000 });
+});
+
 test("sends a User-Agent and Accept header", async () => {
   let headers: IncomingHttpHeaders = {};
   await withServer(
