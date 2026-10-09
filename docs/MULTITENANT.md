@@ -107,6 +107,8 @@ Global limits from [REMOTE.md](REMOTE.md) still apply. The following additional 
 
 Every value must be a positive safe integer. A reservation must fit global, tenant, and agent budgets. Even a tiny upload reserves the configured maximum output size, so storage limits can bind before job-count limits. Queue scheduling skips owners that have reached their concurrency cap, allowing another eligible owner to run; global concurrency still bounds total converters. These are admission and scheduling limits, not filesystem quotas or a distributed queue.
 
+In [JWT mode](JWT.md#effective-per-user-limits) the tenant and agent ID are both the LiteLLM user ID, so one user is bound by both scopes and the effective cap is the minimum of the global, tenant and agent limits.
+
 ## Operations
 
 New manifests persist immutable owner IDs. For a fresh deployment, leave `MD_LEGACY_OWNER` unset and use a new data volume. No client or data migration is required. The server retains an explicit recovery option for unowned manifests from older test deployments; assigning an owner is an operator-only operation and never happens automatically.
