@@ -1,0 +1,99 @@
+site_name: Markdownify Remote MCP
+site_description: >-
+  Remote MCP server that converts uploaded documents to Markdown with
+  MarkItDown, with private per-agent jobs, LiteLLM JWT or registry
+  authentication, a Docker image and health endpoints.
+site_url: https://bxm156.github.io/markdownify-mcp/
+repo_url: https://github.com/bxm156/markdownify-mcp
+repo_name: bxm156/markdownify-mcp
+edit_uri: edit/main/docs/
+docs_dir: docs
+exclude_docs: |
+  requirements.txt
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - include-markdown
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      # GitHub-compatible heading IDs, so anchors such as
+      # README.md#vs-code--github-copilot-local-extension-session resolve.
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Install and connect clients: install.md
+      - Fresh deployment quickstart: QUICKSTART.md
+      - Remote HTTP service: REMOTE.md
+  - Deployment:
+      - Container images: CONTAINERS.md
+      - LiteLLM JWT authentication: JWT.md
+  - Multi-agent & identity:
+      - Private agents, quotas and LiteLLM: MULTITENANT.md
+  - Agents:
+      - Agent skill (SKILL.md): agent-skill.md
+  - Operations:
+      - Health checks: HEALTH.md
+      - Errors and recovery: ERRORS.md
+  - Project:
+      - Plan and milestones: plan.md
+      - Single-tenant MVP validation: MVP-VALIDATION.md
+      - Multi-tenant validation: MULTITENANT-VALIDATION.md
+
+hooks:
+  - mkdocs_hooks.py
