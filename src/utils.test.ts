@@ -133,15 +133,20 @@ describe("validateUrl", () => {
     "http://[64:ff9b::169.254.169.254]/",
     "http://[::ffff:0:7f00:1]/", // IPv4-translated (SIIT) 127.0.0.1
     "http://[::ffff:0:a9fe:a9fe]/",
-    "http://[64:ff9b:1::7f00:1]/", // local-use NAT64 of 127.0.0.1
+    // Local-use NAT64 64:ff9b:1::/48 is rejected outright (RFC 8215 section 5):
+    "http://[64:ff9b:1::7f00:1]/", // /96 placement of 127.0.0.1
     "http://[64:ff9b:1::a9fe:a9fe]/",
+    "http://[64:ff9b:1::808:808]/", // /96 placement of public 8.8.8.8
+    "http://[64:ff9b:1:808:8:800:0:0]/", // /48 placement of 8.8.8.8
+    "http://[64:ff9b:1:7f00:0:100:808:808]/", // /48 placement of 127.0.0.1, nonzero suffix
+    "http://[64:ff9b:1:7f00:0:100::]/", // /48 placement of 127.0.0.1
+    "http://[64:ff9b:1:0:7f:0:100:0]/", // /64 placement of 127.0.0.1
   ])("rejects %s", async (url) => {
     await expect(validateUrl(url)).rejects.toThrow("potentially dangerous");
   });
 
   test("accepts NAT64, IPv4-translated and IPv4-mapped forms of public addresses", async () => {
     await expect(validateUrl("http://[64:ff9b::808:808]/")).resolves.toBeUndefined();
-    await expect(validateUrl("http://[64:ff9b:1::808:808]/")).resolves.toBeUndefined();
     await expect(validateUrl("http://[::ffff:0:808:808]/")).resolves.toBeUndefined();
     await expect(validateUrl("http://[::ffff:8.8.8.8]/")).resolves.toBeUndefined();
   });

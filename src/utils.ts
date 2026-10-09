@@ -124,12 +124,17 @@ function isPrivateAddress(address: string): boolean {
   if (allZero(0, 7) && groups[7] <= 1) {
     return true; // :: (unspecified) and ::1 (loopback)
   }
+  if (groups[0] === 0x64 && groups[1] === 0xff9b && groups[2] === 1) {
+    // 64:ff9b:1::/48 local-use NAT64: RFC 8215 section 5 lets operators use
+    // any RFC 6052 section 2.2 prefix length (/32 to /96) inside it, so the
+    // embedded IPv4 cannot be located reliably. Reject the whole range.
+    return true;
+  }
   const embedsIPv4 =
     (allZero(0, 5) && groups[5] === 0xffff) || // ::ffff:0:0/96 IPv4-mapped
     (allZero(0, 4) && groups[4] === 0xffff && groups[5] === 0) || // ::ffff:0:0:0/96 IPv4-translated (SIIT)
     allZero(0, 6) || // ::/96 IPv4-compatible (deprecated)
-    (groups[0] === 0x64 && groups[1] === 0xff9b && allZero(2, 6)) || // 64:ff9b::/96 NAT64
-    (groups[0] === 0x64 && groups[1] === 0xff9b && groups[2] === 1); // 64:ff9b:1::/48 local-use NAT64
+    (groups[0] === 0x64 && groups[1] === 0xff9b && allZero(2, 6)); // 64:ff9b::/96 well-known NAT64 (always /96)
   if (embedsIPv4) {
     const [high, low] = [groups[6], groups[7]];
     return isPrivateAddress(
