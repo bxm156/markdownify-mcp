@@ -7,6 +7,7 @@ import { errorResponse, lookupError } from "./errors.js";
 
 const id = z.string().uuid();
 const definitions = {
+  get_service_health: { description: "Use to check service readiness, storage/converter checks, and your own job states, reserved bytes and configured quota/concurrency limits. Never returns other users\' job counts, usage or IDs. Queue saturation is normal and does not make the process unhealthy. This is not a converter quality test; follow existing error guidance on failures.", schema: z.strictObject({}) },
   create_upload: { description: "Use first for a new accessible file or replacement of an expired/failed job. Reserve private storage using basename and actual byte count. Runtime must PUT bytes to upload_url with required_headers: use returned scoped Authorization in JWT mode, otherwise add owner bearer Authorization. Files do not pass through MCP. Keep both upload credentials secret; grants expire and are consumed once. Follow error_info/lookup_error on limits; avoid blind retries and duplicate reservations.", schema: z.strictObject({ filename: z.string().min(1).max(255), size_bytes: z.number().int().positive() }) },
   start_conversion: { description: "Use only after the binary PUT succeeds. Queue your uploaded file and return promptly. Repeated calls are idempotent; failed jobs are not restarted. Poll get_conversion_status next. Concurrency limits queue work; do not create duplicate jobs.", schema: z.strictObject({ upload_id: id }) },
   get_conversion_status: { description: "Use to resume a saved job or poll after start_conversion with backoff and a finite deadline. For completed, call get_markdown. For failed, stop polling and follow error_info.next_steps or lookup_error(error_info.code). Only your own jobs are accessible.", schema: z.strictObject({ job_id: id }) },
@@ -41,6 +42,7 @@ export function createRemoteServer(service: JobService, publicBaseUrl: string, p
         case "get_conversion_status": result = await service.getStatus(principal, args.job_id); break;
         case "get_markdown": result = await service.getMarkdown(principal, args.job_id, { offset: args.offset, max_chars: args.max_chars }); break;
         case "delete_job": result = await service.deleteJob(principal, args.job_id); break;
+        case "get_service_health": result = await service.health(principal); break;
         case "lookup_error": {
           result = lookupError(args.code);
           if ((result as { code: string }).code === "UNKNOWN_ERROR_CODE") throw new ServiceError(400, "Unknown error code", "UNKNOWN_ERROR_CODE");

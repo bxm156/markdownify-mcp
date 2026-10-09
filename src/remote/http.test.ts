@@ -60,7 +60,7 @@ test("stateless SDK clients can upload, convert, poll and retrieve across reconn
   const { client, request, base, options } = await fixture();
   const first = await client();
   const tools = await first.listTools();
-  expect(tools.tools.map(tool => tool.name).sort()).toEqual(["create_upload", "delete_job", "get_conversion_status", "get_markdown", "lookup_error", "start_conversion"]);
+  expect(tools.tools.map(tool => tool.name).sort()).toEqual(["create_upload", "delete_job", "get_conversion_status", "get_markdown", "get_service_health", "lookup_error", "start_conversion"]);
   const upload = parsed(await first.callTool({ name: "create_upload", arguments: { filename: "example.txt", size_bytes: 5 } }));
   expect(upload.upload_url).toBe(`${base}/uploads/${upload.upload_id}`);
   await first.close();

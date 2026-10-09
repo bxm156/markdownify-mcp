@@ -31,6 +31,8 @@ jobs:
           python -m pip install 'markitdown[pdf,docx,xlsx,pptx]==0.1.5'
           bun scripts/remote-converter-smoke.ts
           bun scripts/jwt-http-smoke.ts
+          python -m pip install 'litellm[mcp]==1.104.0'
+          python scripts/litellm-health-smoke.py
       - uses: docker/setup-buildx-action@v4
       - name: Build candidate without registry credentials
         uses: docker/build-push-action@v7

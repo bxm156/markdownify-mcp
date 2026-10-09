@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { JobService, ServiceError } from "./jobs.js";
 import { createRemoteServer } from "./mcp.js";
 import type { Authenticator } from "./auth.js";
+import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
 import { errorResponse } from "./errors.js";
 
 export interface HttpOptions { authenticator: Authenticator; publicBaseUrl: string; allowedHosts?: string[] }
@@ -33,14 +34,15 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
       if (url.search) { reply(response, 400, "Query parameters are not supported"); return; }
       if (url.pathname === "/healthz") {
         if (request.method !== "GET") { response.setHeader("Allow", "GET"); reply(response, 405, "Method not allowed"); return; }
-        response.writeHead(200, { "Content-Type": "application/json" }); response.end('{"status":"ok"}'); return;
+        const health = await service.health();
+        response.writeHead(health.ready ? 200 : 503, { "Content-Type": "application/json" }); response.end(JSON.stringify(health)); return;
       }
       const upload = /^\/uploads\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(url.pathname);
       if (!upload && url.pathname !== "/mcp") { reply(response, 404, "Not found"); return; }
       const principal = upload && options.authenticator.mode === "jwt"
         ? await service.authenticateUpload(upload[1], token(request))
         : await options.authenticator.authenticate(token(request));
-      if (!principal) { response.setHeader("WWW-Authenticate", "Bearer"); reply(response, 401, "Authorization required"); return; }
+      if (!principal && (upload || options.authenticator.mode !== "jwt")) { response.setHeader("WWW-Authenticate", "Bearer"); reply(response, 401, "Authorization required"); return; }
       if (upload) {
         if (request.method !== "PUT") { response.setHeader("Allow", "PUT"); reply(response, 405, "Method not allowed"); return; }
         const header = request.headers["x-upload-token"];
@@ -53,7 +55,7 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
         const failed = (error: Error) => source.destroy(error);
         request.once("aborted", aborted); request.once("error", failed);
         request.pipe(source);
-        try { await service.upload(principal, upload[1], uploadToken, source); }
+        try { await service.upload(principal!, upload[1], uploadToken, source); }
         catch (error) {
           request.pause();
           response.setHeader("Connection", "close");
@@ -77,8 +79,16 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
       }
       let body: unknown;
       try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { reply(response, 400, "Invalid JSON"); return; }
+      if (!principal) {
+        const method = body && typeof body === "object" && !Array.isArray(body) ? (body as { method?: unknown }).method : undefined;
+        if (!["initialize", "notifications/initialized", "ping"].includes(method as string)) {
+          response.setHeader("WWW-Authenticate", "Bearer"); reply(response, 401, "Authorization required"); return;
+        }
+        const health = await service.health();
+        if (!health.ready) { reply(response, 503, "Service unavailable"); return; }
+      }
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
-      const mcp = createRemoteServer(service, options.publicBaseUrl, principal);
+      const mcp = principal ? createRemoteServer(service, options.publicBaseUrl, principal) : new McpServer({ name: "markdownify-remote", version: "0.1.0" }, { capabilities: {} });
       response.on("close", () => { void transport.close(); void mcp.close(); });
       await mcp.connect(transport);
       await transport.handleRequest(request, response, body);

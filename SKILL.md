@@ -13,11 +13,15 @@ Use this skill when the user wants files converted through an available Markdown
 
 Have the runtime supply this agent's credential; keep credentials out of prompts and logs. Direct MCP uses `Authorization: Bearer <agent credential>`. Through LiteLLM, use the configured gateway credentials and per-server authorization forwarding described in [multi-agent deployment](docs/MULTITENANT.md).
 
-In recommended [LiteLLM JWT mode](docs/JWT.md), the runtime supplies only its own LiteLLM virtual key; LiteLLM signs MCP requests automatically. No Markdownify long-lived key or per-server credential forwarding is needed. Identity is mapped from the verified JWT subject, never selected by tool arguments. The upload response includes a separate short-lived Authorization header: use it together with X-Upload-Token for that job only. Never substitute the gateway key or a JWT for this scoped upload credential. Neither returned credential is reusable on MCP or after upload/expiry.
+In recommended [LiteLLM JWT mode](docs/JWT.md), the runtime supplies only its own LiteLLM virtual key; LiteLLM signs MCP requests automatically. No Markdownify long-lived key or per-server credential forwarding is needed. Identity is mapped from the verified JWT subject, never selected by tool arguments. The upload response includes a separate short-lived Authorization header: use it together with X-Upload-Token for that job only. Never substitute the gateway key or a JWT for this scoped upload credential. Neither returned credential authorizes MCP discovery/tool calls or upload after success/expiry. Public initialization/ping may succeed without granting file access.
 
 Discover available tool names with `listTools`; gateways may prefix names. Select the configured server rather than guessing among duplicate tools. Tool results place JSON in text content blocks: check `isError` first, then concatenate text blocks and parse JSON.
 
 The model cannot transfer a file by naming its local path. The runtime must read and upload bytes. If the runtime cannot access the file or perform HTTP uploads, report that missing capability. Do not fabricate a completed upload, send base64 in tool arguments, or substitute another agent's credential.
+
+## Check readiness
+
+Use get_service_health({}) with your normal identity to inspect readiness, your own job states/reserved bytes and configured limits. Queued work or a full quota is capacity pressure, not a failed process. Anonymous initialization/ping is monitoring only and never authorizes job tools; keep using normal authentication. See [health reference](docs/HEALTH.md).
 
 ## Convert a file
 

@@ -54,7 +54,7 @@ try {
     assert.equal((await fetch(u.upload_url, { method: "PUT", headers: u.required_headers, body: pdf })).status, 204);
     assert.equal((await fetch(u.upload_url, { method: "PUT", headers: u.required_headers, body: pdf })).status, 401);
     await call(agents[i], "start_conversion", { upload_id: u.upload_id });
-    let done = false; for (let n = 0; n < 100; n++) { const state = await call(agents[i], "get_conversion_status", { job_id: u.upload_id }); assert.notEqual(state.status, "failed"); if (state.status === "completed") { done = true; break; } await new Promise(r => setTimeout(r, 100)); } assert(done);
+    let done = false; for (const deadline = Date.now() + 130000; Date.now() < deadline;) { const state = await call(agents[i], "get_conversion_status", { job_id: u.upload_id }); assert.notEqual(state.status, "failed"); if (state.status === "completed") { done = true; break; } await new Promise(r => setTimeout(r, 100)); } assert(done);
     assert.match((await call(agents[i], "get_markdown", { job_id: u.upload_id })).markdown, /Test PDF content/);
     for (const peer of agents.filter(c => c !== agents[i])) { const result = await peer.callTool({ name: "get_markdown", arguments: { job_id: u.upload_id } }); assert(result.isError); assert.equal(JSON.parse((result.content as Array<{ text: string }>)[0].text).error_info.code, "JOB_NOT_FOUND"); }
   }

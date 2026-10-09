@@ -12,7 +12,7 @@ import { JobService } from "./jobs.js";
 import { createHttpServer } from "./http.js";
 
 const issuer = "https://litellm.test", audience = "markdownify";
-const tools = ["create_upload", "start_conversion", "get_conversion_status", "get_markdown", "delete_job", "lookup_error"];
+const tools = ["create_upload", "start_conversion", "get_conversion_status", "get_markdown", "get_service_health", "delete_job", "lookup_error"];
 const allScopes = ["mcp:tools/list", "mcp:tools/call", ...tools.map(t => `mcp:tools/${t}:call`)].join(" ");
 const key = await generateKeyPair("RS256", { extractable: true });
 const publicJwk = { ...await exportJWK(key.publicKey), kid: "first", alg: "RS256", use: "sig" };
@@ -73,7 +73,8 @@ test("JWT agents use scoped upload grants, enforce tool scopes and keep files pr
   expect((await f.put(upload, other.required_headers.Authorization)).status).toBe(401);
   expect((await f.put(upload, `Bearer ${await signed("machine-b")}`)).status).toBe(401);
   const grantClient = new Client({ name: "bad-grant", version: "1" });
-  await expect(grantClient.connect(new StreamableHTTPClientTransport(new URL(`${f.base}/mcp`), { requestInit: { headers: { Host: "127.0.0.1", Authorization: upload.required_headers.Authorization } } }))).rejects.toThrow(); await grantClient.close();
+  await grantClient.connect(new StreamableHTTPClientTransport(new URL(`${f.base}/mcp`), { requestInit: { headers: { Host: "127.0.0.1", Authorization: upload.required_headers.Authorization } } }));
+  await expect(grantClient.listTools()).rejects.toThrow(); await grantClient.close();
   expect((await f.put(upload)).status).toBe(204); expect((await f.put(upload)).status).toBe(401);
   parsed(await a.callTool({ name: "start_conversion", arguments: { upload_id: upload.upload_id } }));
   for (let i = 0; i < 100; i++) { const s = parsed(await a.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } })); if (s.status === "completed") break; await new Promise(r => setTimeout(r, 10)); }
@@ -81,6 +82,9 @@ test("JWT agents use scoped upload grants, enforce tool scopes and keep files pr
   const refreshed = await f.client(); expect(parsed(await refreshed.callTool({ name: "get_markdown", arguments: { job_id: upload.upload_id } })).markdown).toBe("x");
   const limited = await f.client("machine-a", "mcp:tools/list mcp:tools/call mcp:tools/lookup_error:call");
   parsed(await limited.callTool({ name: "lookup_error", arguments: { code: "FILE_TOO_LARGE" } }));
+  const healthDenied = await limited.callTool({ name: "get_service_health", arguments: {} });
+  expect(healthDenied.isError).toBe(true);
+  expect(parsed(await a.callTool({ name: "get_service_health", arguments: {} })).own_jobs.completed).toBe(1);
   const denied = await limited.callTool({ name: "delete_job", arguments: { job_id: upload.upload_id } }); expect(denied.isError).toBe(true); expect(JSON.parse((denied.content as any)[0].text).error_info.code).toBe("AUTH_SCOPE_REQUIRED");
   const listDenied = await f.client("machine-a", "mcp:tools/call mcp:tools/lookup_error:call");
   await expect(listDenied.listTools()).rejects.toThrow("Scope not granted");
@@ -118,4 +122,14 @@ test("JWT upload grants are capped at five minutes even when legacy upload TTL i
   const now = Date.now(); const grant = await f.service.createUpload({ tenantId: "machine-a", agentId: "machine-a" }, { filename: "x.txt", size_bytes: 1 }, true);
   expect(Date.parse(grant.expires_at) - now).toBeLessThanOrEqual(300050);
   expect(Date.parse(grant.expires_at) - now).toBeGreaterThan(299000);
+});
+
+test("verified JWT without sub can only perform public readiness probes", async () => {
+  const f = await deployment();
+  const client = new Client({ name: "identity-free-probe", version: "1" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(f.base + "/mcp"), { requestInit: { headers: { Host: "127.0.0.1", Authorization: `Bearer ${await signed("machine-a", { sub: undefined })}` } } }));
+  disposers.push(() => client.close());
+  expect(await client.ping()).toEqual({});
+  await expect(client.listTools()).rejects.toThrow();
+  await expect(client.callTool({ name: "get_service_health", arguments: {} })).rejects.toThrow();
 });
