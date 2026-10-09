@@ -110,16 +110,32 @@ Every value must be a positive safe integer. A reservation must fit global, tena
 
 ### Operator quota overrides
 
-Operators can give specific principals different agent-scope caps with a JSON file named by `MD_QUOTA_OVERRIDES_FILE`:
+Operators can give specific principals different agent-scope caps with a JSON file named by `MD_QUOTA_OVERRIDES_FILE`. Because tenant caps still apply, raising an agent above a tenant default only takes effect if the tenant cap is raised too. This example raises two tenant caps and keeps every other setting at its default:
+
+```dotenv
+MD_MAX_TENANT_JOBS=40
+MD_MAX_TENANT_CONCURRENCY=2
+MD_QUOTA_OVERRIDES_FILE=/run/markdownify/quota-overrides.json
+```
 
 ```json
 {
   "overrides": [
-    { "tenant_id": "tenant-a", "agent_id": "batch-agent", "max_jobs": 40, "max_storage_bytes": 134217728, "max_concurrency": 2 },
-    { "tenant_id": "markdownify-agent-b", "agent_id": "markdownify-agent-b", "max_jobs": 2 }
+    { "tenant_id": "tenant-a", "agent_id": "batch-agent", "max_jobs": 40, "max_concurrency": 2 },
+    { "tenant_id": "markdownify-agent-b", "agent_id": "markdownify-agent-b", "max_jobs": 2, "max_storage_bytes": 67108864 }
   ]
 }
 ```
+
+`get_service_health` then reports these `limits.effective` values:
+
+| Caller | `jobs` | `reserved_bytes` | `concurrency` |
+| --- | --- | --- | --- |
+| `tenant-a` / `batch-agent` (raised) | 40 | 134,217,728 (128 MiB) | 2 |
+| `markdownify-agent-b` (lowered) | 2 | 67,108,864 (64 MiB) | 1 |
+| Any unlisted principal | 10 | 134,217,728 (128 MiB) | 1 |
+
+Unlisted agents are still held to `MD_MAX_AGENT_JOBS=10` and `MD_MAX_AGENT_CONCURRENCY=1`. Raising the tenant caps lets the agents of one tenant together use up to 40 jobs and 2 converters. With the default `MD_CONCURRENCY=2`, `batch-agent` can occupy both global converter slots, and round-robin scheduling hands each freed slot to other waiting tenants in turn.
 
 Each entry replaces the `MD_MAX_AGENT_JOBS`, `MD_MAX_AGENT_STORAGE_BYTES` and/or `MD_MAX_AGENT_CONCURRENCY` defaults for exactly that `(tenant_id, agent_id)` pair; omitted fields keep the default. An override may lower or raise a cap. Global and tenant caps still apply, so the effective cap is the minimum of the global, tenant and agent values. In [JWT mode](JWT.md) the tenant and agent are both the LiteLLM user ID, so use that ID for both fields; the tenant defaults (`MD_MAX_TENANT_*`) also constrain that user, and raising a user above them requires raising those defaults too.
 
@@ -129,7 +145,7 @@ The file is read once at startup and validated strictly. Startup fails with an `
 
 Agents cannot change quotas. No tool accepts tenant, agent or quota arguments. `get_service_health` shows each caller only its own job states, `own_reserved_bytes` and `limits`: `agent_*` include that caller's override, `agent_override` says whether one applies, and `limits.effective` gives the tightest `jobs`, `reserved_bytes` and `concurrency` that admission and scheduling enforce. It never reveals other principals' overrides, usage or IDs. Quota errors keep the existing `JOB_LIMIT_EXCEEDED` and `STORAGE_LIMIT_EXCEEDED` codes; with `scope: "agent"`, `limit_jobs` or `limit_bytes` is the overridden value.
 
-Reservations count input bytes plus the maximum output size for every non-expired job, including queued and running work. Deleting a job releases its reservation immediately; an expired job releases it when periodic cleanup marks it expired, within a minute of its expiry time. They are admission limits, not a filesystem hard quota: manifests, indexes and audit logs add overhead outside the budget.
+Reservations count input bytes plus the maximum output size for every non-expired job, including queued and running work. Deleting a job releases its reservation immediately; an expired job releases it when periodic cleanup marks it expired, within a minute of its expiry time, unless cleanup of that job keeps failing. They are admission limits, not a filesystem hard quota: manifests, indexes and audit logs add overhead outside the budget.
 
 ## Operations
 

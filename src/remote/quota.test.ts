@@ -236,6 +236,30 @@ describe("MD_QUOTA_OVERRIDES_FILE configuration", () => {
     return target;
   }
   const entry = (changes: Record<string, unknown> = {}) => ({ tenant_id: "user-a", agent_id: "user-a", max_jobs: 5, ...changes });
+  test.skipIf(process.platform === "win32")("a FIFO is rejected without blocking startup", async () => {
+    const fifo = path.join(path.dirname(await file({ overrides: [] })), "fifo.json");
+    execFileSync("mkfifo", [fifo]);
+    // A blocking open would stall the whole event loop, so a timer in this process could never fire; bound it in a child process.
+    const script = `const { loadConfig } = await import(${JSON.stringify(path.join(import.meta.dir, "config.ts"))});
+      try { loadConfig({ MD_API_KEY: "a".repeat(32), MD_QUOTA_OVERRIDES_FILE: ${JSON.stringify(fifo)} }); console.log("loaded"); } catch (error) { console.log(error.message); }`;
+    expect(execFileSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 3000 })).toContain("MD_QUOTA_OVERRIDES_FILE must be a readable regular file of at most 1 MiB");
+  });
+  test("the documented example produces the documented effective limits", async () => {
+    const docs = await fs.readFile(path.join(import.meta.dir, "../../docs/MULTITENANT.md"), "utf8");
+    const section = docs.slice(docs.indexOf("### Operator quota overrides"));
+    const block = (language: string) => section.match(new RegExp("```" + language + "\\r?\\n([\\s\\S]*?)```"))![1];
+    const settings = Object.fromEntries(block("dotenv").split(/\r?\n/).filter(Boolean).map(line => line.split("=") as [string, string]));
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-quota-docs-"));
+    disposers.push(() => fs.rm(dataDir, { recursive: true, force: true }));
+    const config = loadConfig({ ...env, ...settings, MD_DATA_DIR: dataDir, MD_QUOTA_OVERRIDES_FILE: await file(block("json")) });
+    const instance = new JobService({ ...config.jobs, converter: async () => {} }); await instance.init(); disposers.push(() => instance.close());
+    const effective = async (principal: Principal) => (await health(instance, principal)).limits.effective;
+    expect(await effective(user("batch-agent", "tenant-a"))).toEqual({ jobs: 40, reserved_bytes: 134_217_728, concurrency: 2 });
+    expect(await effective(user("markdownify-agent-b"))).toEqual({ jobs: 2, reserved_bytes: 67_108_864, concurrency: 1 });
+    expect(await effective(user("other-agent", "tenant-a"))).toEqual({ jobs: 10, reserved_bytes: 134_217_728, concurrency: 1 });
+    // The documented table lists the same values.
+    for (const row of ["| 40 | 134,217,728 (128 MiB) | 2 |", "| 2 | 67,108,864 (64 MiB) | 1 |", "| 10 | 134,217,728 (128 MiB) | 1 |"]) expect(section).toContain(row);
+  });
   test("valid overrides load keyed by principal and absence keeps defaults", async () => {
     expect(loadConfig(env).jobs.quotaOverrides).toBeUndefined();
     const loaded = loadConfig({ ...env, MD_MAX_OUTPUT_BYTES: "1000", MD_QUOTA_OVERRIDES_FILE: await file({ overrides: [entry({ max_concurrency: 2, max_storage_bytes: 1024 }), { tenant_id: "t", agent_id: "b", max_concurrency: 1 }] }) }).jobs.quotaOverrides!;
@@ -266,10 +290,7 @@ describe("MD_QUOTA_OVERRIDES_FILE configuration", () => {
     expect(loadConfig({ ...env, MD_QUOTA_OVERRIDES_FILE: await file(exact + " ".repeat(mib - exact.length)) }).jobs.quotaOverrides!.size).toBe(1);
     expect(loadConfig({ ...env, MD_QUOTA_OVERRIDES_FILE: await file({ overrides: [entry({ max_storage_bytes: 25 * 1024 * 1024 + 1 })] }) }).jobs.quotaOverrides!.size).toBe(1);
     const large = await file(exact + " ".repeat(mib - exact.length + 1));
-    const targets = [large, path.dirname(large), path.join(path.dirname(large), "missing.json")];
-    // A FIFO must be rejected without blocking startup waiting for a writer.
-    if (process.platform !== "win32") { const fifo = path.join(path.dirname(large), "fifo.json"); execFileSync("mkfifo", [fifo]); targets.push(fifo); }
-    for (const target of targets) expect(() => loadConfig({ ...env, MD_QUOTA_OVERRIDES_FILE: target })).toThrow("at most 1 MiB");
+    for (const target of [large, path.dirname(large), path.join(path.dirname(large), "missing.json")]) expect(() => loadConfig({ ...env, MD_QUOTA_OVERRIDES_FILE: target })).toThrow("at most 1 MiB");
     expect(() => new JobService({ dataDir: os.tmpdir(), maxUploadBytes: 1, maxStorageBytes: 1, maxJobs: 1, retentionMs: 1, uploadTtlMs: 1, conversionTimeoutMs: 1, maxOutputBytes: 1, concurrency: 1, quotaOverrides: overrides([user("x"), { maxJobs: 0 }]) })).toThrow("quotaOverrides");
   });
 });
