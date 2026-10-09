@@ -52,6 +52,10 @@ User IDs must match `[A-Za-z0-9_-]{1,64}` (e.g. `markdownify-agent-a`); tokens w
 
 To revoke an agent, block or delete its LiteLLM key or user. Upload grants it already holds stay valid until they expire (at most five minutes) and can only complete that one upload.
 
+If your gateway cannot run the `mcp_jwt_signer` guardrail, the alternative is registry mode with LiteLLM forwarding or storing each user's Markdownify credential; see [stored per-user credentials](MULTITENANT.md#stored-per-user-credentials-in-litellm) for the setup and trade-offs. The two modes cannot be combined in one deployment.
+
+LiteLLM's on-behalf-of mode (`auth_type: oauth2_token_exchange`) exchanges the caller's identity-provider token for an access token scoped to the MCP server (RFC 8693, or the Entra ID `jwt-bearer` profile) and forwards that provider-issued token instead of signing its own. Markdownify does not support this today: the verifier pins one issuer and JWKS, which would have to be the provider's rather than LiteLLM's, and it requires `mcp:tools/list` or `mcp:tools/call` plus per-tool `mcp:tools/<name>:call` scopes that identity providers do not issue. Supporting it would need a configurable scope mapping and acceptance of provider subjects as owners. It would also change the guarantee from "signed by your LiteLLM" to "issued by your provider for this audience", making the provider's token-exchange policy the effective gateway restriction. Use the signer or forwarded credentials until that is designed. See [LiteLLM OBO auth](https://docs.litellm.ai/docs/mcp_obo_auth).
+
 ## 3. Run Markdownify
 
 ```sh
