@@ -15,7 +15,7 @@ It is a fork of [zcaceres/markdownify-mcp](https://github.com/zcaceres/markdowni
 - Runs conversions asynchronously, with status polling and paginated Markdown retrieval.
 - Keeps every job private to one tenant and agent; agents in the same tenant cannot see each other's files.
 - Enforces global, tenant and agent budgets, keeps metadata-only audit logs and deletes results after a retention period.
-- Reports readiness at `GET /healthz` and per-agent usage through the `get_service_health` tool.
+- Exposes `GET /livez` (alias `/healthz`) for liveness and `GET /readyz` for readiness, plus per-agent usage through the `get_service_health` tool.
 
 ## The 60-second mental model
 
