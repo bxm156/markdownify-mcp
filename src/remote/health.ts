@@ -6,9 +6,19 @@ import { resolveMarkitdownPath } from "../utils.js";
 
 export type RuntimeHealth = { checked_at: string; storage: { writable: boolean; free_bytes: number | null }; converter: { available: boolean; check: "custom" | "executable" } };
 export const HEALTH_TIMEOUT_MS = 5000;
+const inFlight = new Map<string, Promise<RuntimeHealth>>();
+/** Keep the underlying filesystem work single-flight even after its response deadline. */
+export function checkRuntime(dataDir: string, customConverter: boolean, timeoutMs = HEALTH_TIMEOUT_MS): Promise<RuntimeHealth> {
+  const key = JSON.stringify([path.resolve(dataDir), customConverter]);
+  const existing = inFlight.get(key);
+  if (existing) return existing;
+  const result = runRuntime(dataDir, customConverter, timeoutMs, () => { inFlight.delete(key); });
+  inFlight.set(key, result);
+  return result;
+}
 /** Bounded-size write/delete probe; executable presence, not a sample conversion. No paths/diagnostics leave this function.
  * Settles within timeoutMs: a hung mount reports storage unwritable while the abandoned probe cleans up whenever it finishes. */
-export async function checkRuntime(dataDir: string, customConverter: boolean, timeoutMs = HEALTH_TIMEOUT_MS): Promise<RuntimeHealth> {
+async function runRuntime(dataDir: string, customConverter: boolean, timeoutMs: number, settled: () => void): Promise<RuntimeHealth> {
   const result: RuntimeHealth = { checked_at: new Date().toISOString(), storage: { writable: false, free_bytes: null }, converter: { available: customConverter, check: customConverter ? "custom" : "executable" } };
   const probe = path.join(dataDir, ".health-" + randomUUID());
   let abandoned = false, timer: ReturnType<typeof setTimeout> | undefined;
@@ -34,7 +44,8 @@ export async function checkRuntime(dataDir: string, customConverter: boolean, ti
       try { if (!(await fs.stat(candidate)).isFile()) continue; await fs.access(candidate, process.platform === "win32" ? constants.F_OK : constants.X_OK); result.converter.available = true; break; } catch {}
     }
   })();
-  const done = await Promise.race([Promise.all([storage, converter]).then(() => true), new Promise<false>(resolve => { timer = setTimeout(resolve, timeoutMs, false); })]);
+  const work = Promise.all([storage, converter]).finally(settled);
+  const done = await Promise.race([work.then(() => true), new Promise<false>(resolve => { timer = setTimeout(resolve, timeoutMs, false); })]);
   clearTimeout(timer);
   if (done) return result;
   abandoned = true;

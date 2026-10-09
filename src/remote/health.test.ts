@@ -154,7 +154,14 @@ test("hung storage probe reports 503 within the bound and a later probe retries"
     expect([a.status, b.status]).toEqual([503, 503]); expect(calls).toBe(1);
     expect((await a.json()).checks).toEqual({ initialized: true, accepting_work: true, storage: { writable: false }, converter: { available: true } });
     expect((await ready()).status).toBe(503); expect(calls).toBe(1);
+    // Expiring the response cache must not start more work on the hung mount.
+    for (let i = 0; i < 3; i++) {
+      setSystemTime(new Date(Date.now() + 2100));
+      expect((await ready()).status).toBe(503);
+      expect(calls).toBe(1);
+    }
     release();
+    await new Promise(r => setTimeout(r, 20));
     setSystemTime(new Date(Date.now() + 2100));
     expect((await ready()).status).toBe(200); expect(calls).toBe(2);
     expect((await fs.readdir(f.dataDir)).some(n => n.startsWith(".health-"))).toBe(false);
