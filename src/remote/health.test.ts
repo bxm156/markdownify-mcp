@@ -54,7 +54,7 @@ test("health measures storage, omits foreign usage, and fails readiness during s
   expect(ready.status).toBe(200);
   const body = await ready.json();
   for (const v of [body.free_bytes, body.checks.storage.free_bytes, body.memory_rss_bytes, body.uptime_seconds, body.checked_at, body.own_jobs]) expect(v).toBeUndefined();
-  expect(body).toEqual({ status: "ok", ready: true, checks: { initialized: true, accepting_work: true, storage: { writable: true }, converter: { available: true, check: "custom" } } });
+  expect(body).toEqual({ status: "ok", ready: true, checks: { initialized: true, accepting_work: true, storage: { writable: true }, converter: { available: true } } });
   expect((await fs.readdir(f.dataDir)).some(n => n.startsWith(".health-"))).toBe(false);
   await f.service.close();
   const notReady = await probe("/readyz");

@@ -388,7 +388,7 @@ export class JobService {
   /** Unauthenticated readiness verdict: booleans only, no capacity/process metrics. */
   async publicHealth() {
     const { status, ready, checks: { initialized, accepting_work, storage, converter } } = await this.health();
-    return { status, ready, checks: { initialized, accepting_work, storage: { writable: storage.writable }, converter: { available: converter.available, check: converter.check } } };
+    return { status, ready, checks: { initialized, accepting_work, storage: { writable: storage.writable }, converter: { available: converter.available } } };
   }
 
   async close() {
