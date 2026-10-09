@@ -115,7 +115,7 @@ Operators can give specific principals different agent-scope caps with a JSON fi
 ```json
 {
   "overrides": [
-    { "tenant_id": "tenant-a", "agent_id": "batch-agent", "max_jobs": 40, "max_storage_bytes": 1073741824, "max_concurrency": 2 },
+    { "tenant_id": "tenant-a", "agent_id": "batch-agent", "max_jobs": 40, "max_storage_bytes": 134217728, "max_concurrency": 2 },
     { "tenant_id": "markdownify-agent-b", "agent_id": "markdownify-agent-b", "max_jobs": 2 }
   ]
 }
