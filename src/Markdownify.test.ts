@@ -1,27 +1,45 @@
-import { expect, test, mock, beforeAll, afterAll } from "bun:test";
+import {
+  expect,
+  test,
+  mock,
+  spyOn,
+  beforeAll,
+  afterAll,
+} from "bun:test";
 import { Markdownify, MarkdownResult } from "./Markdownify";
 import fs from "fs";
 import path from "path";
 import os from "os";
 
 const sampleDataDir = path.join(__dirname, "sample-data");
-const tempDir = os.tmpdir();
+
+// Markdownify writes its output under os.tmpdir(). Point TMPDIR at a private
+// directory for this file so tests never see or delete files from other
+// processes, then remove only that directory afterwards.
+const originalTmpdir = process.env.TMPDIR;
+let tempDir: string;
+
+// Network-dependent tests (git clones) only run when MD_TEST_NETWORK is set.
+const networkTest = test.skipIf(!process.env.MD_TEST_NETWORK);
 
 beforeAll(() => {
   // Ensure the sample data directory exists
   if (!fs.existsSync(sampleDataDir)) {
     throw new Error("Sample data directory not found");
   }
+  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "markdownify-test-"));
+  process.env.TMPDIR = tempDir;
 });
 
 afterAll(() => {
-  // Clean up any temporary files created during tests
-  const tempFiles = fs.readdirSync(tempDir);
-  tempFiles.forEach((file) => {
-    if (file.startsWith("markdown_output_")) {
-      fs.unlinkSync(path.join(tempDir, file));
-    }
-  });
+  if (originalTmpdir === undefined) {
+    delete process.env.TMPDIR;
+  } else {
+    process.env.TMPDIR = originalTmpdir;
+  }
+  if (tempDir) {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("Markdownify.toMarkdown converts PDF file to Markdown", async () => {
@@ -68,18 +86,22 @@ test("Markdownify.toMarkdown converts image file to Markdown", async () => {
 test("Markdownify.toMarkdown converts URL content to Markdown", async () => {
   const testUrl = "https://example.com";
   const html = "<h1>Example Domain</h1>";
-  const mockFetch = mock(() =>
-    Promise.resolve({
-      arrayBuffer: () =>
-        Promise.resolve(new TextEncoder().encode(html).buffer),
-    }),
+  const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+    (() =>
+      Promise.resolve({
+        arrayBuffer: () =>
+          Promise.resolve(new TextEncoder().encode(html).buffer),
+      })) as any,
   );
-  global.fetch = mockFetch as any;
 
-  const result = await Markdownify.toMarkdown({ url: testUrl });
+  try {
+    const result = await Markdownify.toMarkdown({ url: testUrl });
 
-  expect(result).toBeDefined();
-  expect(result.text).toContain("# Example Domain");
+    expect(result).toBeDefined();
+    expect(result.text).toContain("# Example Domain");
+  } finally {
+    fetchSpy.mockRestore();
+  }
 });
 
 test("Markdownify.get retrieves existing Markdown file", async () => {
@@ -116,7 +138,7 @@ test("Markdownify.get throws error for non-existent file", async () => {
   );
 });
 
-test("Markdownify.fromRepo converts a git repo to markdown via shorthand", async () => {
+networkTest("Markdownify.fromRepo converts a git repo to markdown via shorthand", async () => {
   const result = await Markdownify.fromRepo({
     repoUrl: "octocat/Hello-World",
   });
@@ -126,7 +148,7 @@ test("Markdownify.fromRepo converts a git repo to markdown via shorthand", async
   expect(result.text).toContain("Hello World!");
 }, 60_000);
 
-test("Markdownify.fromRepo works with full GitHub URL", async () => {
+networkTest("Markdownify.fromRepo works with full GitHub URL", async () => {
   const result = await Markdownify.fromRepo({
     repoUrl: "https://github.com/octocat/Hello-World",
   });
@@ -135,7 +157,7 @@ test("Markdownify.fromRepo works with full GitHub URL", async () => {
   expect(result.text).toContain("README");
 }, 60_000);
 
-test("Markdownify.fromRepo supports branch parameter", async () => {
+networkTest("Markdownify.fromRepo supports branch parameter", async () => {
   const result = await Markdownify.fromRepo({
     repoUrl: "octocat/Hello-World",
     branch: "master",
@@ -145,7 +167,7 @@ test("Markdownify.fromRepo supports branch parameter", async () => {
   expect(result.text).toContain("README");
 }, 60_000);
 
-test("Markdownify.fromRepo supports compress parameter", async () => {
+networkTest("Markdownify.fromRepo supports compress parameter", async () => {
   const normal = await Markdownify.fromRepo({
     repoUrl: "octocat/Hello-World",
   });
@@ -160,7 +182,7 @@ test("Markdownify.fromRepo supports compress parameter", async () => {
   expect(compressed.text).not.toEqual(normal.text);
 }, 120_000);
 
-test("Markdownify.fromRepo throws error for invalid repo", async () => {
+networkTest("Markdownify.fromRepo throws error for invalid repo", async () => {
   await expect(
     Markdownify.fromRepo({ repoUrl: "not-a-real-owner/not-a-real-repo-xyz" }),
   ).rejects.toThrow();
@@ -185,7 +207,7 @@ test("Markdownify.fromRepo rejects shell metacharacters in URL", async () => {
 });
 
 // Integration tests against diverse real repositories
-test("Markdownify.fromRepo handles a TypeScript repo (sindresorhus/is)", async () => {
+networkTest("Markdownify.fromRepo handles a TypeScript repo (sindresorhus/is)", async () => {
   const result = await Markdownify.fromRepo({
     repoUrl: "sindresorhus/is",
   });
@@ -196,7 +218,7 @@ test("Markdownify.fromRepo handles a TypeScript repo (sindresorhus/is)", async (
   expect(result.text).toContain("tsconfig");
 }, 120_000);
 
-test("Markdownify.fromRepo handles a Python repo (pallets/click)", async () => {
+networkTest("Markdownify.fromRepo handles a Python repo (pallets/click)", async () => {
   const result = await Markdownify.fromRepo({
     repoUrl: "pallets/click",
   });
@@ -206,7 +228,7 @@ test("Markdownify.fromRepo handles a Python repo (pallets/click)", async () => {
   expect(result.text).toContain(".py");
 }, 120_000);
 
-test("Markdownify.fromRepo handles a Rust repo (BurntSushi/ripgrep)", async () => {
+networkTest("Markdownify.fromRepo handles a Rust repo (BurntSushi/ripgrep)", async () => {
   const result = await Markdownify.fromRepo({
     repoUrl: "BurntSushi/ripgrep",
   });
@@ -216,7 +238,7 @@ test("Markdownify.fromRepo handles a Rust repo (BurntSushi/ripgrep)", async () =
   expect(result.text).toContain("Cargo.toml");
 }, 120_000);
 
-test("Markdownify.fromRepo handles a Go repo (junegunn/fzf)", async () => {
+networkTest("Markdownify.fromRepo handles a Go repo (junegunn/fzf)", async () => {
   const result = await Markdownify.fromRepo({
     repoUrl: "junegunn/fzf",
   });
@@ -226,7 +248,7 @@ test("Markdownify.fromRepo handles a Go repo (junegunn/fzf)", async () => {
   expect(result.text).toContain("go.mod");
 }, 120_000);
 
-test("Markdownify.fromRepo handles full GitLab-style HTTPS URL", async () => {
+networkTest("Markdownify.fromRepo handles full GitLab-style HTTPS URL", async () => {
   const result = await Markdownify.fromRepo({
     repoUrl: "https://github.com/kelseyhightower/nocode",
   });
@@ -235,7 +257,7 @@ test("Markdownify.fromRepo handles full GitLab-style HTTPS URL", async () => {
   expect(result.text).toContain("README");
 }, 60_000);
 
-test("Markdownify.fromRepo handles a specific tag via branch param", async () => {
+networkTest("Markdownify.fromRepo handles a specific tag via branch param", async () => {
   const result = await Markdownify.fromRepo({
     repoUrl: "sindresorhus/is",
     branch: "v6.0.0",
@@ -245,7 +267,7 @@ test("Markdownify.fromRepo handles a specific tag via branch param", async () =>
   expect(result.text).toContain("package.json");
 }, 120_000);
 
-test("Markdownify.fromRepo compress works on a multi-file repo", async () => {
+networkTest("Markdownify.fromRepo compress works on a multi-file repo", async () => {
   const result = await Markdownify.fromRepo({
     repoUrl: "sindresorhus/is",
     compress: true,
