@@ -73,8 +73,7 @@ test("JWT agents use scoped upload grants, enforce tool scopes and keep files pr
   expect((await f.put(upload, other.required_headers.Authorization)).status).toBe(401);
   expect((await f.put(upload, `Bearer ${await signed("machine-b")}`)).status).toBe(401);
   const grantClient = new Client({ name: "bad-grant", version: "1" });
-  await grantClient.connect(new StreamableHTTPClientTransport(new URL(`${f.base}/mcp`), { requestInit: { headers: { Host: "127.0.0.1", Authorization: upload.required_headers.Authorization } } }));
-  await expect(grantClient.listTools()).rejects.toThrow(); await grantClient.close();
+  await expect(grantClient.connect(new StreamableHTTPClientTransport(new URL(`${f.base}/mcp`), { requestInit: { headers: { Host: "127.0.0.1", Authorization: upload.required_headers.Authorization } } }))).rejects.toThrow(); await grantClient.close();
   expect((await f.put(upload)).status).toBe(204); expect((await f.put(upload)).status).toBe(401);
   parsed(await a.callTool({ name: "start_conversion", arguments: { upload_id: upload.upload_id } }));
   for (let i = 0; i < 100; i++) { const s = parsed(await a.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } })); if (s.status === "completed") break; await new Promise(r => setTimeout(r, 10)); }
@@ -124,12 +123,12 @@ test("JWT upload grants are capped at five minutes even when legacy upload TTL i
   expect(Date.parse(grant.expires_at) - now).toBeGreaterThan(299000);
 });
 
-test("verified JWT without sub can only perform public readiness probes", async () => {
-  const f = await deployment();
+test("verified JWT without sub is rejected at connect and on every MCP method", async () => {
+  const f = await deployment(), bearer = `Bearer ${await signed("machine-a", { sub: undefined })}`;
   const client = new Client({ name: "identity-free-probe", version: "1" });
-  await client.connect(new StreamableHTTPClientTransport(new URL(f.base + "/mcp"), { requestInit: { headers: { Host: "127.0.0.1", Authorization: `Bearer ${await signed("machine-a", { sub: undefined })}` } } }));
-  disposers.push(() => client.close());
-  expect(await client.ping()).toEqual({});
-  await expect(client.listTools()).rejects.toThrow();
-  await expect(client.callTool({ name: "get_service_health", arguments: {} })).rejects.toThrow();
+  await expect(client.connect(new StreamableHTTPClientTransport(new URL(f.base + "/mcp"), { requestInit: { headers: { Host: "127.0.0.1", Authorization: bearer } } }))).rejects.toThrow(); await client.close();
+  for (const method of ["initialize", "ping", "tools/list", "tools/call"]) {
+    const response = await fetch(f.base + "/mcp", { method: "POST", headers: { Host: "127.0.0.1", Authorization: bearer, "Content-Type": "application/json", Accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { name: "get_service_health", arguments: {} } }) });
+    expect(response.status).toBe(401); expect(response.headers.get("www-authenticate")).toBe("Bearer");
+  }
 });

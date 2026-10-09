@@ -5,6 +5,7 @@ import { JobService, ServiceError } from "./jobs.js";
 import type { AuthenticatedPrincipal } from "./auth.js";
 import { errorResponse, lookupError } from "./errors.js";
 
+export const SERVER_INFO = { name: "markdownify-remote", version: "0.1.0" } as const;
 const id = z.string().uuid();
 const definitions = {
   get_service_health: { description: "Use to check service readiness, storage/converter checks, and your own job states, reserved bytes and configured quota/concurrency limits. Never returns other users\' job counts, usage or IDs. Queue saturation is normal and does not make the process unhealthy. This is not a converter quality test; follow existing error guidance on failures.", schema: z.strictObject({}) },
@@ -18,7 +19,7 @@ const definitions = {
 
 export function createRemoteServer(service: JobService, publicBaseUrl: string, principal: AuthenticatedPrincipal): Server {
   const base = publicBaseUrl.replace(/\/$/, "");
-  const server = new Server({ name: "markdownify-remote", version: "0.1.0" }, { capabilities: { tools: {} } });
+  const server = new Server(SERVER_INFO, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     if (principal.scopes && !principal.scopes.includes("mcp:tools/list")) throw new ServiceError(403, "Scope not granted", "AUTH_SCOPE_REQUIRED");
     return { tools: Object.entries(definitions).map(([name, definition]) => ({ name, description: definition.description, inputSchema: z.toJSONSchema(definition.schema) as any })) };
