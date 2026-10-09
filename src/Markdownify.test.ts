@@ -10,6 +10,7 @@ import {
   afterEach,
 } from "bun:test";
 import { Markdownify, MarkdownResult } from "./Markdownify";
+import { download } from "./download";
 import dns from "node:dns";
 import fs from "fs";
 import path from "path";
@@ -80,7 +81,8 @@ test("Markdownify.toMarkdown converts URL content to Markdown", async () => {
   const testUrl = "https://example.com";
   const html = "<h1>Example Domain</h1>";
   const mockFetch = mock(() => Promise.resolve(new Response(html)));
-  global.fetch = mockFetch as any;
+  const original = download.fetch;
+  download.fetch = mockFetch as any;
   const lookupSpy = spyOn(dns.promises, "lookup").mockResolvedValue([
     { address: "93.184.215.14", family: 4 },
   ] as any);
@@ -91,6 +93,7 @@ test("Markdownify.toMarkdown converts URL content to Markdown", async () => {
     expect(result).toBeDefined();
     expect(result.text).toContain("# Example Domain");
   } finally {
+    download.fetch = original;
     lookupSpy.mockRestore();
   }
 });
@@ -98,25 +101,25 @@ test("Markdownify.toMarkdown converts URL content to Markdown", async () => {
 describe("Markdownify.safeFetch", () => {
   const safeFetch = (url: string) => Markdownify["safeFetch"](url);
   let lookupSpy: ReturnType<typeof spyOn>;
-  let originalFetch: typeof fetch;
+  let originalFetch: typeof download.fetch;
 
   // Install a fresh fetch stub per test (rather than spying on whatever an
   // earlier test left in global.fetch) and put the previous one back after.
   const stubFetch = (impl: (url: string) => Promise<Response>) => {
     const stub = mock(impl);
-    globalThis.fetch = stub as unknown as typeof fetch;
+    download.fetch = stub as unknown as typeof download.fetch;
     return stub;
   };
 
   beforeEach(() => {
-    originalFetch = globalThis.fetch;
+    originalFetch = download.fetch;
     lookupSpy = spyOn(dns.promises, "lookup").mockResolvedValue([
       { address: "93.184.215.14", family: 4 },
     ] as any);
   });
 
   afterEach(() => {
-    globalThis.fetch = originalFetch;
+    download.fetch = originalFetch;
     lookupSpy.mockRestore();
   });
 
@@ -186,12 +189,21 @@ describe("Markdownify.safeFetch", () => {
     );
   });
 
-  test("passes a timeout signal and manual redirects to fetch", async () => {
+  test("passes validated addresses and a deadline to the pinned transport", async () => {
     const fetchStub = stubFetch(async () => new Response("ok"));
     await safeFetch("https://example.com/");
-    const init = (fetchStub.mock.calls[0] as unknown[])[1] as RequestInit;
-    expect(init.signal).toBeInstanceOf(AbortSignal);
-    expect(init.redirect).toBe("manual");
+    const args = fetchStub.mock.calls[0] as unknown[];
+    expect(args[1]).toEqual([{ address: "93.184.215.14", family: 4 }]);
+    expect(args[2]).toBeInstanceOf(AbortSignal);
+    expect(lookupSpy).toHaveBeenCalledTimes(1);
+  });
+  test("hung DNS lookup stops at the whole-exchange deadline without connecting", async () => {
+    lookupSpy.mockImplementation(() => new Promise(() => {}));
+    const fetchStub = stubFetch(async () => new Response("unexpected"));
+    const start = performance.now();
+    await expect(Markdownify["safeFetch"]("https://example.com", 10, 20)).rejects.toThrow();
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(fetchStub).not.toHaveBeenCalled();
   });
 });
 

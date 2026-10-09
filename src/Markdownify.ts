@@ -4,9 +4,11 @@ import path from "path";
 import fs from "fs";
 import os from "os";
 import { fileURLToPath } from "url";
+import { download } from "./download.js";
 import {
   expandHome,
   validateUrl,
+  resolvePublicAddresses,
   validateRepoUrl,
   isUnconvertedHtml,
   inferExtensionFromUrl,
@@ -86,20 +88,22 @@ export class Markdownify {
   private static async safeFetch(
     url: string,
     maxRedirects = 10,
+    timeoutMs = FETCH_TIMEOUT_MS,
   ): Promise<Response> {
     // One deadline for the whole exchange, including reading the final body.
-    const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+    const signal = AbortSignal.timeout(timeoutMs);
     let currentUrl = url;
     for (let i = 0; i <= maxRedirects; i++) {
       // Re-validate (and re-resolve) every hop so a redirect cannot reach
       // an internal address.
-      await validateUrl(currentUrl);
-      const response = await fetch(currentUrl, { redirect: "manual", signal });
+      const addresses = await resolvePublicAddresses(currentUrl, signal);
+      const response = await download.fetch(currentUrl, addresses, signal);
       if (
         response.status >= 300 &&
         response.status < 400 &&
         response.headers.get("location")
       ) {
+        await response.body?.cancel();
         currentUrl = new URL(
           response.headers.get("location")!,
           currentUrl,
@@ -107,6 +111,7 @@ export class Markdownify {
         continue;
       }
       if (response.status >= 400) {
+        await response.body?.cancel();
         throw new Error(
           `Fetching ${currentUrl} failed with HTTP ${response.status}` +
             (response.statusText ? ` ${response.statusText}` : ""),

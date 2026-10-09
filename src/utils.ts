@@ -137,7 +137,10 @@ function isPrivateAddress(address: string): boolean {
  * hostname must not be (or resolve to) a loopback, private, link-local or
  * cloud-metadata address. Resolution failures are treated as unsafe.
  */
-export async function validateUrl(url: string): Promise<void> {
+export async function validateUrl(url: string): Promise<void> { await resolvePublicAddresses(url); }
+
+export async function resolvePublicAddresses(url: string, signal?: AbortSignal): Promise<{ address: string; family: number }[]> {
+  signal?.throwIfAborted();
   const parsed = new URL(url);
   if (!["http:", "https:"].includes(parsed.protocol)) {
     throw new Error("Only http: and https: schemes are allowed.");
@@ -158,13 +161,14 @@ export async function validateUrl(url: string): Promise<void> {
 
   if (net.isIP(hostname)) {
     if (isPrivateAddress(hostname)) throw dangerous;
-    return;
+    return [{ address: hostname, family: net.isIP(hostname) }];
   }
 
-  let addresses: { address: string }[];
+  let addresses: { address: string; family: number }[];
   try {
-    addresses = await dns.promises.lookup(hostname, { all: true, verbatim: true });
+    addresses = await withAbort(dns.promises.lookup(hostname, { all: true, verbatim: true }), signal);
   } catch {
+    signal?.throwIfAborted();
     throw dangerous;
   }
   if (
@@ -173,6 +177,18 @@ export async function validateUrl(url: string): Promise<void> {
   ) {
     throw dangerous;
   }
+  return addresses;
+}
+
+/** DNS lookup cannot be cancelled, but callers must stop waiting at their deadline. */
+function withAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    if (signal.aborted) abort();
+  });
 }
 
 export function validateRepoUrl(repoUrl: string): void {
