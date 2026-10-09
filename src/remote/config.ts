@@ -8,14 +8,22 @@ const overrideFields = { max_jobs: "maxJobs", max_storage_bytes: "maxStorageByte
  * Operator-managed agent-scope caps, read once at startup. Unlisted principals keep the defaults: this is not an
  * allowlist and never grants or denies access. Overrides above a global cap are rejected rather than silently clamped.
  */
-export function loadQuotaOverrides(file: string, global: { maxJobs: number; maxStorageBytes: number; concurrency: number }) {
+export function loadQuotaOverrides(file: string, global: { maxJobs: number; maxStorageBytes: number; concurrency: number; maxOutputBytes: number }) {
   const fail = (reason: string): never => { throw new Error(`MD_QUOTA_OVERRIDES_FILE ${reason}`); };
   if (!file) fail("must be a file path");
+  const cap = 1024 * 1024;
   let text = "";
   try {
-    const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error();
-    text = fs.readFileSync(file, "utf8");
+    // One descriptor for check and read: O_NONBLOCK keeps a FIFO from blocking startup, and the read is bounded even if the file grows.
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    try {
+      if (!fs.fstatSync(fd).isFile()) throw new Error();
+      const buffer = Buffer.alloc(cap + 1);
+      let length = 0, read = 0;
+      while (length < buffer.length && (read = fs.readSync(fd, buffer, length, buffer.length - length, null)) > 0) length += read;
+      if (length > cap) throw new Error();
+      text = buffer.toString("utf8", 0, length);
+    } finally { fs.closeSync(fd); }
   } catch { fail("must be a readable regular file of at most 1 MiB"); }
   let raw: any;
   try { raw = JSON.parse(text); } catch { fail("must contain valid JSON"); }
@@ -36,6 +44,8 @@ export function loadQuotaOverrides(file: string, global: { maxJobs: number; maxS
       if (entry[field] === undefined) continue;
       if (!Number.isSafeInteger(entry[field]) || entry[field] <= 0) fail(`${at} ${field} must be a positive safe integer`);
       if (entry[field] > caps[name]) fail(`${at} ${field} exceeds the global cap ${caps[name]}`);
+      // Every job reserves its input plus MD_MAX_OUTPUT_BYTES, so a smaller budget could never admit any upload.
+      if (field === "max_storage_bytes" && entry[field] < 1 + global.maxOutputBytes) fail(`${at} max_storage_bytes must be at least ${1 + global.maxOutputBytes} (one input byte plus MD_MAX_OUTPUT_BYTES)`);
       override[name] = entry[field];
     }
     if (!Object.keys(override).length) fail(`${at} must set at least one of max_jobs, max_storage_bytes or max_concurrency`);
@@ -67,8 +77,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const publicBaseUrl = publicUrl.origin;
   const allowedHosts = env.MD_ALLOWED_HOSTS?.split(",").map(value => value.trim()).filter(Boolean) ?? [publicUrl.host, `localhost:${port}`, `127.0.0.1:${port}`];
   if (!allowedHosts.length || allowedHosts.some(host => /[\s\/\\?#@]/.test(host))) throw new Error("MD_ALLOWED_HOSTS must contain comma-separated Host header values");
-  const maxJobs = integer("MD_MAX_JOBS", 100), maxStorageBytes = integer("MD_MAX_STORAGE_BYTES", 256 * 1024 * 1024), concurrency = integer("MD_CONCURRENCY", 2);
-  const quotaOverrides = env.MD_QUOTA_OVERRIDES_FILE === undefined ? undefined : loadQuotaOverrides(env.MD_QUOTA_OVERRIDES_FILE, { maxJobs, maxStorageBytes, concurrency });
+  const maxJobs = integer("MD_MAX_JOBS", 100), maxStorageBytes = integer("MD_MAX_STORAGE_BYTES", 256 * 1024 * 1024), concurrency = integer("MD_CONCURRENCY", 2), maxOutputBytes = integer("MD_MAX_OUTPUT_BYTES", 25 * 1024 * 1024);
+  const quotaOverrides = env.MD_QUOTA_OVERRIDES_FILE === undefined ? undefined : loadQuotaOverrides(env.MD_QUOTA_OVERRIDES_FILE, { maxJobs, maxStorageBytes, concurrency, maxOutputBytes });
   return {
     authenticator, publicBaseUrl, allowedHosts, port, host: env.MD_HOST ?? "127.0.0.1",
     jobs: {
@@ -79,7 +89,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       retentionMs: integer("MD_RETENTION_MS", 24 * 60 * 60 * 1000),
       uploadTtlMs: integer("MD_UPLOAD_TTL_MS", 15 * 60 * 1000),
       conversionTimeoutMs: integer("MD_CONVERSION_TIMEOUT_MS", 120_000),
-      maxOutputBytes: integer("MD_MAX_OUTPUT_BYTES", 25 * 1024 * 1024),
+      maxOutputBytes,
       concurrency,
       maxTenantJobs: integer("MD_MAX_TENANT_JOBS", 25),
       maxTenantStorageBytes: integer("MD_MAX_TENANT_STORAGE_BYTES", 128 * 1024 * 1024),

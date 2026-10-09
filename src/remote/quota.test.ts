@@ -3,6 +3,7 @@ import { SignJWT, generateKeyPair, exportJWK, createLocalJWKSet } from "jose";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { Readable } from "node:stream";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -108,6 +109,13 @@ describe("operator quota overrides", () => {
     await expect(instance.createUpload(plain, { filename: "x.txt", size_bytes: 1 })).rejects.toMatchObject({ code: "JOB_LIMIT_EXCEEDED", details: { scope: "tenant", limit_jobs: 2 } });
   });
 
+  test("with only global caps configured, effective limits equal the global caps", async () => {
+    const instance = await service({ maxJobs: 7, maxStorageBytes: 9000, concurrency: 2, maxTenantJobs: undefined, maxTenantStorageBytes: undefined, maxAgentJobs: undefined });
+    const limits = (await health(instance, user("only-global"))).limits;
+    expect(limits).toMatchObject({ tenant_jobs: 7, agent_jobs: 7, tenant_reserved_bytes: 9000, agent_reserved_bytes: 9000, tenant_concurrency: 2, agent_concurrency: 2, agent_override: false });
+    expect(limits.effective).toEqual({ jobs: 7, reserved_bytes: 9000, concurrency: 2 });
+  });
+
   test("scheduler applies a per-principal concurrency override without exceeding tenant or global caps", async () => {
     const owners = new Map<string, string>(), gate = gatedConverter(owners);
     const vip = user("vip", "shared"), std = user("std", "shared");
@@ -120,6 +128,33 @@ describe("operator quota overrides", () => {
     gate.release();
     await until(async () => (await health(instance, vip)).own_jobs.completed === 3 && (await health(instance, std)).own_jobs.completed === 2);
     expect(gate.peak.get("vip")).toBe(2); expect(gate.peak.get("std")).toBe(1);
+  });
+
+  test("cross-tenant fairness is unchanged when one agent has a concurrency override", async () => {
+    // Each conversion waits for its own release, so exactly one slot frees at a time and start order is the scheduling order.
+    const owners = new Map<string, string>(), starts: string[] = [], waiting: Array<() => void> = [];
+    const converter = async (input: string, output: string, signal: AbortSignal) => {
+      starts.push(owners.get(path.basename(path.dirname(input)))!);
+      await new Promise<void>((resolve, reject) => { waiting.push(resolve); signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }); });
+      await fs.writeFile(output, "done");
+    };
+    const vip = user("vip", "tenant-a"), std = user("std", "tenant-b");
+    const instance = await service({ concurrency: 2, maxTenantConcurrency: 2, maxAgentConcurrency: 1, maxAgentJobs: 5, converter, quotaOverrides: overrides([vip, { maxConcurrency: 2 }]) });
+    for (let i = 0; i < 4; i++) await queue(instance, vip, owners);
+    await until(async () => waiting.length === 2);
+    expect(starts).toEqual(["vip", "vip"]);
+    for (let i = 0; i < 2; i++) await queue(instance, std, owners);
+    expect((await health(instance, std)).own_jobs.queued).toBe(2);
+    // FIFO would run vip's two remaining jobs next; round-robin gives each freed slot to the other tenant in turn.
+    for (const expected of ["std", "vip", "std", "vip"]) {
+      const before = starts.length;
+      waiting.shift()!();
+      await until(async () => starts.length === before + 1);
+      expect(starts.at(-1)).toBe(expected);
+    }
+    while (waiting.length) waiting.shift()!();
+    await until(async () => (await health(instance, vip)).own_jobs.completed === 4 && (await health(instance, std)).own_jobs.completed === 2);
+    expect(starts).toEqual(["vip", "vip", "std", "vip", "std", "vip"]);
   });
 
   test("queued and running work hold reservations until deletion or expiry releases them", async () => {
@@ -153,7 +188,7 @@ describe("signed subjects see only their own effective quota", () => {
     const scope = ["mcp:tools/list", "mcp:tools/call", ...["create_upload", "get_service_health", "lookup_error"].map(name => `mcp:tools/${name}:call`)].join(" ");
     const key = await generateKeyPair("RS256", { extractable: true });
     const jwk = { ...await exportJWK(key.publicKey), kid: "k", alg: "RS256", use: "sig" };
-    const instance = await service({ maxAgentJobs: 1, quotaOverrides: overrides([user("machine-vip"), { maxJobs: 2 }]) });
+    const instance = await service({ maxAgentJobs: 1, quotaOverrides: overrides([user("machine-vip"), { maxJobs: 2 }], [user("machine-store"), { maxJobs: 3, maxStorageBytes: 1500 }]) });
     const httpOptions = { authenticator: createJwtAuthenticator({ issuer, audience, getKey: createLocalJWKSet({ keys: [jwk] }) }), publicBaseUrl: "http://127.0.0.1", allowedHosts: ["127.0.0.1"] };
     const server = createHttpServer(instance, httpOptions); await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`; httpOptions.publicBaseUrl = base;
@@ -173,6 +208,13 @@ describe("signed subjects see only their own effective quota", () => {
     const denied = calls.findLast((result, i) => result.isError && i < 3)!;
     expect(text(denied).error_info).toMatchObject({ code: "JOB_LIMIT_EXCEEDED", details: { scope: "agent", limit_jobs: 2 } });
     expect(text(await clients[0].callTool({ name: "lookup_error", arguments: { code: text(denied).error_info.code } }))).toMatchObject({ code: "JOB_LIMIT_EXCEEDED", retryable: false });
+    const store = await connect("machine-store");
+    expect((await store.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } })).isError).toBe(false);
+    const full = await store.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } });
+    expect(full.isError).toBe(true);
+    expect(text(full).error_info).toMatchObject({ code: "STORAGE_LIMIT_EXCEEDED", retryable: false, details: { scope: "agent", limit_bytes: 1500, requested_bytes: 1, reserved_bytes: 1001 } });
+    expect(text(await store.callTool({ name: "lookup_error", arguments: { code: "STORAGE_LIMIT_EXCEEDED" } })).next_steps.join(" ")).toContain("input bytes plus the maximum output bytes");
+    expect(text(await store.callTool({ name: "get_service_health", arguments: {} })).limits.effective).toMatchObject({ jobs: 3, reserved_bytes: 1500 });
     for (const [index, client] of clients.entries()) {
       const report = text(await client.callTool({ name: "get_service_health", arguments: {} }));
       expect(report.own_jobs.awaiting_upload).toBe(index ? 1 : 2);
@@ -196,7 +238,7 @@ describe("MD_QUOTA_OVERRIDES_FILE configuration", () => {
   const entry = (changes: Record<string, unknown> = {}) => ({ tenant_id: "user-a", agent_id: "user-a", max_jobs: 5, ...changes });
   test("valid overrides load keyed by principal and absence keeps defaults", async () => {
     expect(loadConfig(env).jobs.quotaOverrides).toBeUndefined();
-    const loaded = loadConfig({ ...env, MD_QUOTA_OVERRIDES_FILE: await file({ overrides: [entry({ max_concurrency: 2, max_storage_bytes: 1024 }), { tenant_id: "t", agent_id: "b", max_concurrency: 1 }] }) }).jobs.quotaOverrides!;
+    const loaded = loadConfig({ ...env, MD_MAX_OUTPUT_BYTES: "1000", MD_QUOTA_OVERRIDES_FILE: await file({ overrides: [entry({ max_concurrency: 2, max_storage_bytes: 1024 }), { tenant_id: "t", agent_id: "b", max_concurrency: 1 }] }) }).jobs.quotaOverrides!;
     expect(loaded.size).toBe(2);
     expect(loaded.get(quotaKey(user("user-a")))).toEqual({ maxJobs: 5, maxStorageBytes: 1024, maxConcurrency: 2 });
     expect(loaded.get(quotaKey(user("b", "t")))).toEqual({ maxConcurrency: 1 });
@@ -212,11 +254,22 @@ describe("MD_QUOTA_OVERRIDES_FILE configuration", () => {
       [{ overrides: [entry({ disabled: true })] }, "unknown field"], [{ overrides: [entry({ max_jobs: 1.5 })] }, "max_jobs must be a positive safe integer"],
       [{ overrides: [entry({ max_jobs: "2" })] }, "positive safe integer"], [{ overrides: [entry({ max_jobs: 0 })] }, "positive safe integer"], [{ overrides: [entry({ max_concurrency: -1 })] }, "positive safe integer"],
       [{ overrides: [{ tenant_id: "user-a", agent_id: "user-a" }] }, "at least one"],
+      [{ overrides: [entry({ max_storage_bytes: 25 * 1024 * 1024 })] }, `max_storage_bytes must be at least ${25 * 1024 * 1024 + 1}`], [{ overrides: [entry({ max_storage_bytes: 1 })] }, "one input byte plus MD_MAX_OUTPUT_BYTES"],
+      ['{"overrides": [], "__proto__": {"polluted": true}}', '"overrides" array'], ['{"overrides": [], "constructor": {"prototype": {"polluted": true}}}', '"overrides" array'],
+      ['{"overrides": [{"tenant_id": "user-a", "agent_id": "user-a", "max_jobs": 1, "__proto__": {"polluted": true}}]}', 'unknown field "__proto__"'],
+      ['{"overrides": [{"tenant_id": "user-a", "agent_id": "user-a", "max_jobs": 1, "constructor": {"prototype": {"polluted": true}}}]}', 'unknown field "constructor"'],
     ];
     for (const [content, message] of invalid) { const target = await file(content); expect(() => loadConfig({ ...env, MD_QUOTA_OVERRIDES_FILE: target })).toThrow(message); }
     expect(() => loadConfig({ ...env, MD_QUOTA_OVERRIDES_FILE: "" })).toThrow("MD_QUOTA_OVERRIDES_FILE must be a file path");
-    const large = await file(JSON.stringify({ overrides: [] }) + " ".repeat(1024 * 1024));
-    for (const target of [large, path.dirname(large), path.join(path.dirname(large), "missing.json")]) expect(() => loadConfig({ ...env, MD_QUOTA_OVERRIDES_FILE: target })).toThrow("at most 1 MiB");
+    expect(({} as any).polluted).toBeUndefined(); expect(Object.prototype).not.toHaveProperty("polluted");
+    const exact = JSON.stringify({ overrides: [entry()] }), mib = 1024 * 1024;
+    expect(loadConfig({ ...env, MD_QUOTA_OVERRIDES_FILE: await file(exact + " ".repeat(mib - exact.length)) }).jobs.quotaOverrides!.size).toBe(1);
+    expect(loadConfig({ ...env, MD_QUOTA_OVERRIDES_FILE: await file({ overrides: [entry({ max_storage_bytes: 25 * 1024 * 1024 + 1 })] }) }).jobs.quotaOverrides!.size).toBe(1);
+    const large = await file(exact + " ".repeat(mib - exact.length + 1));
+    const targets = [large, path.dirname(large), path.join(path.dirname(large), "missing.json")];
+    // A FIFO must be rejected without blocking startup waiting for a writer.
+    if (process.platform !== "win32") { const fifo = path.join(path.dirname(large), "fifo.json"); execFileSync("mkfifo", [fifo]); targets.push(fifo); }
+    for (const target of targets) expect(() => loadConfig({ ...env, MD_QUOTA_OVERRIDES_FILE: target })).toThrow("at most 1 MiB");
     expect(() => new JobService({ dataDir: os.tmpdir(), maxUploadBytes: 1, maxStorageBytes: 1, maxJobs: 1, retentionMs: 1, uploadTtlMs: 1, conversionTimeoutMs: 1, maxOutputBytes: 1, concurrency: 1, quotaOverrides: overrides([user("x"), { maxJobs: 0 }]) })).toThrow("quotaOverrides");
   });
 });
