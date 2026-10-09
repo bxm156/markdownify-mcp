@@ -142,9 +142,17 @@ The data volume contains:
 | `<job-id>/output.md`, `<job-id>/output.md.index.json` | Converted Markdown and its pagination index |
 | `<job-id>/input.part`, `output.part`, `job.json.<uuid>.tmp` | Crash partials; removed at startup |
 | `audit.jsonl`, `audit.jsonl.1`–`.3` | Metadata-only audit history shared by all agents |
-| `.lock` | PID of the running service; removed on clean shutdown |
+| `.lock` | PID of the running service (informational only); removed whenever the process exits, but left behind by SIGKILL, an OOM kill or a host crash |
 
-Stop the service before changing the volume. One process owns each data volume and loads every manifest only at startup, so edits under a running service race its in-memory state. The service creates `.lock` exclusively and refuses startup whenever that file exists. Clean shutdown removes it. After a crash, stop every service/container using the volume and manually remove the leftover `.lock` before restarting or purging. Automatic PID-based reclamation is unsafe because PIDs are reused and differ between container namespaces. The purge tool refuses to run while any lock exists, and refuses a path that contains neither job manifests nor `audit.jsonl`. It follows a symlinked data directory, reads manifests and file sizes only, never document contents, and is a dry run unless `--apply` is given:
+Stop the service before changing the volume. One process owns each data volume and loads every manifest only at startup, so edits under a running service race its in-memory state. The service creates `.lock` exclusively and refuses startup whenever that file exists, with `Data directory is in use: MD_DATA_DIR/.lock exists`. Graceful shutdown removes it, and so does every other process exit the runtime can observe: the forced exit when shutdown exceeds its 10-second deadline, an uncaught exception, or a startup failure. A SIGKILL (`docker kill`, or `docker stop` exceeding `stop_grace_period`), an OOM kill or a host crash leaves it behind, and every restart then fails with that message. Automatic PID-based reclamation is unsafe because PIDs are reused and differ between container namespaces, so remove a leftover lock manually. First confirm that no service, container or replica is using the volume:
+
+```sh
+docker compose -f compose.multitenant.yaml ps --all   # markdownify must not be running
+docker compose -f compose.multitenant.yaml run --rm --no-deps --entrypoint rm markdownify -f /data/.lock
+docker compose -f compose.multitenant.yaml start markdownify
+```
+
+For a native process, confirm that it is stopped and run `rm -f "$MD_DATA_DIR/.lock"`. The purge tool refuses to run while any lock exists, and refuses a path that contains neither job manifests nor `audit.jsonl`. It follows a symlinked data directory, reads manifests and file sizes only, never document contents, and is a dry run unless `--apply` is given:
 
 ```sh
 docker compose -f compose.multitenant.yaml stop markdownify
@@ -158,7 +166,7 @@ docker compose -f compose.multitenant.yaml start markdownify
 For a native process, run `node dist/remote/purge-owner.js "$MD_DATA_DIR" <tenant_id> <agent_id> [--apply]` with the process stopped. The tool always prints a JSON report:
 
 - `jobs`: the owner's jobs, each `listed` (dry run), `deleted`, or `failed` with an errno-style `code`. A failure on one job does not stop the others.
-- `skipped`: directories it will not touch: `missing_manifest` (an interrupted create, removed by the service at startup), `legacy_unowned` (a manifest without owner fields, only usable with `MD_LEGACY_OWNER`), and `id_mismatch` (a manifest whose `id` differs from its directory name). Startup refuses the last two, so inspect them manually.
+- `skipped`: directories it will not touch: `missing_manifest` (an interrupted create, removed by the service at startup), `legacy_unowned` (a manifest without owner fields, only usable with `MD_LEGACY_OWNER`), `malformed_owner` (a manifest with only one of `tenant_id`/`agent_id`, or a non-string value), and `id_mismatch` (a manifest whose `id` differs from its directory name). Startup refuses `malformed_owner` and `id_mismatch`, and `legacy_unowned` unless `MD_LEGACY_OWNER` is set, so inspect them manually.
 - `unreadable`: manifests that could not be read or parsed. Ownership is never guessed; startup refuses these too.
 
 The exit status is 0 only when no job failed and no manifest was unreadable, 1 otherwise or when a precondition fails, and 2 for usage errors. Rerun with `--apply` after fixing a failure; already deleted jobs are simply absent. Do not delete job directories by hand from manifest contents: a directory's name, not the manifest's `id` field, is what the service loads.

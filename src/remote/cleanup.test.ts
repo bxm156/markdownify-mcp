@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, setSystemTime, spyOn, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -58,7 +59,7 @@ describe("retention cleanup resilience", () => {
       await expect(instance.getMarkdown(alice, failing)).rejects.toMatchObject({ statusCode: 410 });
       const owner = await health(instance);
       expect(owner.own_reserved_bytes).toBe(1 + options.maxOutputBytes);
-      expect(owner.cleanup).toMatchObject({ own_jobs_failed_last_sweep: 1, own_jobs_pending_retry: 1, last_sweep_started_at: expect.any(String), last_sweep_finished_at: expect.any(String) });
+      expect(owner.cleanup).toEqual({ last_sweep_at: expect.any(String), own_jobs_failed_last_sweep: 1, own_jobs_pending_retry: 1 });
       // Other tenants and agents never see failures caused by someone else's job.
       for (const actor of [carol, bob]) {
         const foreign = await health(instance, actor);
@@ -284,7 +285,7 @@ describe("retired owner purge tool", () => {
     const { instance, options } = await service();
     const mine = [await completed(instance, alice), await uploaded(instance, alice), await uploaded(instance, alice)], theirs = [await uploaded(instance, bob), await uploaded(instance, carol)];
     // The service is still running, so purging is refused.
-    await expect(purgeOwnerJobs(options.dataDir, alice)).rejects.toThrow("stop it first");
+    await expect(purgeOwnerJobs(options.dataDir, alice)).rejects.toThrow("A lock file exists (MD_DATA_DIR/.lock). Stop the service if it is running.");
     await instance.close();
     const mismatch = "22222222-2222-2222-2222-222222222222", legacy = "33333333-3333-3333-3333-333333333333";
     await fs.mkdir(path.join(options.dataDir, mismatch)); await fs.writeFile(path.join(options.dataDir, mismatch, "job.json"), JSON.stringify({ ...await manifest(options.dataDir, mine[1]), id: mine[1] }));
@@ -319,22 +320,40 @@ describe("retired owner purge tool", () => {
     expect((await purgeOwnerJobs(empty, alice)).jobs).toEqual([]);
   });
 
-  const node = Bun.which("node");
-  test.skipIf(!node)("compiled CLI reports usage, refusals, unreadable manifests and follows a symlinked data directory", async () => {
-    const root = path.resolve(import.meta.dir, "../..");
-    const build = spawnSync(process.execPath, ["run", "build:remote"], { cwd: root, encoding: "utf8" });
-    expect(build.status).toBe(0);
+  test("null manifests are unreadable and partial owners are skipped as malformed, both left untouched", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-malformed-")); directories.push(dataDir);
+    const nullish = "55555555-5555-5555-5555-555555555555", partial = "66666666-6666-6666-6666-666666666666", typed = "77777777-7777-7777-7777-777777777777";
+    for (const [id, body] of [[nullish, "null"], [partial, JSON.stringify({ id: partial, tenant_id: "team", status: "completed" })], [typed, JSON.stringify({ id: typed, tenant_id: "team", agent_id: 7 })]]) {
+      await fs.mkdir(path.join(dataDir, id)); await fs.writeFile(path.join(dataDir, id, "job.json"), body);
+    }
+    const report = await purgeOwnerJobs(dataDir, alice, true);
+    expect(report.unreadable).toEqual([nullish]); expect(report.jobs).toEqual([]);
+    expect(report.skipped).toEqual(expect.arrayContaining([{ job_id: partial, reason: "malformed_owner" }, { job_id: typed, reason: "malformed_owner" }]));
+    for (const id of [nullish, partial, typed]) expect(await files(dataDir, id)).toEqual(["job.json"]);
+  });
+
+});
+
+const node = Bun.which("node"), root = path.resolve(import.meta.dir, "../..");
+const freePort = () => new Promise<number>((resolve, reject) => { const server = net.createServer(); server.once("error", reject); server.listen(0, "127.0.0.1", () => { const { port } = server.address() as net.AddressInfo; server.close(() => resolve(port)); }); });
+describe.skipIf(!node)("compiled entry points under node", () => {
+  beforeAll(() => { const build = spawnSync(process.execPath, ["run", "build:remote"], { cwd: root, encoding: "utf8" }); if (build.status !== 0) throw new Error(`build failed: ${build.stdout}${build.stderr}`); }, 60_000);
+
+  test("purge CLI reports usage, refusals and unreadable manifests, and follows symlinks to itself and the data directory", async () => {
     const cli = (...args: string[]) => spawnSync(node!, [path.join(root, "dist/remote/purge-owner.js"), ...args], { encoding: "utf8" });
     expect(cli().status).toBe(2); expect(cli().stderr).toContain("Usage:");
+    const linkParent = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-link-")); directories.push(linkParent);
+    // A symlinked CLI behaves like a direct invocation instead of silently exiting 0.
+    const linkedCli = path.join(linkParent, "purge-owner.js"); await fs.symlink(path.join(root, "dist/remote/purge-owner.js"), linkedCli);
+    const viaLink = spawnSync(node!, [linkedCli], { encoding: "utf8" }); expect(viaLink.status).toBe(2); expect(viaLink.stderr).toContain("Usage:");
     const { instance, options } = await service();
     const mine = await uploaded(instance, alice);
-    // A live service holds the lock (this test process), so the CLI refuses.
+    // A service holds the lock, so the CLI refuses without printing a report.
     const live = cli(options.dataDir, alice.tenantId, alice.agentId);
-    expect(live.status).toBe(1); expect(live.stderr).toContain("stop it first"); expect(live.stdout).toBe("");
+    expect(live.status).toBe(1); expect(live.stderr).toContain("A lock file exists (MD_DATA_DIR/.lock)"); expect(live.stderr).toContain("remove MD_DATA_DIR/.lock"); expect(live.stdout).toBe("");
     await instance.close();
     const missing = cli(path.join(options.dataDir, "missing"), alice.tenantId, alice.agentId);
     expect(missing.status).toBe(1); expect(missing.stderr).toContain("Data directory not found");
-    const linkParent = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-link-")); directories.push(linkParent);
     const link = path.join(linkParent, "data"); await fs.symlink(options.dataDir, link, "dir");
     const linked = cli(link, alice.tenantId, alice.agentId);
     expect(linked.status).toBe(0); expect(JSON.parse(linked.stdout).jobs).toMatchObject([{ job_id: mine, result: "listed" }]);
@@ -346,5 +365,42 @@ describe("retired owner purge tool", () => {
     expect(report.unreadable).toEqual([corrupt]); expect(report.jobs).toMatchObject([{ job_id: mine, result: "deleted" }]);
     await expect(fs.stat(path.join(options.dataDir, mine))).rejects.toMatchObject({ code: "ENOENT" });
     expect(await fs.readFile(path.join(options.dataDir, corrupt, "job.json"), "utf8")).toBe("{not json");
-  }, 60_000);
+  }, 30_000);
+
+  test("process.exit and uncaught exceptions release the lock", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-exit-lock-")); directories.push(dataDir);
+    const lockModule = JSON.stringify(path.join(root, "dist/remote/lock.js"));
+    for (const ending of ["process.exit(1);", "throw new Error('boom');"]) {
+      const child = spawnSync(node!, ["--input-type=module", "-e", `import { acquireLock } from ${lockModule}; import fs from 'node:fs'; await acquireLock(${JSON.stringify(dataDir)}); if (!fs.existsSync(${JSON.stringify(path.join(dataDir, ".lock"))})) process.exit(9); ${ending}`], { encoding: "utf8" });
+      expect(child.status).toBe(1);
+      await expect(fs.stat(path.join(dataDir, ".lock"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  test("a SIGKILLed server leaves its lock, restarts fail with the removal step, and removing it allows restart", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-sigkill-")); directories.push(dataDir);
+    const port = await freePort(), lock = path.join(dataDir, ".lock");
+    const env = { ...process.env, MD_API_KEY: "k".repeat(40), MD_DATA_DIR: dataDir, MD_HOST: "127.0.0.1", MD_PORT: String(port), MD_PUBLIC_BASE_URL: `http://127.0.0.1:${port}`, MARKITDOWN_PATH: node! };
+    const start = () => { const child = spawn(node!, [path.join(root, "dist/remote/index.js")], { env, stdio: ["ignore", "ignore", "pipe"] }); let stderr = ""; child.stderr!.on("data", chunk => { stderr += chunk; }); const exited = new Promise<number | null>(resolve => child.once("exit", code => resolve(code))); return { child, exited, stderr: () => stderr }; };
+    const ready = async (server: ReturnType<typeof start>) => {
+      for (let tries = 0; tries < 200; tries++) {
+        if (server.child.exitCode !== null) throw new Error(`server exited: ${server.stderr()}`);
+        const ok = await fetch(`http://127.0.0.1:${port}/readyz`, { headers: { Host: `127.0.0.1:${port}` } }).then(response => response.ok, () => false);
+        if (ok) return; await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      throw new Error("server never became ready");
+    };
+    const first = start();
+    try { await ready(first); expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(first.child.pid)); first.child.kill("SIGKILL"); await first.exited; }
+    finally { if (first.child.exitCode === null) first.child.kill("SIGKILL"); }
+    expect((await fs.readFile(lock, "utf8")).trim()).toBe(String(first.child.pid));
+    const refused = start(); expect(await refused.exited).toBe(1);
+    expect(refused.stderr()).toContain("Data directory is in use: MD_DATA_DIR/.lock exists"); expect(refused.stderr()).toContain("remove MD_DATA_DIR/.lock and restart");
+    await fs.rm(lock, { force: true });
+    const restarted = start();
+    try { await ready(restarted); restarted.child.kill("SIGTERM"); expect(await restarted.exited).toBe(0); }
+    finally { if (restarted.child.exitCode === null) restarted.child.kill("SIGKILL"); }
+    // Graceful shutdown releases the lock again.
+    await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 30_000);
 });

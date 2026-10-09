@@ -416,7 +416,7 @@ export class JobService {
     const states = Object.fromEntries(["awaiting_upload", "uploaded", "queued", "running", "completed", "failed", "expired"].map(s => [s, mine.filter(j => j.status === s).length]));
     const live = mine.filter(j => j.status !== "expired");
     // Only the caller's own cleanup failures; failures do not affect readiness.
-    const cleanup = { last_sweep_started_at: this.cleanupStats.last_started_at, last_sweep_finished_at: this.cleanupStats.last_finished_at,
+    const cleanup = { last_sweep_at: this.cleanupStats.last_finished_at,
       own_jobs_failed_last_sweep: mine.filter(j => this.failedLastSweep.has(j.id)).length, own_jobs_pending_retry: mine.filter(j => this.cleanupPending.has(j.id)).length };
     return { ...base, own_jobs: states, cleanup, own_reserved_bytes: live.reduce((n, j) => n + j.size_bytes + this.options.maxOutputBytes, 0),
       limits: { global_jobs: this.options.maxJobs, global_reserved_bytes: this.options.maxStorageBytes,

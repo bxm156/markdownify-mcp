@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import fs from "node:fs/promises";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { validatePrincipal, type Principal } from "./identity.js";
-import { liveLockOwner } from "./lock.js";
+import { LOCK_REMOVAL_HINT, readLock } from "./lock.js";
 
 export type PurgedJob = { job_id: string; status: string; bytes: number | null; result: "listed" | "deleted" | "failed"; code?: string };
-export type PurgeReport = { applied: boolean; tenant_id: string; agent_id: string; jobs: PurgedJob[]; skipped: { job_id: string; reason: "missing_manifest" | "legacy_unowned" | "id_mismatch" }[]; unreadable: string[] };
+export type PurgeReport = { applied: boolean; tenant_id: string; agent_id: string; jobs: PurgedJob[]; skipped: { job_id: string; reason: "missing_manifest" | "legacy_unowned" | "malformed_owner" | "id_mismatch" }[]; unreadable: string[] };
 /** A precondition failed; nothing was read or removed. */
 export class PurgeRefused extends Error {}
 const errorCode = (error: unknown) => { const code = (error as NodeJS.ErrnoException | null)?.code; return typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code) ? code : "UNKNOWN"; };
@@ -21,7 +22,7 @@ export async function purgeOwnerJobs(dataDir: string, owner: Principal, apply = 
   try { validatePrincipal(owner); } catch { throw new PurgeRefused("Invalid tenant_id or agent_id"); }
   let root: string;
   try { root = await fs.realpath(dataDir); if (!(await fs.stat(root)).isDirectory()) throw new Error(); } catch { throw new PurgeRefused("Data directory not found"); }
-  if (await liveLockOwner(root) !== undefined) throw new PurgeRefused("The service is running on this data directory; stop it first (one process per data volume)");
+  if (await readLock(root)) throw new PurgeRefused(`A lock file exists (MD_DATA_DIR/.lock). Stop the service if it is running. ${LOCK_REMOVAL_HINT}`);
   const entries = await fs.readdir(root, { withFileTypes: true });
   const candidates = entries.filter(entry => entry.isDirectory() && /^[0-9a-f-]{36}$/.test(entry.name)).map(entry => entry.name);
   const manifests = await Promise.all(candidates.map(name => fs.lstat(path.join(root, name, "job.json")).then(stat => stat.isFile(), () => false)));
@@ -39,6 +40,7 @@ export async function purgeOwnerJobs(dataDir: string, owner: Principal, apply = 
     if (!job || typeof job !== "object") { report.unreadable.push(name); continue; }
     if (job.id !== name) { report.skipped.push({ job_id: name, reason: "id_mismatch" }); continue; }
     if (job.tenant_id === undefined && job.agent_id === undefined) { report.skipped.push({ job_id: name, reason: "legacy_unowned" }); continue; }
+    if (typeof job.tenant_id !== "string" || typeof job.agent_id !== "string") { report.skipped.push({ job_id: name, reason: "malformed_owner" }); continue; }
     if (job.tenant_id !== owner.tenantId || job.agent_id !== owner.agentId) continue;
     const entry: PurgedJob = { job_id: name, status: typeof job.status === "string" && /^[a-z_]{1,32}$/.test(job.status) ? job.status : "unknown", bytes: await directoryBytes(directory).catch(() => null), result: apply ? "deleted" : "listed" };
     if (apply) try { await fs.rm(directory, { recursive: true, force: true }); } catch (error) { entry.result = "failed"; entry.code = errorCode(error); }
@@ -47,7 +49,9 @@ export async function purgeOwnerJobs(dataDir: string, owner: Principal, apply = 
   return report;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+// Compare real paths so invocation through a symlink behaves like a direct invocation.
+const isMain = () => { try { return !!process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); } catch { return false; } };
+if (isMain()) {
   const [dataDir, tenantId, agentId, flag, ...rest] = process.argv.slice(2);
   if (!dataDir || !tenantId || !agentId || (flag !== undefined && flag !== "--apply") || rest.length) {
     console.error("Usage: node dist/remote/purge-owner.js <data-dir> <tenant_id> <agent_id> [--apply]  (stop the service first; dry run by default)");
