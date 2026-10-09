@@ -162,9 +162,13 @@ test("MD_JWT_MAX_TTL_SECONDS is bounded at load and enforced against exp - iat",
   expect(await auth.authenticate(await signed("machine-a", { iat: now, exp: now + 61 }))).toBeNull();
 });
 test("JWT clock tolerance allows 5s of iat skew but none for exp", async () => {
+  const { setSystemTime } = await import("bun:test");
+  setSystemTime(new Date("2026-01-01T12:00:00Z"));
+  try {
   const auth = verifier(), now = Math.floor(Date.now() / 1000);
   expect(await auth.authenticate(await signed("machine-a", { iat: now + 4, exp: now + 304 }))).not.toBeNull();
   expect(await auth.authenticate(await signed("machine-a", { iat: now + 6, exp: now + 306 }))).toBeNull();
   // Expired tokens get no grace even though the library tolerance is 5s: the explicit `exp <= now` check rejects them.
   expect(await auth.authenticate(await signed("machine-a", { iat: now - 10, exp: now - 1 }))).toBeNull();
+  } finally { setSystemTime(); }
 });
