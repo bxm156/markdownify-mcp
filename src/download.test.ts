@@ -1,9 +1,27 @@
 import { expect, test } from "bun:test";
-import { createServer } from "node:http";
+import { createServer, type IncomingHttpHeaders, type RequestListener } from "node:http";
 import { gzipSync } from "node:zlib";
-import { download } from "./download";
+import { download, USER_AGENT } from "./download";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import packageJson from "../package.json";
+
+/** Runs `body` against a throwaway HTTP server on 127.0.0.1 and always closes it. */
+async function withServer(
+  handler: RequestListener,
+  body: (port: number) => Promise<void>,
+): Promise<void> {
+  const server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await body((server.address() as any).port);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+const loopback = [{ address: "127.0.0.1", family: 4 }];
 
 test("pinned connection uses the selected address and preserves the original Host", async () => {
   let host: string | undefined;
@@ -24,7 +42,7 @@ test("pinned connection uses the selected address and preserves the original Hos
 });
 
 test("the exchange deadline also terminates a stalled response body", async () => {
-  // Exercise the production Node runtime; Bun 1.4.2 on Windows crashes in its HTTP abort bridge.
+  // Run under Node (the server supports both Node and Bun); Bun 1.4.2 on Windows crashes in its HTTP abort bridge.
   const script = `
     import assert from 'node:assert/strict';
     import {createServer} from 'node:http';
@@ -37,4 +55,85 @@ test("the exchange deadline also terminates a stalled response body", async () =
     } finally {server.closeAllConnections(); await new Promise(r => server.close(r));}
   `;
   await promisify(execFile)("node", ["--experimental-strip-types", "--input-type=module", "-e", script], { timeout: 5000 });
+});
+
+test("sends a User-Agent and Accept header", async () => {
+  let headers: IncomingHttpHeaders = {};
+  await withServer(
+    (request, response) => {
+      headers = request.headers;
+      response.end("ok");
+    },
+    async (port) => {
+      const response = await download.fetch(`http://ua.invalid:${port}/`, loopback, AbortSignal.timeout(1000));
+      expect(await response.text()).toBe("ok");
+    },
+  );
+  expect(USER_AGENT).toBe(`markdownify-mcp/${packageJson.version}`);
+  expect(headers["user-agent"]).toBe(USER_AGENT);
+  expect(headers["accept"]).toBe("*/*");
+  expect(headers["accept-encoding"]).toBe("identity");
+});
+
+test("falls through to the next validated address when a connection is refused", async () => {
+  let requests = 0;
+  await withServer(
+    (_request, response) => {
+      requests++;
+      response.end("second address");
+    },
+    async (port) => {
+      // Nothing listens on 127.0.0.2:<port>, so the first attempt is refused.
+      const response = await download.fetch(
+        `http://dual.invalid:${port}/`,
+        [{ address: "127.0.0.2", family: 4 }, ...loopback],
+        AbortSignal.timeout(2000),
+      );
+      expect(await response.text()).toBe("second address");
+    },
+  );
+  expect(requests).toBe(1);
+});
+
+test("reports the last connection error when every address is refused", async () => {
+  let port = 0;
+  await withServer(() => {}, async (p) => { port = p; });
+  // The server is closed now, so both addresses refuse.
+  await expect(
+    download.fetch(
+      `http://down.invalid:${port}/`,
+      [{ address: "127.0.0.2", family: 4 }, ...loopback],
+      AbortSignal.timeout(2000),
+    ),
+  ).rejects.toMatchObject({ code: "ECONNREFUSED" });
+});
+
+test.each(["x-gzip", "GZIP"])("decodes Content-Encoding %p", async (encoding) => {
+  await withServer(
+    (_request, response) => {
+      response.writeHead(200, { "Content-Encoding": encoding });
+      response.end(gzipSync("decoded"));
+    },
+    async (port) => {
+      const response = await download.fetch(`http://enc.invalid:${port}/`, loopback, AbortSignal.timeout(1000));
+      expect(await response.text()).toBe("decoded");
+    },
+  );
+});
+
+test.each([
+  ["gzip, br", "multiple encodings are not supported"],
+  ["zstd", 'Unsupported Content-Encoding "zstd"'],
+])("rejects Content-Encoding %p instead of passing compressed bytes on", async (encoding, message) => {
+  await withServer(
+    (_request, response) => {
+      response.writeHead(200, { "Content-Encoding": encoding });
+      response.end("still compressed");
+    },
+    async (port) => {
+      await expect(
+        download.fetch(`http://enc.invalid:${port}/`, loopback, AbortSignal.timeout(1000)),
+      ).rejects.toThrow(message);
+    },
+  );
 });
