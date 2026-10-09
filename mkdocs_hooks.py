@@ -10,7 +10,11 @@ then runs on the result, without changing any source file:
 * other repository files link to ``<repo_url>/blob/main/<path>``, and
   directories to ``<repo_url>/tree/main/<path>``.
 
-Fenced code blocks and inline code spans are left untouched. Links inside
+Fenced code blocks and inline code spans are left untouched. Only inline
+links and images (``[text](target)``) are rewritten: reference-style link
+definitions (``[id]: target``) and raw HTML (``<a href>``) are deliberately
+left alone, since the docs do not use them for repository links; MkDocs still
+validates whatever it can of those. Links inside
 ``docs/`` are left for MkDocs, which still validates them strictly. A link to a
 repository path that does not exist is logged as a warning, which fails
 ``mkdocs build --strict``.
@@ -47,8 +51,10 @@ LINK_TARGET = re.compile(r'(\]\()([^)\s]+)((?:\s+"[^"]*")?\))')
 SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 # Opening/closing line of a fenced code block (``` or ~~~, up to 3 spaces in).
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-# Inline code span: a backtick run closed by a run of the same length.
-CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)", re.DOTALL)
+# Inline code span: a backtick run closed by a run of the same length. It may
+# wrap onto the next line but never crosses a blank line (paragraph boundary),
+# so a stray backtick cannot hide links in a later paragraph.
+CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(?:(?!\n[ \t]*\n).)+?(?<!`)\1(?!`)", re.DOTALL)
 
 log = logging.getLogger("mkdocs.hooks.repo_links")
 
@@ -167,6 +173,12 @@ def _self_check() -> None:
         "[still fenced](../LICENSE)",
         "~~~~",
         "After: [plan](../PLAN.md)",
+        "A stray ` backtick here.",
+        "",
+        "Next paragraph [license](../LICENSE).",
+        "",
+        "Span `wrapping",
+        "lines [x](../LICENSE)` is code.",
         "",
     ])
     expected = "\n".join([
@@ -182,6 +194,12 @@ def _self_check() -> None:
         "[still fenced](../LICENSE)",
         "~~~~",
         "After: [plan](plan.md)",
+        "A stray ` backtick here.",
+        "",
+        f"Next paragraph [license]({repo}/blob/main/LICENSE).",
+        "",
+        "Span `wrapping",
+        "lines [x](../LICENSE)` is code.",
         "",
     ])
     actual = rewrite_links(source, ctx)

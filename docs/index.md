@@ -35,7 +35,7 @@ Agent runtime ◄─ Markdown pages ── /mcp
 1. **Reserve.** `create_upload` with the file name and exact size returns an `upload_id`, an `upload_url` and short-lived upload headers.
 2. **Upload.** The runtime streams the raw bytes with HTTP `PUT` to `upload_url`, using those headers.
 3. **Convert.** `start_conversion` with the `upload_id` returns a `job_id` immediately.
-4. **Poll.** `get_conversion_status` with backoff and a finite deadline, until the job is `completed` or `failed`. A `JOB_EXPIRED` error (HTTP 410) is also terminal: stop polling and create a fresh upload if the document is still needed.
+4. **Poll.** `get_conversion_status` with backoff and a finite deadline, until the job is `completed` or `failed`. An `isError` result whose `error_info.code` is `JOB_EXPIRED` (or `JOB_NOT_FOUND`, once the expired record has been cleaned up) is also terminal: stop polling and create a fresh upload if the document is still needed.
 5. **Read.** `get_markdown` returns pages; follow `next_offset` until it is `null`.
 6. **Clean up.** `delete_job` when the result is saved, or let retention remove it (24 hours by default).
 
