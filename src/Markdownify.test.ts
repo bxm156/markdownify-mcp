@@ -1,5 +1,16 @@
-import { expect, test, mock, beforeAll, afterAll } from "bun:test";
+import {
+  expect,
+  test,
+  describe,
+  mock,
+  spyOn,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+} from "bun:test";
 import { Markdownify, MarkdownResult } from "./Markdownify";
+import dns from "node:dns";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -68,18 +79,153 @@ test("Markdownify.toMarkdown converts image file to Markdown", async () => {
 test("Markdownify.toMarkdown converts URL content to Markdown", async () => {
   const testUrl = "https://example.com";
   const html = "<h1>Example Domain</h1>";
-  const mockFetch = mock(() =>
-    Promise.resolve({
-      arrayBuffer: () =>
-        Promise.resolve(new TextEncoder().encode(html).buffer),
-    }),
-  );
+  const mockFetch = mock(() => Promise.resolve(new Response(html)));
   global.fetch = mockFetch as any;
+  const lookupSpy = spyOn(dns.promises, "lookup").mockResolvedValue([
+    { address: "93.184.215.14", family: 4 },
+  ] as any);
 
-  const result = await Markdownify.toMarkdown({ url: testUrl });
+  try {
+    const result = await Markdownify.toMarkdown({ url: testUrl });
 
-  expect(result).toBeDefined();
-  expect(result.text).toContain("# Example Domain");
+    expect(result).toBeDefined();
+    expect(result.text).toContain("# Example Domain");
+  } finally {
+    lookupSpy.mockRestore();
+  }
+});
+
+describe("Markdownify.safeFetch", () => {
+  const safeFetch = (url: string) => Markdownify["safeFetch"](url);
+  let lookupSpy: ReturnType<typeof spyOn>;
+  let originalFetch: typeof fetch;
+
+  // Install a fresh fetch stub per test (rather than spying on whatever an
+  // earlier test left in global.fetch) and put the previous one back after.
+  const stubFetch = (impl: (url: string) => Promise<Response>) => {
+    const stub = mock(impl);
+    globalThis.fetch = stub as unknown as typeof fetch;
+    return stub;
+  };
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    lookupSpy = spyOn(dns.promises, "lookup").mockResolvedValue([
+      { address: "93.184.215.14", family: 4 },
+    ] as any);
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    lookupSpy.mockRestore();
+  });
+
+  const redirect = (location?: string) =>
+    new Response(null, {
+      status: 302,
+      headers: location ? { location } : {},
+    });
+
+  test("rejects a redirect to the cloud metadata address", async () => {
+    const fetchStub = stubFetch(async () =>
+      redirect("http://169.254.169.254/latest/meta-data/"),
+    );
+    await expect(safeFetch("https://example.com/")).rejects.toThrow(
+      "potentially dangerous",
+    );
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+  });
+
+  test("follows up to 10 redirects", async () => {
+    let calls = 0;
+    const fetchStub = stubFetch(async () =>
+      ++calls <= 10 ? redirect(`/hop-${calls}`) : new Response("ok"),
+    );
+    const response = await safeFetch("https://example.com/");
+    expect(await response.text()).toBe("ok");
+    expect(fetchStub).toHaveBeenCalledTimes(11);
+  });
+
+  test("gives up after too many redirects", async () => {
+    const fetchStub = stubFetch(async () => redirect("/again"));
+    await expect(safeFetch("https://example.com/")).rejects.toThrow(
+      "Too many redirects",
+    );
+    expect(fetchStub).toHaveBeenCalledTimes(11);
+  });
+
+  test("resolves a relative Location against the current URL", async () => {
+    const fetchStub = stubFetch(async (url) =>
+      url === "https://example.com/a/b"
+        ? redirect("../c?x=1")
+        : new Response("done"),
+    );
+    await safeFetch("https://example.com/a/b");
+    expect(fetchStub.mock.calls.map((call) => call[0])).toEqual([
+      "https://example.com/a/b",
+      "https://example.com/c?x=1",
+    ]);
+  });
+
+  test("returns a 3xx response without a Location header as-is", async () => {
+    stubFetch(async () => redirect());
+    const response = await safeFetch("https://example.com/");
+    expect(response.status).toBe(302);
+  });
+
+  test("throws on an HTTP error status", async () => {
+    stubFetch(
+      async () =>
+        new Response("boom", {
+          status: 500,
+          statusText: "Internal Server Error",
+        }),
+    );
+    await expect(safeFetch("https://example.com/")).rejects.toThrow(
+      "failed with HTTP 500 Internal Server Error",
+    );
+  });
+
+  test("passes a timeout signal and manual redirects to fetch", async () => {
+    const fetchStub = stubFetch(async () => new Response("ok"));
+    await safeFetch("https://example.com/");
+    const init = (fetchStub.mock.calls[0] as unknown[])[1] as RequestInit;
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+    expect(init.redirect).toBe("manual");
+  });
+});
+
+describe("Markdownify.readBodyWithLimit", () => {
+  const readBodyWithLimit = (response: Response, maxBytes?: number) =>
+    Markdownify["readBodyWithLimit"](response, maxBytes);
+
+  test("returns the body when it fits", async () => {
+    const body = await readBodyWithLimit(new Response("hello"), 5);
+    expect(body.toString()).toBe("hello");
+  });
+
+  test("rejects a declared Content-Length over the limit", async () => {
+    const response = new Response("x", {
+      headers: { "content-length": String(51 * 1024 * 1024) },
+    });
+    await expect(readBodyWithLimit(response)).rejects.toThrow(
+      "download limit",
+    );
+  });
+
+  test("aborts a streamed body once it passes the limit", async () => {
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls++;
+        controller.enqueue(new Uint8Array(4));
+      },
+    });
+    await expect(readBodyWithLimit(new Response(stream), 10)).rejects.toThrow(
+      "download limit",
+    );
+    expect(pulls).toBeLessThan(10);
+  });
 });
 
 test("Markdownify.get retrieves existing Markdown file", async () => {

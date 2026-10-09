@@ -20,6 +20,9 @@ const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const FETCH_TIMEOUT_MS = 30_000;
+const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024; // 50 MiB
+
 export type MarkdownResult = {
   path?: string;
   text: string;
@@ -84,10 +87,14 @@ export class Markdownify {
     url: string,
     maxRedirects = 10,
   ): Promise<Response> {
+    // One deadline for the whole exchange, including reading the final body.
+    const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
     let currentUrl = url;
-    for (let i = 0; i < maxRedirects; i++) {
-      validateUrl(currentUrl);
-      const response = await fetch(currentUrl, { redirect: "manual" });
+    for (let i = 0; i <= maxRedirects; i++) {
+      // Re-validate (and re-resolve) every hop so a redirect cannot reach
+      // an internal address.
+      await validateUrl(currentUrl);
+      const response = await fetch(currentUrl, { redirect: "manual", signal });
       if (
         response.status >= 300 &&
         response.status < 400 &&
@@ -99,9 +106,47 @@ export class Markdownify {
         ).toString();
         continue;
       }
+      if (response.status >= 400) {
+        throw new Error(
+          `Fetching ${currentUrl} failed with HTTP ${response.status}` +
+            (response.statusText ? ` ${response.statusText}` : ""),
+        );
+      }
       return response;
     }
     throw new Error("Too many redirects");
+  }
+
+  private static async readBodyWithLimit(
+    response: Response,
+    maxBytes = MAX_DOWNLOAD_BYTES,
+  ): Promise<Buffer> {
+    const tooLarge = new Error(
+      `Response body exceeds the ${maxBytes}-byte download limit.`,
+    );
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (declaredLength > maxBytes) {
+      throw tooLarge;
+    }
+    if (!response.body) {
+      return Buffer.alloc(0);
+    }
+    // Stream even when Content-Length is present: it can be absent or wrong,
+    // and fetch transparently decompresses gzip/br bodies.
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        await reader.cancel();
+        throw tooLarge;
+      }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks);
   }
 
   static async toMarkdown({
@@ -121,8 +166,7 @@ export class Markdownify {
         const response = await this.safeFetch(url);
         const extension = inferExtensionFromUrl(url);
 
-        const arrayBuffer = await response.arrayBuffer();
-        const content = Buffer.from(arrayBuffer);
+        const content = await this.readBodyWithLimit(response);
 
         inputPath = await this.saveToTempFile(content, extension);
         isTemporary = true;

@@ -1,6 +1,8 @@
 import path from "path";
 import os from "os";
 import fs from "fs";
+import dns from "node:dns";
+import net from "node:net";
 import { URL } from "node:url";
 import is_ip_private from "private-ip";
 import { isValidRemoteValue } from "repomix";
@@ -79,15 +81,97 @@ export function assertPathAllowed(filePath: string): void {
   }
 }
 
-export function validateUrl(url: string): void {
+const BLOCKED_HOSTNAMES = new Set([
+  "localhost",
+  "metadata",
+  "metadata.google.internal",
+]);
+
+/** Expands an IPv6 address into its eight 16-bit groups. */
+function ipv6Groups(address: string): number[] {
+  let text = address;
+  // Rewrite a trailing dotted IPv4 part (::ffff:127.0.0.1) as two hex groups.
+  const ipv4Tail = text.match(/(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (ipv4Tail) {
+    const [a, b, c, d] = ipv4Tail.slice(1).map(Number);
+    text =
+      text.slice(0, -ipv4Tail[0].length) +
+      `${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const [head, tail] = text.split("::");
+  const headGroups = head ? head.split(":") : [];
+  const tailGroups = tail ? tail.split(":") : [];
+  const missing = 8 - headGroups.length - tailGroups.length;
+  return [...headGroups, ...new Array(missing).fill("0"), ...tailGroups].map(
+    (group) => parseInt(group, 16),
+  );
+}
+
+/** True for loopback, private, link-local, unique-local and unspecified addresses. */
+function isPrivateAddress(address: string): boolean {
+  if (net.isIPv4(address)) {
+    return is_ip_private(address) === true;
+  }
+  if (!net.isIPv6(address)) {
+    return false;
+  }
+  const groups = ipv6Groups(address);
+  const firstFiveZero = groups.slice(0, 5).every((group) => group === 0);
+  if (firstFiveZero && groups[5] === 0xffff) {
+    // IPv4-mapped (::ffff:a.b.c.d): judge the embedded IPv4 address.
+    const [high, low] = [groups[6], groups[7]];
+    return isPrivateAddress(
+      [high >> 8, high & 0xff, low >> 8, low & 0xff].join("."),
+    );
+  }
+  if (groups.slice(0, 7).every((group) => group === 0) && groups[7] <= 1) {
+    return true; // :: (unspecified) and ::1 (loopback)
+  }
+  if ((groups[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique local
+  if ((groups[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  return is_ip_private(address) === true;
+}
+
+/**
+ * Checks that a URL is safe to fetch from this host: http(s) only, and the
+ * hostname must not be (or resolve to) a loopback, private, link-local or
+ * cloud-metadata address. Resolution failures are treated as unsafe.
+ */
+export async function validateUrl(url: string): Promise<void> {
   const parsed = new URL(url);
   if (!["http:", "https:"].includes(parsed.protocol)) {
     throw new Error("Only http: and https: schemes are allowed.");
   }
-  if (is_ip_private(parsed.hostname)) {
-    throw new Error(
-      `Fetching ${url} is potentially dangerous, aborting.`,
-    );
+
+  const dangerous = new Error(
+    `Fetching ${url} is potentially dangerous, aborting.`,
+  );
+  // URL.hostname keeps IPv6 brackets ("[::1]"); a trailing dot is a valid FQDN.
+  const hostname = parsed.hostname
+    .toLowerCase()
+    .replace(/^\[(.*)\]$/, "$1")
+    .replace(/\.$/, "");
+
+  if (BLOCKED_HOSTNAMES.has(hostname) || hostname.endsWith(".localhost")) {
+    throw dangerous;
+  }
+
+  if (net.isIP(hostname)) {
+    if (isPrivateAddress(hostname)) throw dangerous;
+    return;
+  }
+
+  let addresses: { address: string }[];
+  try {
+    addresses = await dns.promises.lookup(hostname, { all: true, verbatim: true });
+  } catch {
+    throw dangerous;
+  }
+  if (
+    addresses.length === 0 ||
+    addresses.some(({ address }) => isPrivateAddress(address))
+  ) {
+    throw dangerous;
   }
 }
 

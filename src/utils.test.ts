@@ -1,4 +1,11 @@
-import { expect, test, describe, beforeEach, afterEach } from "bun:test";
+import {
+  expect,
+  test,
+  describe,
+  beforeEach,
+  afterEach,
+  spyOn,
+} from "bun:test";
 import {
   expandHome,
   validateUrl,
@@ -12,6 +19,7 @@ import {
   getAllowedPaths,
   assertPathAllowed,
 } from "./utils";
+import dns from "node:dns";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -37,46 +45,117 @@ describe("expandHome", () => {
 });
 
 describe("validateUrl", () => {
-  test("accepts http URLs", () => {
-    expect(() => validateUrl("http://example.com")).not.toThrow();
+  let lookupSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    // Keep these tests offline: every hostname resolves to a public address
+    // unless a test says otherwise.
+    lookupSpy = spyOn(dns.promises, "lookup").mockResolvedValue([
+      { address: "93.184.215.14", family: 4 },
+    ] as any);
   });
 
-  test("accepts https URLs", () => {
-    expect(() => validateUrl("https://example.com")).not.toThrow();
+  afterEach(() => {
+    lookupSpy.mockRestore();
   });
 
-  test("rejects ftp URLs", () => {
-    expect(() => validateUrl("ftp://example.com")).toThrow(
+  test("accepts http URLs", async () => {
+    await expect(validateUrl("http://example.com")).resolves.toBeUndefined();
+  });
+
+  test("accepts https URLs", async () => {
+    await expect(validateUrl("https://example.com/")).resolves.toBeUndefined();
+    expect(lookupSpy).toHaveBeenCalledWith("example.com", {
+      all: true,
+      verbatim: true,
+    });
+  });
+
+  test("accepts public IP literals without a DNS lookup", async () => {
+    await expect(validateUrl("http://8.8.8.8/")).resolves.toBeUndefined();
+    await expect(
+      validateUrl("http://[2606:4700::1111]/"),
+    ).resolves.toBeUndefined();
+    expect(lookupSpy).not.toHaveBeenCalled();
+  });
+
+  test("rejects ftp URLs", async () => {
+    await expect(validateUrl("ftp://example.com")).rejects.toThrow(
       "Only http: and https: schemes are allowed.",
     );
   });
 
-  test("rejects file URLs", () => {
-    expect(() => validateUrl("file:///etc/passwd")).toThrow(
+  test("rejects file URLs", async () => {
+    await expect(validateUrl("file:///etc/passwd")).rejects.toThrow(
       "Only http: and https: schemes are allowed.",
     );
   });
 
-  test("rejects private IP addresses", () => {
-    expect(() => validateUrl("http://192.168.1.1")).toThrow(
+  test("rejects private IP addresses", async () => {
+    await expect(validateUrl("http://192.168.1.1")).rejects.toThrow(
       "potentially dangerous",
     );
   });
 
-  test("rejects localhost", () => {
-    expect(() => validateUrl("http://127.0.0.1")).toThrow(
+  test("rejects the IPv4 loopback address", async () => {
+    await expect(validateUrl("http://127.0.0.1")).rejects.toThrow(
       "potentially dangerous",
     );
   });
 
-  test("rejects link-local addresses", () => {
-    expect(() => validateUrl("http://169.254.169.254")).toThrow(
+  test("rejects link-local addresses", async () => {
+    await expect(validateUrl("http://169.254.169.254")).rejects.toThrow(
       "potentially dangerous",
     );
   });
 
-  test("throws on invalid URLs", () => {
-    expect(() => validateUrl("not-a-url")).toThrow();
+  test.each([
+    "http://localhost/",
+    "http://LOCALHOST./",
+    "http://app.localhost/",
+    "http://metadata/",
+    "http://metadata.google.internal/",
+    "http://[::1]/",
+    "http://[::]/",
+    "http://0.0.0.0/",
+    "http://[::ffff:127.0.0.1]/",
+    "http://[::ffff:169.254.169.254]/",
+    "http://[fd00::1]/",
+    "http://[fc00::1]/",
+    "http://[fe80::1]/",
+    "http://2130706433/", // 127.0.0.1 in decimal
+  ])("rejects %s", async (url) => {
+    await expect(validateUrl(url)).rejects.toThrow("potentially dangerous");
+  });
+
+  test("rejects hostnames that resolve to a private address", async () => {
+    lookupSpy.mockResolvedValue([{ address: "127.0.0.1", family: 4 }] as any);
+    await expect(validateUrl("http://127.0.0.1.nip.io/")).rejects.toThrow(
+      "potentially dangerous",
+    );
+  });
+
+  test("rejects hostnames where any resolved address is private", async () => {
+    lookupSpy.mockResolvedValue([
+      { address: "93.184.215.14", family: 4 },
+      { address: "::ffff:10.0.0.1", family: 6 },
+    ] as any);
+    await expect(validateUrl("https://example.com/")).rejects.toThrow(
+      "potentially dangerous",
+    );
+  });
+
+  test("rejects hostnames that fail to resolve", async () => {
+    lookupSpy.mockRejectedValue(
+      Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" }),
+    );
+    await expect(validateUrl("https://does-not-exist.example/")).rejects.toThrow(
+      "potentially dangerous",
+    );
+  });
+
+  test("throws on invalid URLs", async () => {
+    await expect(validateUrl("not-a-url")).rejects.toThrow();
   });
 });
 
