@@ -35,8 +35,8 @@ test("LiteLLM anonymous initialize/notification/ping works while tools and batch
     expect((await f.request({ jsonrpc: "2.0", id: 5, method, params: { name: "create_upload", arguments: { filename: "a.txt", size_bytes: 1 } } })).status).toBe(401);
   }
   expect((await f.request([{ jsonrpc: "2.0", id: 1, method: "ping" }, { jsonrpc: "2.0", id: 2, method: "tools/list" }])).status).toBe(401);
-  // Missing-sub/invalid Authorization never acquires a job owner; probe methods remain public.
-  expect((await f.request({ jsonrpc: "2.0", id: 8, method: "ping" }, { Authorization: "Bearer invalid" })).status).toBe(200);
+  // A present but invalid Authorization header is rejected; only header-less probes are public.
+  expect((await f.request({ jsonrpc: "2.0", id: 8, method: "ping" }, { Authorization: "Bearer invalid" })).status).toBe(401);
   expect((await f.request({ jsonrpc: "2.0", id: 9, method: "tools/list" }, { Authorization: "Bearer invalid" })).status).toBe(401);
 });
 test("health measures storage, omits foreign usage, and fails readiness during shutdown", async () => {
