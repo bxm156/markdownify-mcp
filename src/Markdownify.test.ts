@@ -16,7 +16,8 @@ const sampleDataDir = path.join(__dirname, "sample-data");
 // Markdownify writes its output under os.tmpdir(). Point TMPDIR at a private
 // directory for this file so tests never see or delete files from other
 // processes, then remove only that directory afterwards.
-const originalTmpdir = process.env.TMPDIR;
+const tempVariables = ["TMPDIR", "TEMP", "TMP"] as const;
+const originalTemp = Object.fromEntries(tempVariables.map(key => [key, process.env[key]]));
 let tempDir: string;
 
 // Network-dependent tests (git clones) only run when MD_TEST_NETWORK is set.
@@ -28,18 +29,22 @@ beforeAll(() => {
     throw new Error("Sample data directory not found");
   }
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "markdownify-test-"));
-  process.env.TMPDIR = tempDir;
+  for (const key of tempVariables) process.env[key] = tempDir;
 });
 
 afterAll(() => {
-  if (originalTmpdir === undefined) {
-    delete process.env.TMPDIR;
-  } else {
-    process.env.TMPDIR = originalTmpdir;
+  for (const key of tempVariables) {
+    if (originalTemp[key] === undefined) delete process.env[key];
+    else process.env[key] = originalTemp[key];
   }
   if (tempDir) {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+test("converter temporary files use the private suite directory", () => {
+  expect(path.resolve(os.tmpdir())).toBe(path.resolve(tempDir));
+  for (const key of tempVariables) expect(process.env[key]).toBe(tempDir);
 });
 
 test("Markdownify.toMarkdown converts PDF file to Markdown", async () => {
