@@ -120,6 +120,8 @@ Global limits from [REMOTE.md](REMOTE.md) still apply. The following additional 
 
 Every value must be a positive safe integer. A reservation must fit global, tenant, and agent budgets. Even a tiny upload reserves the configured maximum output size, so storage limits can bind before job-count limits. Queue scheduling skips owners that have reached their concurrency cap, allowing another eligible owner to run; global concurrency still bounds total converters. These are admission and scheduling limits, not filesystem quotas or a distributed queue.
 
+In [JWT mode](JWT.md#effective-per-user-limits) the tenant and agent ID are both the LiteLLM user ID, so one user is bound by both scopes and the effective cap is the minimum of the global, tenant and agent limits. `get_service_health` reports that minimum for the caller as `limits.effective`.
+
 ### Operator quota overrides
 
 Operators can give specific principals different agent-scope caps with a JSON file named by `MD_QUOTA_OVERRIDES_FILE`. Because tenant caps still apply, raising an agent above a tenant default only takes effect if the tenant cap is raised too. This example raises two tenant caps and keeps every other setting at its default:
@@ -149,7 +151,7 @@ MD_QUOTA_OVERRIDES_FILE=/run/markdownify/quota-overrides.json
 
 Unlisted agents are still held to `MD_MAX_AGENT_JOBS=10` and `MD_MAX_AGENT_CONCURRENCY=1`. In this example the storage budget binds before the job counts. Every job reserves its input plus `MD_MAX_OUTPUT_BYTES` (25 MiB by default), so the 128 MiB tenant budget holds at most five live jobs for all of `tenant-a` together, and the 64 MiB override holds two. The example's practical effect for `batch-agent` is therefore the second converter slot, not 40 live jobs. To let it hold more jobs, also raise `MD_MAX_TENANT_STORAGE_BYTES` (and `MD_MAX_STORAGE_BYTES` if needed) and its `max_storage_bytes`, or lower `MD_MAX_OUTPUT_BYTES`. With the default `MD_CONCURRENCY=2`, `batch-agent` can occupy both global converter slots, and round-robin scheduling hands each freed slot to other waiting tenants in turn.
 
-Each entry replaces the `MD_MAX_AGENT_JOBS`, `MD_MAX_AGENT_STORAGE_BYTES` and/or `MD_MAX_AGENT_CONCURRENCY` defaults for exactly that `(tenant_id, agent_id)` pair; omitted fields keep the default. An override may lower or raise a cap. Global and tenant caps still apply, so the effective cap is the minimum of the global, tenant and agent values. In [JWT mode](JWT.md) the tenant and agent are both the LiteLLM user ID, so use that ID for both fields; the tenant defaults (`MD_MAX_TENANT_*`) also constrain that user, and raising a user above them requires raising those defaults too.
+Each entry replaces the `MD_MAX_AGENT_JOBS`, `MD_MAX_AGENT_STORAGE_BYTES` and/or `MD_MAX_AGENT_CONCURRENCY` defaults for exactly that `(tenant_id, agent_id)` pair; omitted fields keep the default. An override may lower or raise a cap. Global and tenant caps still apply, so the effective cap is the minimum of the global, tenant and agent values. In JWT mode, use the LiteLLM user ID as both `tenant_id` and `agent_id`. Because the tenant limits bind that same user ([effective per-user limits](JWT.md#effective-per-user-limits)), raising a user above the `MD_MAX_TENANT_*` defaults requires raising those too.
 
 This is not an allowlist. Principals that are not listed keep the configured defaults, and an entry never grants or denies access to files or tools. Identity still comes only from the authenticator; a quota entry does not provision credentials or LiteLLM users.
 

@@ -50,7 +50,28 @@ There is no subject map. Agents cannot forge LiteLLM's signature, so the verifie
 
 User IDs must match `[A-Za-z0-9_-]{1,64}` (e.g. `markdownify-agent-a`); tokens with any other subject are rejected, as is LiteLLM's shared fallback subject `litellm-proxy`. Caller headers, tool arguments, JWT `act`, email and tenant claims cannot change the owner. Renaming a user ID changes the owner, so its earlier jobs become unreachable.
 
-To revoke an agent, block or delete its LiteLLM key or user. Upload grants it already holds stay valid until they expire (at most five minutes) and can only complete that one upload.
+There are no existing deployments, so there is no migration or backward-compatibility path for the removed subject map: no allowlist, mapped tenant/agent IDs, disabled-subject list or map reload exists, and Markdownify cannot deny a user the gateway admits. Registry mode (`MD_AUTH_FILE`) is a separate standalone mode and cannot be combined with JWT mode.
+
+### Effective per-user limits
+
+The verified user ID is both tenant and agent, so the tenant and agent limits both apply to the same user. `createUpload` checks the global, tenant and agent scopes independently and denies the reservation if any one is full; `pump()` starts a queued job only if global, tenant and agent concurrency all have room. The effective cap for one user is the minimum across the three scopes. Defaults:
+
+| Limit | Global | Tenant | Agent | Effective per user |
+| --- | --- | --- | --- | --- |
+| Live jobs (`MD_MAX_JOBS`, `MD_MAX_TENANT_JOBS`, `MD_MAX_AGENT_JOBS`) | 100 | 25 | 10 | 10 |
+| Reserved bytes (`MD_MAX_STORAGE_BYTES`, `MD_MAX_TENANT_STORAGE_BYTES`, `MD_MAX_AGENT_STORAGE_BYTES`) | 256 MiB | 128 MiB | 128 MiB | 128 MiB |
+| Active conversions (`MD_CONCURRENCY`, `MD_MAX_TENANT_CONCURRENCY`, `MD_MAX_AGENT_CONCURRENCY`) | 2 | 1 | 1 | 1 |
+
+Every job reserves its declared input size plus `MD_MAX_OUTPUT_BYTES` (25 MiB), so the default 128 MiB admits at most five live jobs, fewer with larger inputs (a 25 MiB input leaves room for two), before the 10-job cap can apply. Jobs count until deleted or expired. The global limits are shared by all users, so one busy user can exhaust them for others even below its own caps, and `MD_CONCURRENCY` bounds how many users convert at once. Raising an agent limit above the matching tenant limit has no effect, so raise both. To give particular users different caps, list each user ID as both `tenant_id` and `agent_id` in `MD_QUOTA_OVERRIDES_FILE` ([operator quota overrides](MULTITENANT.md#operator-quota-overrides)); users not listed keep the defaults, and the file is not an access allowlist. `get_service_health` reports the configured caps, the caller's own usage and the resulting minimum as `limits.effective`.
+
+### Revocation is bounded, not immediate
+
+Blocking or deleting a LiteLLM key or user stops new gateway admissions, so LiteLLM stops signing new JWTs for it. Markdownify keeps no revocation list and does not see LiteLLM state. Credentials already issued stay valid until they expire:
+
+- A JWT is accepted until its `exp`, which cannot be more than `MD_JWT_MAX_TTL_SECONDS` after `iat` (default 300, maximum 3600). `exp` has no clock tolerance. `iat` may be up to five seconds ahead of the Markdownify clock, so a token can be usable for up to five seconds longer than its TTL if the signer's clock is ahead. Keep the LiteLLM `ttl_seconds` at or below `MD_JWT_MAX_TTL_SECONDS`; longer tokens are rejected. Agents do not normally see the JWT; this bounds a captured or in-flight token.
+- An upload grant is valid for at most five minutes (`Math.min(MD_UPLOAD_TTL_MS, 300000)`) and can only complete that one upload.
+- Existing jobs and results are not deleted. They remain until `MD_RETENTION_MS` (default 24 hours) or `delete_job`, and a later key for the same user ID reaches them again.
+- To cut off sooner, lower `MD_JWT_MAX_TTL_SECONDS` and the signer `ttl_seconds`. Rotating the LiteLLM signing key invalidates tokens for all users only once the old key is removed from the JWKS and Markdownify's 60-second JWKS cache refreshes.
 
 If your gateway cannot run the `mcp_jwt_signer` guardrail, the alternative is registry mode with LiteLLM forwarding or storing each user's Markdownify credential; see [stored per-user credentials](MULTITENANT.md#stored-per-user-credentials-in-litellm) for the setup and trade-offs. The two modes cannot be combined in one deployment.
 
@@ -73,12 +94,10 @@ Configure HTTPS and preserve Authorization plus X-Upload-Token for `/mcp` and `/
 | MD_JWT_ISSUER | Exact trusted issuer, matching LiteLLM signer |
 | MD_JWT_AUDIENCE | Expected audience, recommended `markdownify` |
 | MD_JWT_JWKS_URL | Pinned HTTPS public-key endpoint; token-supplied key URLs are ignored |
-| MD_JWT_MAX_TTL_SECONDS | Maximum token lifetime/age; default 300, allowed 1–3600 |
+| MD_JWT_MAX_TTL_SECONDS | Maximum token lifetime/age; default 300, allowed 1–3600. Also bounds how long an already-issued token outlives LiteLLM revocation |
 | MD_JWT_TOOL_PREFIX | Optional alias prefix accepted in tool scopes; default `markdownify-` |
 
 Only RS256 is accepted. Issuer, audience, signature, expiration, issued-at, bounded lifetime, subject format and scopes are checked. JWKS requests have a five-second timeout, no redirect following, 256 KiB body cap, 60-second cache and five-second refresh cooldown. Key rotation is supported; cached public keys and issued JWTs are not instantly revoked. Avoid sharing virtual keys or service identities. `MD_JWT_ALLOW_HTTP_LOCALHOST=1` permits loopback-only JWKS HTTP for tests; keep it unset in remote deployments.
-
-Each LiteLLM user ID is both tenant and agent, so `MD_MAX_TENANT_*` and `MD_MAX_AGENT_*` both constrain it. To give particular users different caps, list each user ID as both `tenant_id` and `agent_id` in `MD_QUOTA_OVERRIDES_FILE`; see [operator quota overrides](MULTITENANT.md#operator-quota-overrides). Users not listed keep the defaults; the file is not an access allowlist.
 
 ## 4. Configure agents and upload files
 
@@ -122,7 +141,20 @@ Token refresh does not change ownership. Use normal finite polling, Unicode pagi
 
 ## Verify the deployment
 
-Check the public JWKS is reachable, then use two separate machine-user keys to convert real files. Cross-agent status/read/delete must return JOB_NOT_FOUND. A leaked X-Upload-Token combined with another job's scoped bearer must fail; grants must fail on MCP initialization, discovery and tool calls and on upload after successful upload/expiry; initialization/ping without an Authorization header remains public without granting ownership. Confirm fresh gateway tokens retain ownership, and restart/revocation work as intended. The repository's JWT tests and compiled-Node smoke cover protocol behavior; a live user gateway remains environment-specific verification.
+Check the public JWKS is reachable, then use two separate machine-user keys to convert real files. Cross-agent status/read/delete must return JOB_NOT_FOUND. A leaked X-Upload-Token combined with another job's scoped bearer must fail; grants must fail on MCP initialization, discovery and tool calls and on upload after successful upload/expiry; initialization/ping without an Authorization header remains public without granting ownership. Confirm fresh gateway tokens retain ownership, and bounded revocation behaves as documented. The repository's JWT tests and compiled-Node smoke cover protocol behavior; a live user gateway remains environment-specific verification.
+
+For the direct-ownership model, also confirm in the live deployment:
+
+- No subject map or allowlist is configured; ownership is the LiteLLM user ID. A key attached to no user (`litellm-proxy`) or a user ID outside `[A-Za-z0-9_-]{1,64}` is rejected.
+- `get_service_health` for one user shows the effective caps from the table above (10 jobs, 128 MiB reserved, 1 active conversion by default) and that the operator's `MD_MAX_*` overrides in `.env.jwt` were applied to both the tenant and agent scopes.
+- Blocking a test user's LiteLLM key stops new MCP calls through the gateway. Treat anything already issued as valid for up to `MD_JWT_MAX_TTL_SECONDS` (token) or five minutes (upload grant); do not expect immediate denial, and do not expect existing jobs to disappear before retention.
+- The LiteLLM `ttl_seconds` does not exceed `MD_JWT_MAX_TTL_SECONDS`, and the signer and Markdownify clocks agree to within a few seconds.
+- The deployed image is pinned by digest or commit-SHA tag rather than `latest`, one process runs against a private persistent `/data` volume, and the LiteLLM signing key is persistent (`MCP_JWT_SIGNING_KEY`), so a LiteLLM restart does not change the published JWKS.
+- The signer's generated tool scopes allow list and call for the real agents, and a token without the needed scope returns `AUTH_SCOPE_REQUIRED`.
+- Identity refresh and signing-key rotation: a fresh token for the same user ID still reaches that user's jobs, and after rotating the key (new key published, old key removed from the JWKS) tokens signed by the old key are rejected once the JWKS cache refreshes.
+- Through the real gateway, convert real PDF and Office files (upload, `start_conversion`, finite status polling, paginated `get_markdown` retrieval). With a second user, foreign status, read, `start_conversion` and delete calls all return JOB_NOT_FOUND.
+- Queued, interrupted and completed jobs across a Markdownify restart: queued jobs resume, running jobs become `failed` with `CONVERSION_INTERRUPTED` (`init()` in `src/remote/jobs.ts`), completed results stay retrievable, and retention cleanup runs.
+- Record the Markdownify and LiteLLM versions, the image identity and sanitized evidence of these checks.
 
 Client syntax references: [Codex](https://learn.chatgpt.com/docs/extend/mcp?surface=cli), [Claude Code](https://code.claude.com/docs/en/mcp), [Cursor](https://cursor.com/docs/mcp). See [LiteLLM's auth matrix](https://docs.litellm.ai/docs/mcp_config_reference) for the separate gateway and upstream authentication layers.
 
