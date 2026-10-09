@@ -34,4 +34,4 @@ python -m pip install 'litellm[mcp]==1.104.0'
 python scripts/litellm-health-smoke.py
 ```
 
-The test starts a compiled Node JWT-mode service, performs the actual anonymous LiteLLM initialization/ping path, checks real readiness and confirms anonymous discovery fails. It supplies no user token and does not contact a real gateway. CI runs this alongside authenticated conversion and isolation checks.
+The test starts a compiled Node JWT-mode service and runs LiteLLM's real `MCPClient.run_with_session` initialization path anonymously. It additionally sends `ping`, so it is a superset of LiteLLM's no-op health callback (which only initializes). It then checks real readiness and confirms anonymous discovery is rejected with a real HTTP 401 status error from LiteLLM's httpx2 client (a timeout, transport error or any other status fails the test; message text is never matched). The script first runs a built-in regression self-test of that classifier; `python scripts/litellm-health-smoke.py --self-test` runs only that part. It supplies no user token and does not contact a real gateway. CI runs this alongside authenticated conversion and isolation checks.
