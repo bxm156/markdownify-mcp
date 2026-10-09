@@ -12,26 +12,62 @@ import urllib.error
 import socket
 
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+import httpx
 from litellm.experimental_mcp_client.client import MCPClient
+
+
+def check(condition, message):
+    """Explicit check that, unlike a bare assert, is not stripped by `python -O`."""
+    if not condition:
+        raise AssertionError(message)
+
+
+def _walk(exc, seen=None):
+    """Yield exc and every exception reachable via __cause__, __context__ or ExceptionGroup.exceptions."""
+    seen = set() if seen is None else seen
+    if exc is None or id(exc) in seen:
+        return
+    seen.add(id(exc))
+    yield exc
+    yield from _walk(exc.__cause__, seen)
+    yield from _walk(exc.__context__, seen)
+    # ExceptionGroup / BaseExceptionGroup (Python 3.11+); the MCP SDK and anyio raise these.
+    for inner in getattr(exc, "exceptions", None) or ():
+        yield from _walk(inner, seen)
+
+
+def has_http_401(exc):
+    """True if an HTTP 401 is anywhere in the exception chain/groups of exc."""
+    chain = list(_walk(exc))
+    http_errors = [e for e in chain if isinstance(e, httpx.HTTPStatusError)]
+    if http_errors:
+        return any(e.response.status_code == 401 for e in http_errors)
+    # Fallback, only when no httpx error object is present anywhere in the chain
+    # (some wrappers flatten the error to text): accept a "401" in the message text.
+    return any("401" in str(e) for e in chain)
+
 
 async def verify(base):
     client = MCPClient(server_url=base + "/mcp", extra_headers={"Host": "127.0.0.1"}, timeout=10)
     async def noop(session):
         await session.send_ping()
         return "ok"
-    # Same run_with_session(_noop) path used by health_check_server; no user/key/JWT.
-    assert await client.run_with_session(noop) == "ok"
+    # Runs LiteLLM's real MCPClient.run_with_session initialization path and additionally
+    # sends ping, a superset of LiteLLM's no-op health callback (which only initializes).
+    # No user/key/JWT.
+    check(await client.run_with_session(noop) == "ok", "Anonymous initialize/ping did not return ok")
     async def forbidden(session):
         return await session.list_tools()
     try:
         await client.run_with_session(forbidden, quiet_on_error=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        if not has_http_401(exc):
+            raise AssertionError("Anonymous discovery failed for a reason other than HTTP 401") from exc
     else:
         raise AssertionError("Anonymous discovery unexpectedly succeeded")
 
 def main():
-    assert importlib.metadata.version("litellm") == "1.104.0"
+    check(importlib.metadata.version("litellm") == "1.104.0", "LiteLLM 1.104.0 is required")
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -56,12 +92,12 @@ def main():
                     break
                 except (urllib.error.URLError, TimeoutError):
                     time.sleep(0.1)
-            assert health and health["ready"], "Service did not become ready"
-            assert health["checks"]["storage"]["writable"]
-            assert health["checks"]["converter"]["available"]
-            assert "own_jobs" not in health
+            check(health and health["ready"], "Service did not become ready")
+            check(health["checks"]["storage"]["writable"], "Storage is not writable")
+            check(health["checks"]["converter"]["available"], "Converter is not available")
+            check("own_jobs" not in health, "Public health leaked own_jobs")
             asyncio.run(verify(base))
-            print("LiteLLM 1.104.0 actual anonymous health client passed; discovery denied; real readiness metrics verified")
+            print("LiteLLM 1.104.0 actual anonymous health client passed; discovery denied with HTTP 401; real readiness metrics verified")
         finally:
             child.terminate()
             try:
