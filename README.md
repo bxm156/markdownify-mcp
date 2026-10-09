@@ -335,11 +335,8 @@ The upstream local stdio entry point remains `dist/index.js` (`bun start`) with 
 - [Private-agent credentials, quotas and LiteLLM](docs/MULTITENANT.md)
 - [Agent usage skill](SKILL.md)
 - [Container images and Docker Hub publishing](docs/CONTAINERS.md)
+- [Health monitoring: real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). GET /livez (alias /healthz) is a liveness probe; GET /readyz returns 503 until storage, the converter and startup are ready and publishes only boolean checks. Authenticated agents can call `get_service_health` for their own queue/reservation metrics and configured limits; identity-free probes never gain file access.
 
 ## License
 
 [MIT](LICENSE).
-
-## Health monitoring
-
-GET /livez (alias /healthz) is a liveness probe; GET /readyz returns 503 until storage, the converter and startup are ready and publishes only boolean checks. See [real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). Authenticated agents can call get_service_health for their own queue/reservation metrics and configured limits; identity-free probes never gain file access.

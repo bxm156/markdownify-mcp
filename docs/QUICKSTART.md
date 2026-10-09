@@ -71,7 +71,7 @@ Remove-Item Env:MCP_TOKEN
 
 Repeat using `agent-b.token` and a different output filename for agent B. Successful output contains `Test PDF content`. Existing output files are preserved; choose a new filename when retrying. The helper streams bytes directly with the agent's bearer credential and returned upload token, starts conversion, polls with a deadline, and retrieves code-point pages. Jobs remain until temporary retention expires.
 
-For agents using MCP tools directly, load [SKILL.md](../SKILL.md). It describes all six tools, including error lookup/recovery, JSON result parsing, scoped binary upload, finite polling, pagination, and authorized cleanup. A runtime capable of HTTP file upload is necessary; a model passing a local path cannot transfer bytes.
+For agents using MCP tools directly, load [SKILL.md](../SKILL.md). It describes all seven tools, including error lookup/recovery, JSON result parsing, scoped binary upload, finite polling, pagination, and authorized cleanup. A runtime capable of HTTP file upload is necessary; a model passing a local path cannot transfer bytes.
 
 ## 4. Verify isolation before granting access
 

@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -35,8 +35,8 @@ test("LiteLLM anonymous initialize/notification/ping works while tools and batch
     expect((await f.request({ jsonrpc: "2.0", id: 5, method, params: { name: "create_upload", arguments: { filename: "a.txt", size_bytes: 1 } } })).status).toBe(401);
   }
   expect((await f.request([{ jsonrpc: "2.0", id: 1, method: "ping" }, { jsonrpc: "2.0", id: 2, method: "tools/list" }])).status).toBe(401);
-  // Missing-sub/invalid Authorization never acquires a job owner; probe methods remain public.
-  expect((await f.request({ jsonrpc: "2.0", id: 8, method: "ping" }, { Authorization: "Bearer invalid" })).status).toBe(200);
+  // A present but invalid Authorization header is rejected; only header-less probes are public.
+  expect((await f.request({ jsonrpc: "2.0", id: 8, method: "ping" }, { Authorization: "Bearer invalid" })).status).toBe(401);
   expect((await f.request({ jsonrpc: "2.0", id: 9, method: "tools/list" }, { Authorization: "Bearer invalid" })).status).toBe(401);
 });
 test("health measures storage, omits foreign usage, and fails readiness during shutdown", async () => {
@@ -102,19 +102,20 @@ test("slow readiness probes remain single-flight and cache TTL starts after comp
   let first: Promise<unknown> | undefined, second: Promise<unknown> | undefined;
   try {
     first = f.service.health();
-    await new Promise(resolve => setTimeout(resolve, 2100));
+    setSystemTime(new Date(Date.now() + 2100));
     second = f.service.health();
     expect(calls).toBe(1);
     release();
     await Promise.all([first, second]);
     await f.service.health();
     expect(calls).toBe(1);
-    await new Promise(resolve => setTimeout(resolve, 2100));
+    setSystemTime(new Date(Date.now() + 2100));
     await f.service.health();
     expect(calls).toBe(2);
   } finally {
+    setSystemTime();
     release();
     await Promise.allSettled([first, second].filter(Boolean) as Promise<unknown>[]);
     probe.mockRestore();
   }
-}, 10000);
+});
