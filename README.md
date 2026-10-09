@@ -28,7 +28,7 @@ MCP controls the job; the runtime transfers the bytes. Connecting an MCP client 
 
 ## Install the server
 
-For agents using LiteLLM, the recommended authentication is now [short-lived LiteLLM-signed JWTs](docs/JWT.md), using its open-source outbound signer and a distinct machine user per agent. This requires no Enterprise gateway JWT login. Follow that guide for `compose.jwt.yaml` and gateway client configuration. Binary uploads receive separate one-job credentials valid for at most five minutes.
+For agents using LiteLLM, the recommended authentication is now [short-lived LiteLLM-signed JWTs](docs/JWT.md), using its open-source outbound signer and a distinct machine user per agent. This requires no Enterprise gateway JWT login. Follow that guide for `compose.jwt.yaml` and gateway client configuration. Binary uploads receive separate one-job credentials valid for at most five minutes. The LiteLLM user ID is the owner; revoking a key or user in LiteLLM stops new admissions, and already-issued tokens and upload grants expire on their own ([details](docs/JWT.md#revocation-is-bounded-not-immediate)).
 
 The steps below remain the standalone per-agent credential-registry alternative. Their direct-client examples use registry tokens; use the gateway examples in the JWT guide for the recommended setup.
 
@@ -302,7 +302,7 @@ Verify forwarding with two distinct agents in your own LiteLLM deployment. [Iden
 
 ## Limits and troubleshooting
 
-Defaults are 25 MiB per input and output, 24-hour retention, 15-minute upload tokens and a 120-second conversion timeout. Global, tenant and agent budgets also limit job admission and concurrent conversions. Small inputs reserve the maximum output budget. Configure limits in [.env.multitenant.example](.env.multitenant.example); [quota details](docs/MULTITENANT.md#budgets-and-scheduling).
+Defaults are 25 MiB per input and output, 24-hour retention, 15-minute upload tokens and a 120-second conversion timeout. Global, tenant and agent budgets also limit job admission and concurrent conversions. Small inputs reserve the maximum output budget. Configure limits in [.env.multitenant.example](.env.multitenant.example); [quota details](docs/MULTITENANT.md#budgets-and-scheduling). In JWT mode tenant and agent limits both apply to each LiteLLM user ([effective limits](docs/JWT.md#effective-per-user-limits)).
 
 | Symptom | Check |
 | --- | --- |
