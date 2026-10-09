@@ -5,14 +5,14 @@ import net from "node:net";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { JobService } from "./jobs.js";
+import { JobService, type JobServiceOptions } from "./jobs.js";
 import { createHttpServer } from "./http.js";
 import { createAuthenticator, hashToken } from "./auth.js";
 import { checkRuntime } from "./health.js";
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { while (cleanup.length) await cleanup.pop()!(); });
-async function fixture(jwt = true, extra: { healthTimeoutMs?: number } = {}) {
+async function fixture(jwt = true, extra: Partial<JobServiceOptions> = {}) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-health-"));
   const service = new JobService({ dataDir, maxUploadBytes: 100, maxOutputBytes: 100, maxStorageBytes: 10000, maxJobs: 10, retentionMs: 60000, uploadTtlMs: 60000, conversionTimeoutMs: 1000, concurrency: 1, converter: async () => {}, ...extra });
   await service.init();
@@ -25,6 +25,12 @@ async function fixture(jwt = true, extra: { healthTimeoutMs?: number } = {}) {
   const request = (body: unknown, headers = {}) => fetch(base + "/mcp", { method: "POST", headers: { Host: "127.0.0.1", "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers }, body: JSON.stringify(body) });
   return { service, dataDir, base, request };
 }
+/** Raw HTTP/1.1 GET so the request target reaches the server unnormalized (fetch would strip fragments, fold paths, etc.). */
+const rawGet = (base: string, target: string, host = "127.0.0.1") => new Promise<string>((resolve, reject) => {
+  const socket = net.connect(Number(new URL(base).port), "127.0.0.1", () => socket.end(`GET ${target} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`));
+  let data = ""; socket.on("data", d => { data += d; }); socket.on("end", () => resolve(data)); socket.on("error", reject);
+});
+const statusOf = (raw: string) => Number(raw.split(" ", 2)[1]);
 test("LiteLLM anonymous initialize/notification/ping works while tools and batches stay private", async () => {
   const f = await fixture();
   const client = new Client({ name: "litellm-health", version: "1.104.0" });
@@ -190,13 +196,58 @@ test("abandoned probe file is removed when a hung write eventually finishes", as
 
 test("malformed request target is rejected with 400, not 500", async () => {
   const f = await fixture();
-  const port = new URL(f.base).port;
   for (const target of ["http://[", "http://[/livez"]) {
-    const raw = await new Promise<string>((resolve, reject) => {
-      const socket = net.connect(Number(port), "127.0.0.1", () => socket.end(`GET ${target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`));
-      let data = ""; socket.on("data", d => { data += d; }); socket.on("end", () => resolve(data)); socket.on("error", reject);
-    });
+    const raw = await rawGet(f.base, target);
     expect(raw.split("\r\n", 1)[0]).toBe("HTTP/1.1 400 Bad Request");
     expect(raw).toContain("Invalid request target");
   }
+});
+
+test("Host bypass matches probe paths exactly", async () => {
+  const f = await fixture();
+  const cases: Array<[string, number]> = [
+    ["/livez/", 403], ["/LIVEZ", 403], ["//livez", 403], ["/%6civez", 403], ["/readyz/", 403], ["/healthz.json", 403],
+    ["/livez?x=1", 400],
+    // Current behaviour: the fragment is dropped and an absolute-form target's authority is ignored, so these
+    // still reach /livez. Acceptable because probe bodies are boolean-only and carry no per-user data.
+    ["/livez#frag", 200], ["http://evil.example/livez", 200],
+  ];
+  for (const [target, status] of cases) expect([target, statusOf(await rawGet(f.base, target, "10.0.0.7:8000"))]).toEqual([target, status]);
+});
+
+test("hung converter-executable search also reports 503 within the bound", async () => {
+  const exeDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-health-exe-"));
+  cleanup.push(() => fs.rm(exeDir, { recursive: true, force: true }));
+  const exe = path.join(exeDir, "markitdown");
+  await fs.writeFile(exe, "#!/bin/sh\n", { mode: 0o755 });
+  const previous = process.env.MARKITDOWN_PATH;
+  process.env.MARKITDOWN_PATH = exe;
+  const f = await fixture(true, { healthTimeoutMs: 50, converter: undefined });
+  const original = fs.stat;
+  let release!: () => void, calls = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const spy = spyOn(fs, "stat").mockImplementation((async (...args: any[]) => { calls++; await gate; return (original as any)(...args); }) as any);
+  const ready = () => fetch(f.base + "/readyz", { headers: { Host: "127.0.0.1" } });
+  try {
+    const started = performance.now();
+    const r = await ready();
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(r.status).toBe(503); expect(calls).toBe(1);
+    expect((await r.json()).checks.converter).toEqual({ available: false });
+    release();
+    await new Promise(r => setTimeout(r, 20));
+    setSystemTime(new Date(Date.now() + 2100));
+    expect((await ready()).status).toBe(200); expect(calls).toBe(2);
+  } finally {
+    setSystemTime();
+    release();
+    spy.mockRestore();
+    if (previous === undefined) delete process.env.MARKITDOWN_PATH; else process.env.MARKITDOWN_PATH = previous;
+  }
+});
+
+test("healthTimeoutMs above the setTimeout limit is rejected", () => {
+  const options = { dataDir: os.tmpdir(), maxUploadBytes: 1, maxOutputBytes: 1, maxStorageBytes: 1, maxJobs: 1, retentionMs: 1, uploadTtlMs: 1, conversionTimeoutMs: 1, concurrency: 1 };
+  expect(() => new JobService({ ...options, healthTimeoutMs: 2 ** 31 })).toThrow("Invalid healthTimeoutMs: must be at most 2147483647 ms");
+  expect(() => new JobService({ ...options, healthTimeoutMs: 2 ** 31 - 1 })).not.toThrow();
 });

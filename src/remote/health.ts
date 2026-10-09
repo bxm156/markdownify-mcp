@@ -6,6 +6,8 @@ import { resolveMarkitdownPath } from "../utils.js";
 
 export type RuntimeHealth = { checked_at: string; storage: { writable: boolean; free_bytes: number | null }; converter: { available: boolean; check: "custom" | "executable" } };
 export const HEALTH_TIMEOUT_MS = 5000;
+/** Largest delay setTimeout honours; Node clamps anything above it to 1 ms. */
+export const MAX_TIMER_MS = 2 ** 31 - 1;
 const inFlight = new Map<string, Promise<RuntimeHealth>>();
 /** Keep the underlying filesystem work single-flight even after its response deadline. */
 export function checkRuntime(dataDir: string, customConverter: boolean, timeoutMs = HEALTH_TIMEOUT_MS): Promise<RuntimeHealth> {

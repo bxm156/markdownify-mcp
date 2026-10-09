@@ -6,7 +6,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Converter, createConverter } from "./converter.js";
 import { validatePrincipal, type Principal } from "./identity.js";
-import { checkRuntime, type RuntimeHealth } from "./health.js";
+import { checkRuntime, MAX_TIMER_MS, type RuntimeHealth } from "./health.js";
 import { prepareMarkdownIndex, readMarkdownPage } from "./markdown.js";
 
 import { ServiceError, errorInfo, lookupError, legacyCode, type ErrorCode, type ErrorDetails } from "./errors.js";
@@ -36,6 +36,7 @@ export class JobService {
     for (const [name, value] of Object.entries(options)) {
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`Invalid ${name}`);
     }
+    if ((options.healthTimeoutMs ?? 0) > MAX_TIMER_MS) throw new Error(`Invalid healthTimeoutMs: must be at most ${MAX_TIMER_MS} ms`);
     this.options.dataDir = path.resolve(options.dataDir);
     this.converter = options.converter ?? createConverter({ maxOutputBytes: options.maxOutputBytes });
   }
