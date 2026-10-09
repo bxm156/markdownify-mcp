@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable, PassThrough } from "node:stream";
-import { JobService, JobServiceOptions } from "./jobs.js";
+import { JobService, JobServiceOptions, ServiceError } from "./jobs.js";
 import { createConverter } from "./converter.js";
 
 const principal = { tenantId: "tenant-a", agentId: "agent-a" };
@@ -284,10 +284,23 @@ describe("agent isolation and tenant budgets", () => {
     for (let i = 0; i < 3; i++) expect((await instance.health({ tenantId: "a", agentId: "a" })).status).toBe("ok");
     expect(events.slice(baseline)).toEqual([]);
     expect(events.some(event => event.event === "read_health")).toBe(false);
-    await expect(instance.health({ tenantId: "", agentId: "a" })).rejects.toThrow();
+    const invalid = await instance.health({ tenantId: "", agentId: "a" }).catch(e => e);
+    expect(invalid).toBeInstanceOf(ServiceError); expect(invalid.statusCode).toBe(401); expect(invalid.code).toBe("AUTH_REQUIRED");
     expect(events.slice(baseline)).toEqual([]);
     await instance.createUpload(principal, { filename: "notes.txt", size_bytes: 1 });
     expect(events.length).toBeGreaterThan(baseline);
+  });
+  test("same-user principals (tenantId === agentId) hit whichever of the tenant and agent caps is tighter", async () => {
+    const user = { tenantId: "user-1", agentId: "user-1" };
+    for (const [caps, scope] of [[{ maxTenantJobs: 5, maxAgentJobs: 2 }, "agent"], [{ maxTenantJobs: 2, maxAgentJobs: 5 }, "tenant"]] as const) {
+      const { instance } = await service({ maxJobs: 10, ...caps });
+      const limits = (await instance.health(user)).limits;
+      expect([limits.tenant_jobs, limits.agent_jobs]).toEqual([caps.maxTenantJobs, caps.maxAgentJobs]);
+      await instance.createUpload(user, { filename: "a.txt", size_bytes: 1 }); await instance.createUpload(user, { filename: "b.txt", size_bytes: 1 });
+      const denied = await instance.createUpload(user, { filename: "c.txt", size_bytes: 1 }).catch(e => e);
+      expect(denied).toBeInstanceOf(ServiceError);
+      expect(denied.code).toBe("JOB_LIMIT_EXCEEDED"); expect(denied.details).toEqual({ scope, limit_jobs: 2 });
+    }
   });
 });
 
