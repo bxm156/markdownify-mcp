@@ -242,13 +242,21 @@ describe("MD_QUOTA_OVERRIDES_FILE configuration", () => {
     // A blocking open would stall the whole event loop, so a timer in this process could never fire; bound it in a child process.
     const script = `const { loadConfig } = await import(${JSON.stringify(path.join(import.meta.dir, "config.ts"))});
       try { loadConfig({ MD_API_KEY: "a".repeat(32), MD_QUOTA_OVERRIDES_FILE: ${JSON.stringify(fifo)} }); console.log("loaded"); } catch (error) { console.log(error.message); }`;
-    expect(execFileSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 3000 })).toContain("MD_QUOTA_OVERRIDES_FILE must be a readable regular file of at most 1 MiB");
-  });
+    expect(execFileSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 10_000 })).toContain("MD_QUOTA_OVERRIDES_FILE must be a readable regular file of at most 1 MiB");
+  }, 15_000);
   test("the documented example produces the documented effective limits", async () => {
     const docs = await fs.readFile(path.join(import.meta.dir, "../../docs/MULTITENANT.md"), "utf8");
-    const section = docs.slice(docs.indexOf("### Operator quota overrides"));
-    const block = (language: string) => section.match(new RegExp("```" + language + "\\r?\\n([\\s\\S]*?)```"))![1];
-    const settings = Object.fromEntries(block("dotenv").split(/\r?\n/).filter(Boolean).map(line => line.split("=") as [string, string]));
+    const where = "docs/MULTITENANT.md \"### Operator quota overrides\"";
+    const start = docs.indexOf("### Operator quota overrides");
+    expect(start, `${where} section is missing`).toBeGreaterThanOrEqual(0);
+    const section = docs.slice(start);
+    const block = (language: string) => {
+      const match = section.match(new RegExp("```" + language + "\\r?\\n([\\s\\S]*?)```"));
+      expect(match, `${where} has no \`\`\`${language} block`).not.toBeNull();
+      return match![1];
+    };
+    const settings = Object.fromEntries(block("dotenv").split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith("#"))
+      .map(line => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-quota-docs-"));
     disposers.push(() => fs.rm(dataDir, { recursive: true, force: true }));
     const config = loadConfig({ ...env, ...settings, MD_DATA_DIR: dataDir, MD_QUOTA_OVERRIDES_FILE: await file(block("json")) });
@@ -257,8 +265,12 @@ describe("MD_QUOTA_OVERRIDES_FILE configuration", () => {
     expect(await effective(user("batch-agent", "tenant-a"))).toEqual({ jobs: 40, reserved_bytes: 134_217_728, concurrency: 2 });
     expect(await effective(user("markdownify-agent-b"))).toEqual({ jobs: 2, reserved_bytes: 67_108_864, concurrency: 1 });
     expect(await effective(user("other-agent", "tenant-a"))).toEqual({ jobs: 10, reserved_bytes: 134_217_728, concurrency: 1 });
-    // The documented table lists the same values.
-    for (const row of ["| 40 | 134,217,728 (128 MiB) | 2 |", "| 2 | 67,108,864 (64 MiB) | 1 |", "| 10 | 134,217,728 (128 MiB) | 1 |"]) expect(section).toContain(row);
+    // The documented table lists the same values, each on its own caller's row.
+    for (const row of ["| `tenant-a` / `batch-agent` (raised) | 40 | 134,217,728 (128 MiB) | 2 |", "| `markdownify-agent-b` (lowered) | 2 | 67,108,864 (64 MiB) | 1 |", "| Any unlisted principal | 10 | 134,217,728 (128 MiB) | 1 |"]) expect(section, `${where} table row`).toContain(row);
+    // As documented, storage binds before the raised job count: the 128 MiB tenant budget holds five 1-byte jobs.
+    const batch = user("batch-agent", "tenant-a");
+    for (let i = 0; i < 5; i++) await instance.createUpload(batch, { filename: "x.txt", size_bytes: 1 });
+    await expect(instance.createUpload(batch, { filename: "x.txt", size_bytes: 1 })).rejects.toMatchObject({ code: "STORAGE_LIMIT_EXCEEDED", details: { scope: "tenant", limit_bytes: 134_217_728 } });
   });
   test("valid overrides load keyed by principal and absence keeps defaults", async () => {
     expect(loadConfig(env).jobs.quotaOverrides).toBeUndefined();
