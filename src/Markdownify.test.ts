@@ -262,6 +262,80 @@ test("Markdownify.get throws error for non-existent file", async () => {
   );
 });
 
+describe("Markdownify.get with a ~ path", () => {
+  let home: string;
+  let homedirSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-home-"));
+    // Bun caches os.homedir() at startup, so stub it rather than setting HOME.
+    homedirSpy = spyOn(os, "homedir").mockReturnValue(home);
+  });
+
+  afterEach(() => {
+    homedirSpy.mockRestore();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test("reads a Markdown file under the home directory", async () => {
+    fs.writeFileSync(path.join(home, "n.md"), "# Notes");
+    const result = await Markdownify.get({ filePath: "~/n.md" });
+    expect(result.text).toBe("# Notes");
+    expect(result.path).toBe("~/n.md");
+  });
+
+  test("rejects a non-Markdown file before touching the filesystem", async () => {
+    const existsSpy = spyOn(fs, "existsSync");
+    try {
+      await expect(Markdownify.get({ filePath: "~/x.txt" })).rejects.toThrow(
+        "Required file is not a Markdown file.",
+      );
+      expect(existsSpy).not.toHaveBeenCalled();
+    } finally {
+      existsSpy.mockRestore();
+    }
+  });
+
+  test("reports a missing file", async () => {
+    await expect(Markdownify.get({ filePath: "~/missing.md" })).rejects.toThrow(
+      "File does not exist",
+    );
+  });
+});
+
+test("Markdownify.toMarkdown explains a missing markitdown executable", async () => {
+  const saved = process.env.MARKITDOWN_PATH;
+  process.env.MARKITDOWN_PATH = path.join(tempDir, "no-such-markitdown");
+  try {
+    await expect(
+      Markdownify.toMarkdown({ filePath: path.join(sampleDataDir, "test.pdf") }),
+    ).rejects.toThrow("markitdown executable not found");
+  } finally {
+    if (saved === undefined) delete process.env.MARKITDOWN_PATH;
+    else process.env.MARKITDOWN_PATH = saved;
+  }
+});
+
+test.skipIf(process.platform === "win32")(
+  "Markdownify.fromRepo reports empty repomix output",
+  async () => {
+    const saved = process.env.REPOMIX_PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-repomix-"));
+    const stub = path.join(dir, "repomix");
+    fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    process.env.REPOMIX_PATH = stub;
+    try {
+      await expect(
+        Markdownify.fromRepo({ repoUrl: "octocat/Hello-World" }),
+      ).rejects.toThrow("repomix produced no output");
+    } finally {
+      if (saved === undefined) delete process.env.REPOMIX_PATH;
+      else process.env.REPOMIX_PATH = saved;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
 test("Markdownify.fromRepo converts a git repo to markdown via shorthand", async () => {
   const result = await Markdownify.fromRepo({
     repoUrl: "octocat/Hello-World",
