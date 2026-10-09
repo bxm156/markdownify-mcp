@@ -130,7 +130,7 @@ def main():
                 if child.poll() is not None:
                     raise AssertionError("Compiled server exited during startup")
                 try:
-                    req = urllib.request.Request(base + "/healthz", headers={"Host": "127.0.0.1"})
+                    req = urllib.request.Request(base + "/readyz", headers={"Host": "127.0.0.1"})
                     with urllib.request.urlopen(req, timeout=1) as response:
                         health = json.load(response)
                     break

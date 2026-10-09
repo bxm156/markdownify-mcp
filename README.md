@@ -118,7 +118,7 @@ docker compose -f compose.yaml up -d
 curl --fail http://localhost:8000/healthz
 ```
 
-PowerShell can use `Invoke-RestMethod http://localhost:8000/healthz`. The response is `{"status":"ok"}`. Logs are available with `docker compose -f compose.yaml logs`. The local MCP endpoint is `http://localhost:8000/mcp`.
+PowerShell can use `Invoke-RestMethod http://localhost:8000/healthz`. The response is `{"status":"ok"}`; `/healthz` is an alias of the `/livez` liveness probe. Use `/readyz` to wait until storage and the converter are ready. Logs are available with `docker compose -f compose.yaml logs`. The local MCP endpoint is `http://localhost:8000/mcp`.
 
 The image runs as UID/GID 10001 and currently supports `linux/amd64`. For a fixed version, replace `latest` with a published `sha-<full commit SHA>` tag or image digest. [Image build and publication details](docs/CONTAINERS.md).
 
@@ -335,7 +335,7 @@ The upstream local stdio entry point remains `dist/index.js` (`bun start`) with 
 - [Private-agent credentials, quotas and LiteLLM](docs/MULTITENANT.md)
 - [Agent usage skill](SKILL.md)
 - [Container images and Docker Hub publishing](docs/CONTAINERS.md)
-- [Health monitoring: real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). Authenticated agents can call `get_service_health` for their own queue/reservation metrics and configured limits; identity-free probes never gain file access.
+- [Health monitoring: real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). GET /livez (alias /healthz) is a liveness probe; GET /readyz returns 503 until storage, the converter and startup are ready and publishes only boolean checks. Authenticated agents can call `get_service_health` for their own queue/reservation metrics and configured limits; identity-free probes never gain file access.
 
 ## License
 
