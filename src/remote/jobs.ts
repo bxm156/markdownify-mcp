@@ -32,6 +32,10 @@ export class JobService {
   private lastAgent = new Map<string, string>();
   private converter: Converter;
   private timer?: ReturnType<typeof setInterval>;
+  private sweep?: Promise<void>;
+  private sweepAgain = false;
+  // Bounded operator metrics: timestamps, counts and one errno-style code; never paths or messages.
+  private cleanupStats = { last_started_at: null as string | null, last_finished_at: null as string | null, last_duration_ms: null as number | null, jobs_failed_last_sweep: 0, failures_total: 0, consecutive_failed_sweeps: 0, last_failure_at: null as string | null, last_error_code: null as string | null };
   constructor(private options: JobServiceOptions) {
     for (const [name, value] of Object.entries(options)) {
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`Invalid ${name}`);
@@ -62,6 +66,11 @@ export class JobService {
   private async internalAudit(event: string, job: Job) {
     try { await this.audit(event, { tenantId: job.tenant_id, agentId: job.agent_id }, job.id, job.status); }
     catch { console.error("Job audit unavailable", event, job.id); }
+  }
+  private cleanupFailed(id: string, error: unknown) {
+    const raw = (error as NodeJS.ErrnoException | null)?.code, code = typeof raw === "string" && /^[A-Z0-9_]{1,32}$/.test(raw) ? raw : "UNKNOWN";
+    Object.assign(this.cleanupStats, { failures_total: this.cleanupStats.failures_total + 1, last_failure_at: new Date().toISOString(), last_error_code: code });
+    console.error("Job cleanup failed", { event: "job_cleanup_failed", job_id: id, status: this.jobs.get(id)?.status ?? "unknown", code });
   }
   private async owned(principal: Principal, id: string) {
     this.validPrincipal(principal);
@@ -132,7 +141,8 @@ export class JobService {
     for (const id of orphans) await fs.rm(this.dir(id), { recursive: true, force: true });
     await this.cleanup();
     this.initialized = true;
-    this.timer = setInterval(() => { void this.cleanup().catch(() => undefined); }, Math.min(this.options.retentionMs, this.options.uploadTtlMs, 60_000));
+    // A tick during a long sweep is skipped rather than queued or run concurrently.
+    this.timer = setInterval(() => { if (!this.sweep) void this.cleanup().catch(() => console.error("Job cleanup sweep failed")); }, Math.min(this.options.retentionMs, this.options.uploadTtlMs, 60_000));
     this.timer.unref();
     this.pump();
   }
@@ -141,11 +151,12 @@ export class JobService {
     return this.locked("registry", async () => {
       if (this.closing) throw new ServiceError(503, "Service closing");
       // Bound tombstones as well as live jobs during sustained upload traffic.
+      // Tombstones hold no reservation, so a failed removal is reported and retried later instead of blocking uploads.
       for (const expired of [...this.jobs.values()].filter(job => job.status === "expired")) {
         await this.locked(expired.id, async () => {
           await fs.rm(this.dir(expired.id), { recursive: true, force: true });
           this.jobs.delete(expired.id);
-        });
+        }).catch(error => this.cleanupFailed(expired.id, error));
       }
       if (typeof filename !== "string" || filename.length > 255 || !filename.length || /[\x00-\x1f\x7f/\\]/.test(filename) || filename === "." || filename.includes("..")) throw new ServiceError(400, "Invalid filename");
       const extension = path.extname(filename).toLowerCase();
@@ -343,10 +354,21 @@ export class JobService {
       return { job_id: id, deleted: true };
     });
   }
-  async cleanup() {
+  /** Single-flight: concurrent callers share the in-flight sweep, which then runs one more pass so their expirations are covered. */
+  cleanup(): Promise<void> {
+    if (this.sweep) { this.sweepAgain = true; return this.sweep; }
+    const sweep = (async () => { do { this.sweepAgain = false; await this.sweepOnce(); } while (this.sweepAgain && !this.closing); })().finally(() => { this.sweep = undefined; });
+    return this.sweep = sweep;
+  }
+  private async sweepOnce() {
+    const stats = this.cleanupStats, started = performance.now(); let failed = 0;
+    stats.last_started_at = new Date().toISOString();
     for (const id of [...this.jobs.keys()]) {
+      if (this.closing) break;
       if (this.active.has(id) || this.uploading.has(id)) continue;
-      await this.locked(id, async () => {
+      // Each job is isolated. A failure leaves it in its last committed state (a tombstone, or a past-expiry live job that
+      // stays inaccessible and reserved) so the next sweep retries it; reservations are released only by the expired commit.
+      try { await this.locked(id, async () => {
         const job = this.jobs.get(id);
         if (!job || this.active.has(id) || Date.parse(job.expires_at) > Date.now()) return;
         if (job.status === "expired") { await fs.rm(this.dir(id), { recursive: true, force: true }); this.jobs.delete(id); return; }
@@ -356,8 +378,9 @@ export class JobService {
         const expired: Job = { ...job, status: "expired", expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() }; delete expired.token_hash;
         delete expired.upload_auth_hash;
         await this.save(expired); this.jobs.set(id, expired); await this.internalAudit("job_expired", expired);
-      });
+      }); } catch (error) { failed++; this.cleanupFailed(id, error); }
     }
+    Object.assign(stats, { last_finished_at: new Date().toISOString(), last_duration_ms: Math.round(performance.now() - started), jobs_failed_last_sweep: failed, consecutive_failed_sweeps: failed ? stats.consecutive_failed_sweeps + 1 : 0 });
   }
 
   async health(principal?: Principal) {
@@ -377,7 +400,8 @@ export class JobService {
     const mine = [...this.jobs.values()].filter(j => j.tenant_id === principal.tenantId && j.agent_id === principal.agentId);
     const states = Object.fromEntries(["awaiting_upload", "uploaded", "queued", "running", "completed", "failed", "expired"].map(s => [s, mine.filter(j => j.status === s).length]));
     const live = mine.filter(j => j.status !== "expired");
-    return { ...base, own_jobs: states, own_reserved_bytes: live.reduce((n, j) => n + j.size_bytes + this.options.maxOutputBytes, 0),
+    // Service-wide cleanup counters carry no identities, paths or messages; failures do not affect readiness.
+    return { ...base, own_jobs: states, cleanup: { ...this.cleanupStats }, own_reserved_bytes: live.reduce((n, j) => n + j.size_bytes + this.options.maxOutputBytes, 0),
       limits: { global_jobs: this.options.maxJobs, global_reserved_bytes: this.options.maxStorageBytes,
         tenant_jobs: this.options.maxTenantJobs ?? this.options.maxJobs, agent_jobs: this.options.maxAgentJobs ?? this.options.maxJobs,
         tenant_reserved_bytes: this.options.maxTenantStorageBytes ?? this.options.maxStorageBytes, agent_reserved_bytes: this.options.maxAgentStorageBytes ?? this.options.maxStorageBytes,
@@ -391,6 +415,7 @@ export class JobService {
     for (const upload of this.uploading.values()) upload.abort();
     for (const worker of this.active.values()) worker.controller.abort();
     await Promise.allSettled([...this.active.values()].map(worker => worker.promise));
+    await this.sweep?.catch(() => undefined);
     await Promise.allSettled([...this.locks.values()]);
   }
 }

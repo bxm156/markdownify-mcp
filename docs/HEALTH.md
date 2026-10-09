@@ -19,6 +19,7 @@ Use get_service_health({}) with the normal authenticated agent and its per-tool 
 - own_jobs: counts for the caller's job states, including retained expired tombstones.
 - own_reserved_bytes: the caller's current input-plus-maximum-output reservation, using the same non-expired-state accounting as admission.
 - limits: configured global/tenant/agent job, storage and concurrency caps, and per-file/output limits.
+- cleanup: service-wide retention sweep counters: last_started_at, last_finished_at, last_duration_ms, jobs_failed_last_sweep, failures_total, consecutive_failed_sweeps, last_failure_at and last_error_code (an errno-style code such as EACCES). They contain no identities, job IDs, paths or messages. Cleanup failures do not fail readiness; alert on consecutive_failed_sweeps above zero and see [MULTITENANT.md](MULTITENANT.md#inspecting-and-purging-a-retired-users-artifacts).
 
 There is no foreign-user usage, job ID or tenant list. Global limits are configuration, not global usage. When JWT tenant and agent IDs both equal the user ID, both caps constrain that user. A full quota or queued work is normal capacity pressure and does not make readiness fail. Quotas exclude metadata/index/audit overhead; disk free space is a filesystem metric, not reserved storage.
 

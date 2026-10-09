@@ -115,6 +115,46 @@ Audit records live in `MD_DATA_DIR/audit.jsonl`, with timestamps, tenant/agent I
 
 This milestone supplies application-level file isolation for distinct credentials, bounded resources, and restart-safe ownership. The converter subprocess is not a security sandbox against malicious document parser exploits. Use trusted document sources or additional parser isolation for hostile uploads. Multiple service replicas, distributed storage/queues, and a credential-management UI remain separate work.
 
+## Inspecting and purging a retired user's artifacts
+
+Retention cleanup runs at startup and periodically. Once a job's `expires_at` passes (`MD_RETENTION_MS` after upload or completion, `MD_UPLOAD_TTL_MS` for an abandoned upload), it erases the input, `output.md` and its index, and leaves a metadata-only tombstone that is removed one retention period later. Running conversions are skipped until they finish. Each job is cleaned independently: a failure on one job is logged and retried on the next sweep while other jobs continue, and an overrunning sweep is never started twice. A job whose cleanup fails stays inaccessible to its owner (`Job expired`) and keeps its quota reservation until the tombstone is committed.
+
+Each failure logs one line per job per sweep to stderr, for example `Job cleanup failed { event: "job_cleanup_failed", job_id: "…", status: "completed", code: "EACCES" }`. It never contains paths, filenames, error messages or document contents. `get_service_health` reports the same failures as service-wide counters (see [HEALTH.md](HEALTH.md)); alert on `cleanup.consecutive_failed_sweeps` above zero. A common cause is a volume restored or copied with the wrong owner; the container runs as UID/GID 10001.
+
+When a user's LiteLLM access or credential is revoked, their agent can no longer call `delete_job`, and no agent can list or delete another agent's jobs. Their files still expire on the schedule above. To remove them sooner, or when cleanup keeps failing, use privileged operator access to the data volume. This maintenance path is separate from agent access: never expose it through MCP, LiteLLM or an agent credential. Revoke the credential first (registry or JWT signer) so no new jobs appear.
+
+The data volume contains:
+
+| Path under `MD_DATA_DIR` | Contents |
+| --- | --- |
+| `<job-id>/job.json` | Manifest: `tenant_id`, `agent_id`, `status`, `filename`, `created_at`, `expires_at`; salted upload-token hashes only until the upload completes |
+| `<job-id>/input.<ext>` | Uploaded document |
+| `<job-id>/output.md`, `<job-id>/output.md.index.json` | Converted Markdown and its pagination index |
+| `<job-id>/input.part`, `output.part`, `job.json.<uuid>.tmp` | Crash partials; removed at startup |
+| `audit.jsonl`, `audit.jsonl.1`–`.3` | Metadata-only audit history shared by all agents |
+
+Stop the service before changing the volume. One process owns each data volume and loads every manifest only at startup, so edits under a running service race its in-memory state. The bundled tool reads manifests and file sizes, never document contents, and is a dry run unless `--apply` is given:
+
+```sh
+docker compose -f compose.multitenant.yaml stop markdownify
+# Dry run: lists the owner's job IDs, states and byte counts, plus any unreadable manifests.
+docker compose -f compose.multitenant.yaml run --rm --no-deps markdownify node dist/remote/purge-owner.js /data <tenant_id> <agent_id>
+# After reviewing the list, remove those job directories.
+docker compose -f compose.multitenant.yaml run --rm --no-deps markdownify node dist/remote/purge-owner.js /data <tenant_id> <agent_id> --apply
+docker compose -f compose.multitenant.yaml start markdownify
+```
+
+For a native process, run `node dist/remote/purge-owner.js "$MD_DATA_DIR" <tenant_id> <agent_id> [--apply]` with the process stopped. Without the tool, the same selection on a host with `jq`:
+
+```sh
+find "$MD_DATA_DIR" -mindepth 2 -maxdepth 2 -name job.json -exec jq -r --arg t "$TENANT_ID" --arg a "$AGENT_ID" \
+  'select(.tenant_id == $t and .agent_id == $a) | [.id, .status, .expires_at] | @tsv' {} + > retired-jobs.tsv
+cat retired-jobs.tsv   # review before removing
+cut -f1 retired-jobs.tsv | grep -E '^[0-9a-f-]{36}$' | while read -r id; do rm -rf -- "$MD_DATA_DIR/$id"; done
+```
+
+The tool reports unreadable manifests rather than guessing their owner; startup also refuses them, so inspect those directories manually. Audit entries for the retired agent contain only IDs and event codes and rotate out of the bounded history; export or filter `audit.jsonl` according to your own retention policy while the service is stopped. After restarting, confirm the dry run lists no jobs and, after the next sweep, that `get_service_health` (from any authorized agent) reports `cleanup.jobs_failed_last_sweep` and `cleanup.consecutive_failed_sweeps` as 0.
+
 ## Verification
 
 ```sh
