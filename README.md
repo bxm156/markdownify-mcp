@@ -330,7 +330,7 @@ The upstream local stdio entry point remains `dist/index.js` (`bun start`) with 
 
 ## Further documentation
 
-Documentation site: [bxm156.github.io/markdownify-mcp](https://bxm156.github.io/markdownify-mcp/) renders these pages with search. Preview it locally with `pip install -r docs/requirements.txt && mkdocs serve`.
+Documentation site: [bxm156.github.io/markdownify-mcp](https://bxm156.github.io/markdownify-mcp/) renders these pages with search. Preview it locally with `python -m venv .venv && . .venv/bin/activate && pip install -r docs/requirements.txt && mkdocs serve`.
 
 - [Fresh deployment quickstart](docs/QUICKSTART.md)
 - [Remote HTTP settings and operations](docs/REMOTE.md)

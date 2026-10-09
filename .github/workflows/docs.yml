@@ -8,6 +8,12 @@ on:
       - README.md
       - SKILL.md
       - PLAN.md
+      # Repository files the docs link to; mkdocs_hooks.py checks they exist.
+      - LICENSE
+      - examples/**
+      - compose*.yaml
+      - .env*.example
+      - .github/workflows/docker-publish.yml
       - .github/workflows/docs.yml
   push:
     branches: [main]
@@ -18,6 +24,12 @@ on:
       - README.md
       - SKILL.md
       - PLAN.md
+      # Repository files the docs link to; mkdocs_hooks.py checks they exist.
+      - LICENSE
+      - examples/**
+      - compose*.yaml
+      - .env*.example
+      - .github/workflows/docker-publish.yml
       - .github/workflows/docs.yml
   workflow_dispatch:
 permissions:
@@ -37,6 +49,8 @@ jobs:
           cache: pip
           cache-dependency-path: docs/requirements.txt
       - run: python -m pip install -r docs/requirements.txt
+      - name: Self-check the link rewriting hook
+        run: python mkdocs_hooks.py
       - run: mkdocs build --strict
       - name: Upload site artifact
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
