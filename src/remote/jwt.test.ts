@@ -6,7 +6,7 @@ import path from "node:path";
 import { createServer } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { createJwtAuthenticator, subjectPrincipal } from "./jwt.js";
+import { createJwtAuthenticator, loadJwtAuthenticator, subjectPrincipal } from "./jwt.js";
 import { loadAuthenticator, type Authenticator } from "./auth.js";
 import { JobService } from "./jobs.js";
 import { createHttpServer } from "./http.js";
@@ -61,6 +61,7 @@ async function deployment(auth: Authenticator = verifier(), ttl = 60000) {
   async function put(upload: any, bearer?: string) { return fetch(upload.upload_url, { method: "PUT", headers: { ...upload.required_headers, Host: "127.0.0.1", ...(bearer ? { Authorization: bearer } : {}) }, body: "x" }); }
   return { service, options, client, put, base };
 }
+function initialize(base: string, authorization: string) { return fetch(`${base}/mcp`, { method: "POST", headers: { Host: "127.0.0.1", Authorization: authorization, "Content-Type": "application/json", Accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "probe", version: "1" } } }) }); }
 function parsed(result: any) { expect(result.isError).not.toBe(true); return JSON.parse(result.content[0].text); }
 test("JWT agents use scoped upload grants, enforce tool scopes and keep files private across tenants", async () => {
   const f = await deployment(), a = await f.client(), b = await f.client("machine-b"), c = await f.client("machine-c");
@@ -72,6 +73,8 @@ test("JWT agents use scoped upload grants, enforce tool scopes and keep files pr
   const other = parsed(await b.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } }));
   expect((await f.put(upload, other.required_headers.Authorization)).status).toBe(401);
   expect((await f.put(upload, `Bearer ${await signed("machine-b")}`)).status).toBe(401);
+  const grantResponse = await initialize(f.base, upload.required_headers.Authorization);
+  expect(grantResponse.status).toBe(401); expect(grantResponse.headers.get("www-authenticate")).toBe("Bearer");
   const grantClient = new Client({ name: "bad-grant", version: "1" });
   await expect(grantClient.connect(new StreamableHTTPClientTransport(new URL(`${f.base}/mcp`), { requestInit: { headers: { Host: "127.0.0.1", Authorization: upload.required_headers.Authorization } } }))).rejects.toThrow(); await grantClient.close();
   expect((await f.put(upload)).status).toBe(204); expect((await f.put(upload)).status).toBe(401);
@@ -131,4 +134,41 @@ test("verified JWT without sub is rejected at connect and on every MCP method", 
     const response = await fetch(f.base + "/mcp", { method: "POST", headers: { Host: "127.0.0.1", Authorization: bearer, "Content-Type": "application/json", Accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { name: "get_service_health", arguments: {} } }) });
     expect(response.status).toBe(401); expect(response.headers.get("www-authenticate")).toBe("Bearer");
   }
+});
+
+async function closedPort() {
+  const server = createServer(); await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port; await new Promise<void>(r => server.close(() => r())); return port;
+}
+test("validly signed but unusable tokens are rejected at HTTP initialize with a Bearer challenge", async () => {
+  const f = await deployment();
+  const check = async (bearer: string, target = f) => { const response = await initialize(target.base, `Bearer ${bearer}`); return [response.status, response.headers.get("www-authenticate")]; };
+  expect(await check(await signed())).toEqual([200, null]);
+  for (const bearer of [await signed("litellm-proxy"), await signed("machine-a", { scope: "openid" }), await signed("machine-a", { aud: "other" })]) expect(await check(bearer)).toEqual([401, "Bearer"]);
+  // Unreachable JWKS (closed port) and a throwing key resolver both fail closed instead of hanging or admitting the caller.
+  const unreachable = await deployment(createJwtAuthenticator({ issuer, audience, jwksUrl: `http://127.0.0.1:${await closedPort()}/jwks`, allowLoopback: true }));
+  const throwing = await deployment(createJwtAuthenticator({ issuer, audience, getKey: async () => { throw new Error("jwks down"); } }));
+  for (const target of [unreachable, throwing]) {
+    expect(await check(await signed(), target)).toEqual([401, "Bearer"]);
+  }
+}, 15000);
+test("MD_JWT_MAX_TTL_SECONDS is bounded at load and enforced against exp - iat", async () => {
+  const env = (ttl?: string) => ({ MD_JWT_ISSUER: issuer, MD_JWT_AUDIENCE: audience, MD_JWT_JWKS_URL: "https://trusted.test/jwks", ...(ttl === undefined ? {} : { MD_JWT_MAX_TTL_SECONDS: ttl }) });
+  expect(loadJwtAuthenticator(env("3600")).mode).toBe("jwt"); expect(loadJwtAuthenticator(env()).mode).toBe("jwt");
+  for (const ttl of ["0", "3601", "NaN", "abc", "", "-1", "1.5", "Infinity"]) expect(() => loadJwtAuthenticator(env(ttl)), ttl).toThrow("max TTL");
+  const auth = createJwtAuthenticator({ issuer, audience, maxTtlSeconds: 60, getKey: createLocalJWKSet({ keys: [publicJwk] }) });
+  const now = Math.floor(Date.now() / 1000);
+  expect(await auth.authenticate(await signed("machine-a", { iat: now, exp: now + 60 }))).not.toBeNull();
+  expect(await auth.authenticate(await signed("machine-a", { iat: now, exp: now + 61 }))).toBeNull();
+});
+test("JWT clock tolerance allows 5s of iat skew but none for exp", async () => {
+  const { setSystemTime } = await import("bun:test");
+  setSystemTime(new Date("2026-01-01T12:00:00Z"));
+  try {
+  const auth = verifier(), now = Math.floor(Date.now() / 1000);
+  expect(await auth.authenticate(await signed("machine-a", { iat: now + 4, exp: now + 304 }))).not.toBeNull();
+  expect(await auth.authenticate(await signed("machine-a", { iat: now + 6, exp: now + 306 }))).toBeNull();
+  // Expired tokens get no grace even though the library tolerance is 5s: the explicit `exp <= now` check rejects them.
+  expect(await auth.authenticate(await signed("machine-a", { iat: now - 10, exp: now - 1 }))).toBeNull();
+  } finally { setSystemTime(); }
 });
