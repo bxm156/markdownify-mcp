@@ -1,6 +1,7 @@
 import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
+import net from "node:net";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -178,4 +179,17 @@ test("abandoned probe file is removed when a hung write eventually finishes", as
     for (let i = 0; i < 100 && (await fs.readdir(dir)).length; i++) await new Promise(r => setTimeout(r, 10));
     expect(await fs.readdir(dir)).toEqual([]); expect(h.storage.writable).toBe(false);
   } finally { release(); spy.mockRestore(); }
+});
+
+test("malformed request target is rejected with 400, not 500", async () => {
+  const f = await fixture();
+  const port = new URL(f.base).port;
+  for (const target of ["http://[", "http://[/livez"]) {
+    const raw = await new Promise<string>((resolve, reject) => {
+      const socket = net.connect(Number(port), "127.0.0.1", () => socket.end(`GET ${target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`));
+      let data = ""; socket.on("data", d => { data += d; }); socket.on("end", () => resolve(data)); socket.on("error", reject);
+    });
+    expect(raw.split("\r\n", 1)[0]).toBe("HTTP/1.1 400 Bad Request");
+    expect(raw).toContain("Invalid request target");
+  }
 });

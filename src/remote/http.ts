@@ -28,7 +28,8 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
     try {
-      const url = new URL(request.url ?? "/", publicUrl);
+      let url: URL;
+      try { url = new URL(request.url ?? "/", publicUrl); } catch { reply(response, 400, "Invalid request target"); return; }
       // Probes skip Host/Origin checks: orchestrators send Host: <podIP>:port and bodies hold only public booleans.
       const probe = ["/livez", "/healthz", "/readyz"].includes(url.pathname);
       if (!probe && (!request.headers.host || !hosts.has(request.headers.host.toLowerCase()))) { reply(response, 403, "Host not allowed"); return; }
