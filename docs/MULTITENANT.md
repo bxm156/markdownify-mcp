@@ -92,6 +92,18 @@ bun examples/upload-and-convert.ts ./report.pdf ./report.md
 
 Binary uploads bypass LiteLLM and go to the configured direct origin with the same agent credential plus scoped upload token. Provisioning keys and any LiteLLM header allowlist are operator responsibilities. Verify forwarding with two distinct agents before enabling access. See the [LiteLLM MCP configuration reference](https://docs.litellm.ai/docs/mcp_config_reference). Automated isolation tests exercise the native server; live LiteLLM deployment remains an environment-specific check.
 
+### Stored per-user credentials in LiteLLM
+
+The header above is LiteLLM's per-request credential override: the gateway stores nothing and the client supplies the Markdownify token on every call. LiteLLM can also hold that token for the user. Mark the `markdownify` server as BYOK ("bring your own key") in the LiteLLM Admin UI or REST API (not `config.yaml`), then each user stores their Markdownify credential once with `POST /v1/mcp/server/{server_id}/user-credential`. LiteLLM attaches it to that user's calls. A user without a stored credential receives 401 with a `byok_auth_required` error and a `WWW-Authenticate` header pointing at LiteLLM's authorization page.
+
+Stored credentials are keyed by LiteLLM `user_id` and server, not by virtual key. Two virtual keys with the same `user_id` share one Markdownify credential and therefore one Markdownify agent identity; give each service account its own machine user. A virtual key without a `user_id` cannot store a credential (`400 User ID not found in token`) and must use the per-request header instead. Markdownify sees only the forwarded bearer, so isolation, quotas and audit identity come from the registry entry it matches, never from LiteLLM's user ID.
+
+Per-user OAuth and LiteLLM's DCR bridge do not apply: Markdownify is not an OAuth 2.0 resource or authorization server. Binary uploads still bypass LiteLLM and need the same agent credential plus the scoped upload token. See [LiteLLM per-user MCP authentication](https://docs.litellm.ai/docs/mcp_per_user_auth).
+
+### Registry forwarding or JWT mode
+
+Registry mode with forwarded or stored credentials proves the caller holds a Markdownify secret. [JWT mode](JWT.md) proves the request was signed by your LiteLLM for a specific user, with per-tool scopes and short-lived tokens. Choose registry forwarding when the gateway cannot run the `mcp_jwt_signer` guardrail, when immediate revocation matters more than token lifetime (set `disabled: true` on the registry entry and restart; issued JWTs stay valid until they expire), or when some agents call Markdownify without LiteLLM. Choose JWT mode when only gateway-originated traffic should be accepted and per-user provisioning should live entirely in LiteLLM. The modes are exclusive per deployment. With forwarding, anyone holding a Markdownify token can call the server directly, so restrict network access to the gateway where that matters.
+
 ## Budgets and scheduling
 
 Global limits from [REMOTE.md](REMOTE.md) still apply. The following additional limits are independently enforced:
