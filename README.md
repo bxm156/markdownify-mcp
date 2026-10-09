@@ -324,7 +324,7 @@ bun run build:remote
 bun test src/remote
 ```
 
-Root `bun test` runs both the stdio and remote suites (the stdio tests need `markitdown` installed). The tests that clone real GitHub repositories are skipped unless `MD_TEST_NETWORK=1` is set.
+Root `bun test` runs both the stdio and remote suites (the stdio tests need `markitdown` installed). The tests that clone real GitHub repositories are skipped unless `MD_TEST_NETWORK` is exactly `1`; any other value (including `0` or `false`) leaves them skipped.
 
 CI tests every push and PR, including real PDF/Office conversions, Docker builds and three-agent isolation. Main-branch publication tests the image before pushing `latest` and commit-SHA tags to Docker Hub. See [containers](docs/CONTAINERS.md), [validation history](docs/MULTITENANT-VALIDATION.md) and [milestones](PLAN.md).
 

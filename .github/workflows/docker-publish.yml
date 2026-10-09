@@ -30,7 +30,7 @@ jobs:
           bun test src/remote
           python -m pip install 'markitdown[pdf,docx,xlsx,pptx]==0.1.5'
           bun run build
-          MD_TEST_NETWORK=1 bun test
+          bun test
           bun scripts/remote-converter-smoke.ts
           bun scripts/jwt-http-smoke.ts
           python -m pip install 'litellm[mcp]==1.104.0'

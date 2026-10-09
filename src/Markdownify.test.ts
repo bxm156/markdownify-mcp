@@ -20,8 +20,8 @@ const tempVariables = ["TMPDIR", "TEMP", "TMP"] as const;
 const originalTemp = Object.fromEntries(tempVariables.map(key => [key, process.env[key]]));
 let tempDir: string;
 
-// Network-dependent tests (git clones) only run when MD_TEST_NETWORK is set.
-const networkTest = test.skipIf(!process.env.MD_TEST_NETWORK);
+// Network-dependent tests (git clones) only run when MD_TEST_NETWORK=1.
+const networkTest = test.skipIf(process.env.MD_TEST_NETWORK !== "1");
 
 beforeAll(() => {
   // Ensure the sample data directory exists
