@@ -1,5 +1,6 @@
-import { expect, test } from "bun:test";
-import { createServer, type IncomingHttpHeaders, type RequestListener } from "node:http";
+import { expect, spyOn, test } from "bun:test";
+import http, { createServer, type IncomingHttpHeaders, type RequestListener } from "node:http";
+import { EventEmitter } from "node:events";
 import { gzipSync } from "node:zlib";
 import { download, USER_AGENT } from "./download";
 import { execFile } from "node:child_process";
@@ -22,6 +23,13 @@ async function withServer(
 }
 
 const loopback = [{ address: "127.0.0.1", family: 4 }];
+
+/** Emit a controlled error after requestVia attaches its listener. */
+function refusedRequest(error: NodeJS.ErrnoException): http.ClientRequest {
+  const request = new EventEmitter() as EventEmitter & { end: () => void };
+  request.end = () => { process.nextTick(() => request.emit("error", error)); };
+  return request as unknown as http.ClientRequest;
+}
 
 test("pinned connection uses the selected address and preserves the original Host", async () => {
   let host: string | undefined;
@@ -83,29 +91,47 @@ test("falls through to the next validated address when a connection is refused",
       response.end("second address");
     },
     async (port) => {
-      // Nothing listens on 127.0.0.2:<port>, so the first attempt is refused.
-      const response = await download.fetch(
-        `http://dual.invalid:${port}/`,
-        [{ address: "127.0.0.2", family: 4 }, ...loopback],
-        AbortSignal.timeout(2000),
-      );
-      expect(await response.text()).toBe("second address");
+      // An unused loopback address can stall instead of refusing on Windows.
+      // Inject only the first error; the second attempt uses the real transport.
+      const realRequest = http.request.bind(http);
+      const refusal = Object.assign(new Error("controlled refusal"), { code: "ECONNREFUSED" });
+      const requestSpy = spyOn(http, "request")
+        .mockImplementationOnce(() => refusedRequest(refusal))
+        .mockImplementation(realRequest);
+      try {
+        const response = await download.fetch(
+          `http://dual.invalid:${port}/`,
+          [{ address: "192.0.2.1", family: 4 }, ...loopback],
+          AbortSignal.timeout(2000),
+        );
+        expect(await response.text()).toBe("second address");
+        expect(requestSpy).toHaveBeenCalledTimes(2);
+      } finally {
+        requestSpy.mockRestore();
+      }
     },
   );
   expect(requests).toBe(1);
 });
 
 test("reports the last connection error when every address is refused", async () => {
-  let port = 0;
-  await withServer(() => {}, async (p) => { port = p; });
-  // The server is closed now, so both addresses refuse.
-  await expect(
-    download.fetch(
-      `http://down.invalid:${port}/`,
-      [{ address: "127.0.0.2", family: 4 }, ...loopback],
-      AbortSignal.timeout(2000),
-    ),
-  ).rejects.toMatchObject({ code: "ECONNREFUSED" });
+  const first = Object.assign(new Error("first refusal"), { code: "ECONNREFUSED" });
+  const last = Object.assign(new Error("last refusal"), { code: "ECONNREFUSED" });
+  const requestSpy = spyOn(http, "request")
+    .mockImplementationOnce(() => refusedRequest(first))
+    .mockImplementationOnce(() => refusedRequest(last));
+  try {
+    await expect(
+      download.fetch(
+        "http://down.invalid/",
+        [{ address: "192.0.2.1", family: 4 }, { address: "192.0.2.2", family: 4 }],
+        AbortSignal.timeout(2000),
+      ),
+    ).rejects.toBe(last);
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+  } finally {
+    requestSpy.mockRestore();
+  }
 });
 
 test.each(["x-gzip", "GZIP"])("decodes Content-Encoding %p", async (encoding) => {
