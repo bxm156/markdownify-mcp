@@ -53,8 +53,10 @@ SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 # Inline code span: a backtick run closed by a run of the same length. It may
 # wrap onto the next line but never crosses a blank line (paragraph boundary),
-# so a stray backtick cannot hide links in a later paragraph.
-CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(?:(?!\n[ \t]*\n).)+?(?<!`)\1(?!`)", re.DOTALL)
+# so a stray backtick cannot hide links in a later paragraph (LF or CRLF).
+CODE_SPAN = re.compile(
+    r"(?<!`)(`+)(?!`)(?:(?!\r?\n[ \t]*\r?\n).)+?(?<!`)\1(?!`)", re.DOTALL,
+)
 
 log = logging.getLogger("mkdocs.hooks.repo_links")
 
@@ -204,6 +206,10 @@ def _self_check() -> None:
     ])
     actual = rewrite_links(source, ctx)
     assert actual == expected, f"unexpected rewrite:\n{actual}"
+    # The same fixture with CRLF line endings (several source docs use CRLF).
+    actual_crlf = rewrite_links(source.replace("\n", "\r\n"), ctx)
+    expected_crlf = expected.replace("\n", "\r\n")
+    assert actual_crlf == expected_crlf, f"unexpected CRLF rewrite:\n{actual_crlf!r}"
     print("mkdocs_hooks self-check passed")
 
 
