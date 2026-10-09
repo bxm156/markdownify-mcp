@@ -72,6 +72,8 @@ describe("retention cleanup resilience", () => {
       expect(after.cleanup).toMatchObject({ jobs_failed_last_sweep: 0, failures_total: 2, consecutive_failed_sweeps: 0, last_error_code: "EACCES" });
       expect(typeof after.cleanup.last_failure_at).toBe("string"); expect(after.cleanup.last_duration_ms).toBeGreaterThanOrEqual(0);
       expect(JSON.stringify(after.cleanup)).not.toContain(options.dataDir); expect(logged).toHaveBeenCalledTimes(2);
+      // Cleanup counters stay on the authenticated health result; public probes never expose them.
+      expect(await instance.health()).not.toHaveProperty("cleanup"); expect(await instance.publicHealth()).not.toHaveProperty("cleanup");
     } finally { rm.mockRestore(); logged.mockRestore(); setSystemTime(); }
   });
 
