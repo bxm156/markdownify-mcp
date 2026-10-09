@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { Readable } from "node:stream";
 import { JobService, type JobServiceOptions } from "./jobs.js";
 import { purgeOwnerJobs } from "./purge-owner.js";
@@ -344,6 +345,32 @@ describe("retired owner purge tool", () => {
     await expect(restarted.getStatus(alice, id)).rejects.toMatchObject({ statusCode: 404 });
   });
 
+  test("a dry run never writes, so it works when the lock cannot be created; --apply fails clearly without leaving a lock", async () => {
+    const { instance, options } = await service();
+    const id = await uploaded(instance, alice); await instance.close();
+    const lock = path.join(options.dataDir, ".lock");
+    // Simulate a read-only mount for every write under the data directory.
+    const readOnly = (target: unknown) => Promise.reject(Object.assign(new Error(`EROFS: read-only file system, open '${String(target)}'`), { code: "EROFS" }));
+    const writes = spyOn(fs, "writeFile").mockImplementation(((target: any, ...rest: any[]) => String(target).startsWith(options.dataDir) ? readOnly(target) : (realWriteFile as any)(target, ...rest)) as any);
+    try {
+      expect(await purgeOwnerJobs(options.dataDir, alice)).toMatchObject({ applied: false, jobs: [{ job_id: id, result: "listed" }] });
+      await expect(purgeOwnerJobs(options.dataDir, alice, true)).rejects.toThrow("Cannot create MD_DATA_DIR/.lock (EROFS); --apply needs write access to the data directory");
+    } finally { writes.mockRestore(); }
+    await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" }); expect(await files(options.dataDir, id)).toContain("input.txt");
+  });
+
+  // Root bypasses directory permissions, so this real read-only check only runs as an unprivileged POSIX user.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("a dry run succeeds on a read-only data directory and --apply is refused", async () => {
+    const { instance, options } = await service();
+    const id = await uploaded(instance, alice); await instance.close();
+    await fs.chmod(options.dataDir, 0o555);
+    try {
+      expect((await purgeOwnerJobs(options.dataDir, alice)).jobs).toMatchObject([{ job_id: id, result: "listed" }]);
+      await expect(purgeOwnerJobs(options.dataDir, alice, true)).rejects.toThrow("Cannot create MD_DATA_DIR/.lock (EACCES)");
+      await expect(fs.stat(path.join(options.dataDir, ".lock"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await fs.chmod(options.dataDir, 0o700); }
+  });
+
   test("refuses invalid owners, missing paths and directories that are not a data volume", async () => {
     const empty = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-not-data-")); directories.push(empty);
     await expect(purgeOwnerJobs(empty, alice)).rejects.toThrow("Not a markdownify data directory");
@@ -399,6 +426,28 @@ describe.skipIf(!node)("compiled entry points under node", () => {
     expect(report.unreadable).toEqual([corrupt]); expect(report.jobs).toMatchObject([{ job_id: mine, result: "deleted" }]);
     await expect(fs.stat(path.join(options.dataDir, mine))).rejects.toMatchObject({ code: "ENOENT" });
     expect(await fs.readFile(path.join(options.dataDir, corrupt, "job.json"), "utf8")).toBe("{not json");
+  }, 30_000);
+
+  test.skipIf(process.platform === "win32")("an interrupted purge --apply exits with the signal status and leaves no lock", async () => {
+    const preloadDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-purge-signal-")); directories.push(preloadDir);
+    // Hang removal of one job directory in pure JavaScript (no blocked I/O thread), and report when it is reached.
+    const preload = path.join(preloadDir, "hang-rm.mjs");
+    await fs.writeFile(preload, `import fs from "node:fs/promises"; const rm = fs.rm; fs.rm = (target, options) => { if (String(target).endsWith(process.env.HANG_JOB)) { process.stdout.write("gated\\n"); setInterval(() => {}, 1000); return new Promise(() => {}); } return rm(target, options); };`);
+    for (const [signal, number] of [["SIGINT", 2], ["SIGTERM", 15], ["SIGHUP", 1]] as const) {
+      const { instance, options } = await service();
+      const id = await uploaded(instance, alice); await instance.close();
+      const child = spawn(node!, ["--import", pathToFileURL(preload).href, path.join(root, "dist/remote/purge-owner.js"), options.dataDir, alice.tenantId, alice.agentId, "--apply"], { env: { ...process.env, HANG_JOB: id }, stdio: ["ignore", "pipe", "pipe"] });
+      try {
+        let stdout = ""; child.stdout!.on("data", chunk => { stdout += chunk; });
+        const exited = new Promise<number | null>(resolve => child.once("exit", code => resolve(code)));
+        for (let tries = 0; tries < 400 && !stdout.includes("gated"); tries++) { if (child.exitCode !== null) break; await new Promise(resolve => setTimeout(resolve, 10)); }
+        expect(stdout).toContain("gated"); expect((await fs.readFile(path.join(options.dataDir, ".lock"), "utf8")).split("\n")[0]).toBe(String(child.pid));
+        child.kill(signal);
+        expect(await exited).toBe(128 + number);
+        await expect(fs.stat(path.join(options.dataDir, ".lock"))).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await files(options.dataDir, id)).toContain("job.json");
+      } finally { if (child.exitCode === null) child.kill("SIGKILL"); }
+    }
   }, 30_000);
 
   test("process.exit and uncaught exceptions release the lock, but never a lock replaced by another process", async () => {

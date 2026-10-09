@@ -12,7 +12,7 @@ let exitHook = false;
 export const LOCK_REMOVAL_HINT = "If no markdownify process is using this volume (for example after a crash or SIGKILL), remove MD_DATA_DIR/.lock and restart; see docs/MULTITENANT.md";
 /** The data directory's lock file already exists. */
 export class LockHeldError extends Error {}
-const lockError = () => new LockHeldError(`Data directory is in use: MD_DATA_DIR/.lock exists. Run one process per data volume. ${LOCK_REMOVAL_HINT}`);
+const lockError = () => new LockHeldError(`Data directory is in use: MD_DATA_DIR/.lock exists. Run one process per data volume; a running purge-owner --apply also holds this lock. ${LOCK_REMOVAL_HINT}`);
 
 /** The contents of an existing lock, or undefined when the data directory is unlocked. The PID is informational only. */
 export async function readLock(dataDir: string) {

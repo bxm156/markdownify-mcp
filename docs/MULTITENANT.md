@@ -154,7 +154,7 @@ The data volume contains:
 | `<job-id>/output.md`, `<job-id>/output.md.index.json` | Converted Markdown and its pagination index |
 | `<job-id>/input.part`, `output.part`, `job.json.<uuid>.tmp` | Crash partials; removed at startup |
 | `audit.jsonl`, `audit.jsonl.1`–`.3` | Metadata-only audit history shared by all agents |
-| `.lock` | PID of the running service (informational only); removed whenever the process exits, but left behind by SIGKILL, an OOM kill or a host crash |
+| `.lock` | PID (informational only) plus a random per-acquisition token of the running service, or of a running `purge-owner --apply`; removed when that process exits, but left behind by SIGKILL, an OOM kill or a host crash, and never removed by a process whose lock was replaced by another one |
 
 Stop the service before changing the volume. One process owns each data volume and loads every manifest only at startup, so edits under a running service race its in-memory state. The service creates `.lock` exclusively and refuses startup whenever that file exists, with `Data directory is in use: MD_DATA_DIR/.lock exists`. Graceful shutdown on SIGTERM, SIGINT or SIGHUP removes it, and so does every other process exit the runtime can observe: the forced exit when shutdown exceeds its 10-second deadline, an uncaught exception, or a startup failure. A SIGKILL (`docker kill`, or `docker stop` exceeding `stop_grace_period`), an OOM kill or a host crash leaves it behind, and every restart then fails with that message. With `restart: unless-stopped` the container then keeps restarting and failing, so stop it explicitly before removing the lock. A process only ever removes a lock whose contents (its PID plus a random per-start token) it wrote itself, so a hung old process cannot remove a newer service's lock. Automatic PID-based reclamation is unsafe because PIDs are reused and differ between container namespaces, so remove a leftover lock manually:
 
@@ -165,7 +165,7 @@ docker compose -f compose.multitenant.yaml run --rm --no-deps --entrypoint rm ma
 docker compose -f compose.multitenant.yaml start markdownify
 ```
 
-For a native process, stop it (and any supervisor that restarts it), confirm that it is not running, and run `rm -f "$MD_DATA_DIR/.lock"`. The purge tool refuses to run while any lock exists and holds the lock itself for the whole run, so the service cannot start and load half-deleted directories during a purge; it refuses a path that contains neither job manifests nor `audit.jsonl`. It follows a symlinked data directory, reads manifests and file sizes only, never document contents, and is a dry run unless `--apply` is given:
+For a native process, stop it (and any supervisor that restarts it), confirm that it is not running, and run `rm -f "$MD_DATA_DIR/.lock"`. The purge tool refuses to run while any lock exists, and refuses a path that contains neither job manifests nor `audit.jsonl`. It follows a symlinked data directory and never reads document contents. It is a dry run unless `--apply` is given. A dry run reads manifests and file sizes only and writes nothing, so it also works on a read-only snapshot or mount. `--apply` needs write access and holds the lock for the whole run, so the service cannot start and load half-deleted directories during a purge. A completed purge, or one interrupted with SIGINT, SIGTERM or SIGHUP, leaves no lock; only SIGKILL (or an OOM kill or host crash) leaves one behind, to be removed as above:
 
 ```sh
 docker compose -f compose.multitenant.yaml stop markdownify
@@ -173,10 +173,12 @@ docker compose -f compose.multitenant.yaml stop markdownify
 docker compose -f compose.multitenant.yaml run --rm --no-deps markdownify node dist/remote/purge-owner.js /data <tenant_id> <agent_id>
 # After reviewing the list, remove those job directories.
 docker compose -f compose.multitenant.yaml run --rm --no-deps markdownify node dist/remote/purge-owner.js /data <tenant_id> <agent_id> --apply
+# Confirm before restarting (the running service holds the lock, so purge-owner refuses afterwards): "jobs" must be empty.
+docker compose -f compose.multitenant.yaml run --rm --no-deps markdownify node dist/remote/purge-owner.js /data <tenant_id> <agent_id>
 docker compose -f compose.multitenant.yaml start markdownify
 ```
 
-For a native process, run `node dist/remote/purge-owner.js "$MD_DATA_DIR" <tenant_id> <agent_id> [--apply]` with the process stopped. The tool always prints a JSON report:
+For a native process, run `node dist/remote/purge-owner.js "$MD_DATA_DIR" <tenant_id> <agent_id> [--apply]` with the process stopped, and repeat the dry run before restarting it. The tool always prints a JSON report:
 
 - `jobs`: the owner's jobs, each `listed` (dry run), `deleted`, or `failed` with an errno-style `code`. A failure on one job does not stop the others.
 - `skipped`: directories it will not touch: `missing_manifest` (an interrupted create, removed by the service at startup), `legacy_unowned` (a manifest without owner fields, only usable with `MD_LEGACY_OWNER`), `malformed_owner` (a manifest with only one of `tenant_id`/`agent_id`, or a non-string value), and `id_mismatch` (a manifest whose `id` differs from its directory name). Startup refuses `malformed_owner` and `id_mismatch`, and `legacy_unowned` unless `MD_LEGACY_OWNER` is set, so inspect them manually.
@@ -184,7 +186,7 @@ For a native process, run `node dist/remote/purge-owner.js "$MD_DATA_DIR" <tenan
 
 The exit status is 0 only when no job failed and no manifest was unreadable, 1 otherwise or when a precondition fails, and 2 for usage errors. Rerun with `--apply` after fixing a failure; already deleted jobs are simply absent. Do not delete job directories by hand from manifest contents: a directory's name, not the manifest's `id` field, is what the service loads.
 
-Audit entries for the retired agent contain only IDs and event codes and rotate out of the bounded history; export or filter `audit.jsonl` according to your own retention policy while the service is stopped. After restarting, confirm that the dry run lists no jobs and that no `job_cleanup_sweep_failed` line follows the next sweep.
+Audit entries for the retired agent contain only IDs and event codes and rotate out of the bounded history; export or filter `audit.jsonl` according to your own retention policy while the service is stopped. After the confirming dry run lists no jobs, restart the service and check that no `job_cleanup_sweep_failed` line follows the next sweep.
 
 ## Verification
 
