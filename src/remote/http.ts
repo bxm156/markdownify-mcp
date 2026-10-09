@@ -32,9 +32,11 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
       if (request.headers.origin && request.headers.origin !== publicUrl.origin) { reply(response, 403, "Origin not allowed"); return; }
       const url = new URL(request.url ?? "/", publicUrl);
       if (url.search) { reply(response, 400, "Query parameters are not supported"); return; }
-      if (url.pathname === "/healthz") {
+      // /livez (and legacy /healthz) is liveness only; /readyz gates traffic on storage/converter/lifecycle.
+      if (["/livez", "/healthz", "/readyz"].includes(url.pathname)) {
         if (request.method !== "GET") { response.setHeader("Allow", "GET"); reply(response, 405, "Method not allowed"); return; }
-        const health = await service.health();
+        if (url.pathname !== "/readyz") { response.writeHead(200, { "Content-Type": "application/json" }); response.end(JSON.stringify({ status: "ok" })); return; }
+        const health = await service.publicHealth();
         response.writeHead(health.ready ? 200 : 503, { "Content-Type": "application/json" }); response.end(JSON.stringify(health)); return;
       }
       const upload = /^\/uploads\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(url.pathname);

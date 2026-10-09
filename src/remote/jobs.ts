@@ -385,6 +385,12 @@ export class JobService {
         max_upload_bytes: this.options.maxUploadBytes, max_output_bytes: this.options.maxOutputBytes } };
   }
 
+  /** Unauthenticated readiness verdict: booleans only, no capacity/process metrics. */
+  async publicHealth() {
+    const { status, ready, checks: { initialized, accepting_work, storage, converter } } = await this.health();
+    return { status, ready, checks: { initialized, accepting_work, storage: { writable: storage.writable }, converter: { available: converter.available, check: converter.check } } };
+  }
+
   async close() {
     this.closing = true;
     if (this.timer) clearInterval(this.timer);

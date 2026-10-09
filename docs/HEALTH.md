@@ -1,20 +1,20 @@
 # Health checks and LiteLLM 1.104
 
-LiteLLM 1.104.0's MCPServerManager.health_check_server opens an MCPClient session with static headers and no user identity. Its callback is a no-op; successful MCP initialization is marked healthy. It does not call /healthz or fetch detailed health metrics. The per-user signer is not part of this health path.
+LiteLLM 1.104.0's MCPServerManager.health_check_server opens an MCPClient session with static headers and no user identity. Its callback is a no-op; successful MCP initialization is marked healthy. It does not call /readyz or fetch detailed health metrics. The per-user signer is not part of this health path.
 
 Source: [LiteLLM 1.104 manager](https://github.com/BerriAI/litellm/blob/10444df3a0173a99ab4e4858ce6777f31530e6c5/litellm/proxy/_experimental/mcp_server/mcp_server_manager.py). The integration test uses the actual installed 1.104.0 MCPClient.run_with_session path.
 
 ## Public readiness and restricted MCP probes
 
-GET /healthz returns HTTP 200 only after initialization, while accepting work, with writable storage/free space and an available converter executable. Otherwise it returns 503. Fields include status, ready, checked_at, uptime_seconds, memory_rss_bytes and checks.storage/converter. An in-flight check is shared by concurrent requests; completed checks are cached for two seconds after they settle; storage is tested with a small write/delete probe and statfs. Converter availability means an executable file was found (and is executable on Unix), not that all Python dependencies or document conversions work. Custom test converters are reported as custom.
+GET /livez (alias /healthz) returns 200 `{"status":"ok"}` whenever the process is serving; point container HEALTHCHECK and liveness probes here so a full disk does not cause restart loops. GET /readyz returns HTTP 200 only after initialization, while accepting work, with writable storage/free space and an available converter executable. Otherwise it returns 503. Its public body contains only status, ready and boolean checks (initialized, accepting_work, storage.writable, converter.available/check); free space, memory, uptime and check time are reserved for get_service_health. An in-flight check is shared by concurrent requests; completed checks are cached for two seconds after they settle; storage is tested with a small write/delete probe and statfs. Converter availability means an executable file was found (and is executable on Unix), not that all Python dependencies or document conversions work. Custom test converters are reported as custom.
 
 In JWT mode only, requests without an authenticated owner may perform initialize, notifications/initialized and ping on /mcp. They are gated by the same readiness check. This includes requests carrying a missing-sub/expired/invalid JWT: they receive no owner, tool capabilities or authenticated access. Batch requests and all other methods still require authentication. Tools/list, tools/call, resources and prompts remain protected. Registry mode continues requiring authentication for MCP probes.
 
-Keep Host/Origin checks and TLS enabled. No shared health principal, fallback user, long-lived monitoring key or job ownership is created. Public metrics contain process and storage readiness, not user identities, job counts, reservations, paths or errors. Restrict public route access at your proxy if these infrastructure metrics should stay on an internal monitoring network.
+Keep Host/Origin checks and TLS enabled. No shared health principal, fallback user, long-lived monitoring key or job ownership is created. Public probes expose only the readiness verdict, not user identities, job counts, reservations, capacity metrics, paths or errors.
 
 ## Private agent metrics
 
-Use get_service_health({}) with the normal authenticated agent and its per-tool JWT scope. It returns readiness plus:
+Use get_service_health({}) with the normal authenticated agent and its per-tool JWT scope. It returns detailed readiness (checked_at, uptime_seconds, memory_rss_bytes, storage free_bytes) plus:
 
 - own_jobs: counts for the caller's job states, including retained expired tombstones.
 - own_reserved_bytes: the caller's current input-plus-maximum-output reservation, using the same non-expired-state accounting as admission.

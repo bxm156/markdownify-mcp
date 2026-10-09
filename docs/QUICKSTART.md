@@ -45,7 +45,7 @@ docker compose -f compose.multitenant.yaml up --build -d
 Invoke-RestMethod http://localhost:8000/healthz
 ```
 
-The default listener is bound to localhost through Docker. The expected health response is `{"status":"ok"}`. Inspect `docker compose -f compose.multitenant.yaml logs` if startup fails. Remove `MD_API_KEY` entirely from this server's environment; registry authentication uses `MD_AUTH_FILE` and rejects a simultaneous shared key. Use this Compose file on its own.
+The default listener is bound to localhost through Docker. The expected health response is `{"status":"ok"}` (`/healthz` aliases the `/livez` liveness probe); `/readyz` returns 200 once storage and the converter are ready. Inspect `docker compose -f compose.multitenant.yaml logs` if startup fails. Remove `MD_API_KEY` entirely from this server's environment; registry authentication uses `MD_AUTH_FILE` and rejects a simultaneous shared key. Use this Compose file on its own.
 
 For public hosting, configure HTTPS and routing as described in [containers](CONTAINERS.md) and [remote deployment](REMOTE.md). Configure `MD_PUBLIC_BASE_URL` to your server origin before accepting remote clients. Run one replica per data volume. The Docker Hub image `bryanmarty/markdownify-mcp` becomes available after the configured publication workflow succeeds; local builds do not require Docker Hub credentials.
 
