@@ -18,6 +18,7 @@ import {
   resolveRepomixPath,
   getAllowedPaths,
   assertPathAllowed,
+  redactUrl,
 } from "./utils";
 import dns from "node:dns";
 import fs from "fs";
@@ -124,8 +125,43 @@ describe("validateUrl", () => {
     "http://[fc00::1]/",
     "http://[fe80::1]/",
     "http://2130706433/", // 127.0.0.1 in decimal
+    "http://[::127.0.0.1]/", // IPv4-compatible
+    "http://[::7f00:1]/",
+    "http://[::a9fe:a9fe]/", // 169.254.169.254
+    "http://[fec0::1]/", // site-local
+    "http://[64:ff9b::7f00:1]/", // NAT64 of 127.0.0.1
+    "http://[64:ff9b::169.254.169.254]/",
   ])("rejects %s", async (url) => {
     await expect(validateUrl(url)).rejects.toThrow("potentially dangerous");
+  });
+
+  test("accepts NAT64 and IPv4-mapped forms of public addresses", async () => {
+    await expect(validateUrl("http://[64:ff9b::808:808]/")).resolves.toBeUndefined();
+    await expect(validateUrl("http://[::ffff:8.8.8.8]/")).resolves.toBeUndefined();
+  });
+
+  test("rejects URLs with embedded credentials without echoing them", async () => {
+    for (const url of [
+      "http://admin:s3cret@127.0.0.1/?token=abc",
+      "https://user@example.com/",
+      "https://:pw@example.com/",
+    ]) {
+      const error = await validateUrl(url).catch((e: Error) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "URLs with embedded credentials are not allowed.",
+      );
+    }
+    expect(lookupSpy).not.toHaveBeenCalled();
+  });
+
+  test("names only origin and path in the rejection message", async () => {
+    const error = await validateUrl(
+      "http://127.0.0.1/admin/reset?token=abc#frag",
+    ).catch((e: Error) => e);
+    expect((error as Error).message).toBe(
+      "Fetching http://127.0.0.1/admin/reset is potentially dangerous, aborting.",
+    );
   });
 
   test("rejects hostnames that resolve to a private address", async () => {
@@ -156,6 +192,18 @@ describe("validateUrl", () => {
 
   test("throws on invalid URLs", async () => {
     await expect(validateUrl("not-a-url")).rejects.toThrow();
+  });
+});
+
+describe("redactUrl", () => {
+  test("keeps origin and path, drops userinfo, query and fragment", () => {
+    expect(
+      redactUrl("https://u:p@bucket.example.com:8443/a/b.pdf?X-Amz-Signature=x#f"),
+    ).toBe("https://bucket.example.com:8443/a/b.pdf");
+  });
+
+  test("does not echo unparseable input", () => {
+    expect(redactUrl("not a url?token=abc")).toBe("<invalid URL>");
   });
 });
 

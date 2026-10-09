@@ -7,7 +7,7 @@ import { fileURLToPath } from "url";
 import { download } from "./download.js";
 import {
   expandHome,
-  validateUrl,
+  redactUrl,
   resolvePublicAddresses,
   validateRepoUrl,
   isUnconvertedHtml,
@@ -113,7 +113,7 @@ export class Markdownify {
       if (response.status >= 400) {
         await response.body?.cancel();
         throw new Error(
-          `Fetching ${currentUrl} failed with HTTP ${response.status}` +
+          `Fetching ${redactUrl(currentUrl)} failed with HTTP ${response.status}` +
             (response.statusText ? ` ${response.statusText}` : ""),
         );
       }

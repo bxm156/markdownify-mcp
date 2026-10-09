@@ -189,6 +189,27 @@ describe("Markdownify.safeFetch", () => {
     );
   });
 
+  test("does not echo a redirect target's query string in HTTP errors", async () => {
+    stubFetch(async (url) =>
+      url === "https://example.com/file"
+        ? redirect("https://bucket.example.com/f.pdf?X-Amz-Signature=secret")
+        : new Response("denied", { status: 403, statusText: "Forbidden" }),
+    );
+    const error = await safeFetch("https://example.com/file").catch(
+      (e: Error) => e,
+    );
+    expect((error as Error).message).toBe(
+      "Fetching https://bucket.example.com/f.pdf failed with HTTP 403 Forbidden",
+    );
+  });
+
+  test("rejects a redirect to a URL with embedded credentials", async () => {
+    stubFetch(async () => redirect("https://admin:pw@example.com/"));
+    await expect(safeFetch("https://example.com/")).rejects.toThrow(
+      "URLs with embedded credentials are not allowed.",
+    );
+  });
+
   test("passes validated addresses and a deadline to the pinned transport", async () => {
     const fetchStub = stubFetch(async () => new Response("ok"));
     await safeFetch("https://example.com/");

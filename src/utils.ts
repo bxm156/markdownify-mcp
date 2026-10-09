@@ -107,7 +107,10 @@ function ipv6Groups(address: string): number[] {
   );
 }
 
-/** True for loopback, private, link-local, unique-local and unspecified addresses. */
+/**
+ * True for loopback, private, link-local, unique-local, site-local and
+ * unspecified addresses, including IPv4 addresses embedded in IPv6.
+ */
 function isPrivateAddress(address: string): boolean {
   if (net.isIPv4(address)) {
     return is_ip_private(address) === true;
@@ -116,20 +119,38 @@ function isPrivateAddress(address: string): boolean {
     return false;
   }
   const groups = ipv6Groups(address);
-  const firstFiveZero = groups.slice(0, 5).every((group) => group === 0);
-  if (firstFiveZero && groups[5] === 0xffff) {
-    // IPv4-mapped (::ffff:a.b.c.d): judge the embedded IPv4 address.
+  const allZero = (from: number, to: number) =>
+    groups.slice(from, to).every((group) => group === 0);
+  if (allZero(0, 7) && groups[7] <= 1) {
+    return true; // :: (unspecified) and ::1 (loopback)
+  }
+  const embedsIPv4 =
+    (allZero(0, 5) && groups[5] === 0xffff) || // ::ffff:0:0/96 IPv4-mapped
+    allZero(0, 6) || // ::/96 IPv4-compatible (deprecated)
+    (groups[0] === 0x64 && groups[1] === 0xff9b && allZero(2, 6)); // 64:ff9b::/96 NAT64
+  if (embedsIPv4) {
     const [high, low] = [groups[6], groups[7]];
     return isPrivateAddress(
       [high >> 8, high & 0xff, low >> 8, low & 0xff].join("."),
     );
   }
-  if (groups.slice(0, 7).every((group) => group === 0) && groups[7] <= 1) {
-    return true; // :: (unspecified) and ::1 (loopback)
-  }
   if ((groups[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique local
   if ((groups[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((groups[0] & 0xffc0) === 0xfec0) return true; // fec0::/10 site-local (deprecated)
   return is_ip_private(address) === true;
+}
+
+/**
+ * Describes a URL for error messages as origin + path only, so credentials,
+ * query-string tokens and presigned-URL signatures are never echoed.
+ */
+export function redactUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return "<invalid URL>";
+  }
 }
 
 /**
@@ -137,17 +158,26 @@ function isPrivateAddress(address: string): boolean {
  * hostname must not be (or resolve to) a loopback, private, link-local or
  * cloud-metadata address. Resolution failures are treated as unsafe.
  */
-export async function validateUrl(url: string): Promise<void> { await resolvePublicAddresses(url); }
+export async function validateUrl(url: string): Promise<void> {
+  await resolvePublicAddresses(url);
+}
 
-export async function resolvePublicAddresses(url: string, signal?: AbortSignal): Promise<{ address: string; family: number }[]> {
+/** Like validateUrl, but returns the vetted addresses so the caller can pin to them. */
+export async function resolvePublicAddresses(
+  url: string,
+  signal?: AbortSignal,
+): Promise<{ address: string; family: number }[]> {
   signal?.throwIfAborted();
   const parsed = new URL(url);
   if (!["http:", "https:"].includes(parsed.protocol)) {
     throw new Error("Only http: and https: schemes are allowed.");
   }
+  if (parsed.username || parsed.password) {
+    throw new Error("URLs with embedded credentials are not allowed.");
+  }
 
   const dangerous = new Error(
-    `Fetching ${url} is potentially dangerous, aborting.`,
+    `Fetching ${redactUrl(url)} is potentially dangerous, aborting.`,
   );
   // URL.hostname keeps IPv6 brackets ("[::1]"); a trailing dot is a valid FQDN.
   const hostname = parsed.hostname
