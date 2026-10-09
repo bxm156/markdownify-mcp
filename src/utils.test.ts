@@ -166,6 +166,34 @@ describe("isWithinDirectory", () => {
       isWithinDirectory("/home/user/docs/../other/file.md", "/home/user/docs"),
     ).toBe(false);
   });
+
+  test("returns false for a sibling sharing the directory name as a prefix", () => {
+    expect(isWithinDirectory("/tmp/a/share-evil/f.pdf", "/tmp/a/share")).toBe(
+      false,
+    );
+    expect(isWithinDirectory("/tmp/a/sharex", "/tmp/a/share")).toBe(false);
+  });
+
+  test("returns true for the directory itself", () => {
+    expect(isWithinDirectory("/tmp/a/share", "/tmp/a/share")).toBe(true);
+  });
+
+  test("returns true for a child whose name starts with two dots", () => {
+    expect(isWithinDirectory("/tmp/a/share/..f", "/tmp/a/share")).toBe(true);
+  });
+
+  test("accepts a directory given with a trailing separator", () => {
+    expect(isWithinDirectory("/tmp/a/share/f.pdf", "/tmp/a/share/")).toBe(
+      true,
+    );
+    expect(isWithinDirectory("/tmp/a/share-evil/f.pdf", "/tmp/a/share/")).toBe(
+      false,
+    );
+  });
+
+  test("treats / as containing every absolute path", () => {
+    expect(isWithinDirectory("/etc/passwd", "/")).toBe(true);
+  });
 });
 
 describe("validateRepoUrl", () => {
@@ -350,5 +378,86 @@ describe("getAllowedPaths / assertPathAllowed", () => {
     expect(() =>
       assertPathAllowed("/tmp/allowed/../etc/passwd"),
     ).toThrow("outside the allowed directories");
+  });
+
+  test("assertPathAllowed rejects siblings that share the allowed prefix", () => {
+    process.env.MD_ALLOWED_PATHS = "/tmp/a/share";
+    expect(() => assertPathAllowed("/tmp/a/share-evil/f.pdf")).toThrow(
+      "outside the allowed directories",
+    );
+    expect(() => assertPathAllowed("/tmp/a/sharex")).toThrow(
+      "outside the allowed directories",
+    );
+  });
+
+  test("assertPathAllowed permits the allowed dir and its descendants", () => {
+    process.env.MD_ALLOWED_PATHS = "/tmp/a/share";
+    expect(() => assertPathAllowed("/tmp/a/share")).not.toThrow();
+    expect(() => assertPathAllowed("/tmp/a/share/sub/f")).not.toThrow();
+  });
+
+  test("assertPathAllowed accepts an allowed dir with a trailing separator", () => {
+    process.env.MD_ALLOWED_PATHS = `/tmp/a/share${path.sep}`;
+    expect(() => assertPathAllowed("/tmp/a/share/f.pdf")).not.toThrow();
+    expect(() => assertPathAllowed("/tmp/a/share-evil/f.pdf")).toThrow(
+      "outside the allowed directories",
+    );
+  });
+
+  test("assertPathAllowed treats / as an allow-everything root", () => {
+    process.env.MD_ALLOWED_PATHS = "/";
+    expect(() => assertPathAllowed("/etc/passwd")).not.toThrow();
+  });
+
+  describe("with symlinks", () => {
+    let tmp: string;
+    let allowedDir: string;
+    let outsideDir: string;
+
+    beforeEach(() => {
+      tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-")));
+      allowedDir = path.join(tmp, "allowed");
+      outsideDir = path.join(tmp, "outside");
+      fs.mkdirSync(allowedDir);
+      fs.mkdirSync(outsideDir);
+      fs.writeFileSync(path.join(allowedDir, "inside.pdf"), "");
+      fs.writeFileSync(path.join(outsideDir, "secret.pdf"), "");
+      process.env.MD_ALLOWED_PATHS = allowedDir;
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    });
+
+    test("rejects a symlink inside the allowed dir pointing outside it", () => {
+      const link = path.join(allowedDir, "link.pdf");
+      fs.symlinkSync(path.join(outsideDir, "secret.pdf"), link);
+      expect(() => assertPathAllowed(link)).toThrow(
+        "outside the allowed directories",
+      );
+    });
+
+    test("rejects a not-yet-existing file under a symlinked dir pointing outside", () => {
+      const dirLink = path.join(allowedDir, "escape");
+      fs.symlinkSync(outsideDir, dirLink);
+      expect(() => assertPathAllowed(path.join(dirLink, "new.pdf"))).toThrow(
+        "outside the allowed directories",
+      );
+    });
+
+    test("accepts a symlink pointing to a file inside the allowed dir", () => {
+      const link = path.join(allowedDir, "alias.pdf");
+      fs.symlinkSync(path.join(allowedDir, "inside.pdf"), link);
+      expect(() => assertPathAllowed(link)).not.toThrow();
+    });
+
+    test("accepts files when the allowed dir itself is reached via a symlink", () => {
+      const allowedLink = path.join(tmp, "allowed-link");
+      fs.symlinkSync(allowedDir, allowedLink);
+      process.env.MD_ALLOWED_PATHS = allowedLink;
+      expect(() =>
+        assertPathAllowed(path.join(allowedDir, "inside.pdf")),
+      ).not.toThrow();
+    });
   });
 });

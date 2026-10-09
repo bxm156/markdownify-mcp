@@ -43,11 +43,34 @@ export function getAllowedPaths(): string[] | null {
   return dirs.length > 0 ? dirs : null;
 }
 
+/**
+ * Resolves symlinks in `target` via the deepest ancestor that exists, then
+ * re-joins the not-yet-existing remainder. This lets paths that do not exist
+ * yet still be checked against the real location of their parent directory.
+ */
+function realpathOfDeepestExisting(target: string): string {
+  let current = path.resolve(target);
+  const remainder: string[] = [];
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(current), ...remainder);
+    } catch (e: unknown) {
+      const parent = path.dirname(current);
+      if ((e as NodeJS.ErrnoException)?.code !== "ENOENT" || parent === current) {
+        throw e;
+      }
+      remainder.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
 export function assertPathAllowed(filePath: string): void {
   const allowed = getAllowedPaths();
   if (!allowed) return;
-  const resolved = path.normalize(path.resolve(expandHome(filePath)));
-  if (!allowed.some((dir) => isWithinDirectory(resolved, dir))) {
+  const resolved = realpathOfDeepestExisting(expandHome(filePath));
+  const allowedReal = allowed.map(realpathOfDeepestExisting);
+  if (!allowedReal.some((dir) => isWithinDirectory(resolved, dir))) {
     throw new Error(
       `Path "${filePath}" is outside the allowed directories. ` +
         `Set MD_ALLOWED_PATHS to a ${path.delimiter}-separated list that includes a parent directory ` +
@@ -104,7 +127,10 @@ export function isMarkdownFile(filePath: string): boolean {
 }
 
 export function isWithinDirectory(filePath: string, directory: string): boolean {
-  const normPath = path.normalize(path.resolve(filePath));
-  const normDir = path.normalize(path.resolve(directory));
-  return normPath.startsWith(normDir);
+  // path.relative is case-insensitive on win32 and returns an absolute path
+  // when the two are on different drives.
+  const relative = path.relative(path.resolve(directory), path.resolve(filePath));
+  if (relative === "") return true;
+  if (path.isAbsolute(relative)) return false;
+  return relative !== ".." && !relative.startsWith(".." + path.sep);
 }
