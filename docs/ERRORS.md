@@ -1,6 +1,6 @@
 # Agent errors and recovery
 
-Use `lookup_error({"code":"FILE_TOO_LARGE"})` when an error code needs explanation. It returns static guidance without reading jobs or exposing other agents' usage. All six remote tools describe when to call them and the next action.
+Use `lookup_error({"code":"FILE_TOO_LARGE"})` when an error code needs explanation. It returns static guidance without reading jobs or exposing other agents' usage. All seven remote tools describe when to call them and the next action.
 
 MCP tool errors have `isError: true` and JSON text:
 
