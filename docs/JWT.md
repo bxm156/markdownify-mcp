@@ -73,6 +73,10 @@ Blocking or deleting a LiteLLM key or user stops new gateway admissions, so Lite
 - Existing jobs and results are not deleted. They remain until `MD_RETENTION_MS` (default 24 hours) or `delete_job`, and a later key for the same user ID reaches them again.
 - To cut off sooner, lower `MD_JWT_MAX_TTL_SECONDS` and the signer `ttl_seconds`. Rotating the LiteLLM signing key invalidates tokens for all users only once the old key is removed from the JWKS and Markdownify's 60-second JWKS cache refreshes.
 
+If your gateway cannot run the `mcp_jwt_signer` guardrail, the alternative is registry mode with LiteLLM forwarding or storing each user's Markdownify credential; see [stored per-user credentials](MULTITENANT.md#stored-per-user-credentials-in-litellm) for the setup and trade-offs. The two modes cannot be combined in one deployment.
+
+LiteLLM's on-behalf-of mode (`auth_type: oauth2_token_exchange`) exchanges the caller's identity-provider token for an access token scoped to the MCP server (RFC 8693, or the Entra ID `jwt-bearer` profile) and forwards that provider-issued token instead of signing its own. Markdownify does not support this today: the verifier pins one issuer and JWKS, which would have to be the provider's rather than LiteLLM's, and it requires `mcp:tools/list` or `mcp:tools/call` plus per-tool `mcp:tools/<name>:call` scopes that identity providers do not issue. Supporting it would need a configurable scope mapping and acceptance of provider subjects as owners. It would also change the guarantee from "signed by your LiteLLM" to "issued by your provider for this audience", making the provider's token-exchange policy the effective gateway restriction. Use the signer or forwarded credentials until that is designed. See [LiteLLM OBO auth](https://docs.litellm.ai/docs/mcp_obo_auth).
+
 ## 3. Run Markdownify
 
 ```sh
