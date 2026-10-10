@@ -68,21 +68,25 @@ export class Markdownify {
     return stdout;
   }
 
-  private static async saveToTempFile(
-    content: string | Buffer,
-    suggestedExtension?: string | null,
-  ): Promise<string> {
-    let outputExtension = "md";
-    if (suggestedExtension != null) {
-      outputExtension = suggestedExtension;
-    }
-
-    const tempOutputPath = path.join(
-      os.tmpdir(),
-      `markdown_output_${Date.now()}.${outputExtension}`,
+  /**
+   * Run `fn` with a fresh, private staging directory under os.tmpdir().
+   *
+   * Every call gets its own directory (fs.mkdtemp picks a unique name), so
+   * concurrent conversions can never overwrite each other's files. The
+   * directory and everything in it is removed when `fn` settles, whether it
+   * resolves or throws, so nothing leaks in long-running stdio sessions.
+   */
+  private static async withStagingDir<T>(
+    fn: (stagingDir: string) => Promise<T>,
+  ): Promise<T> {
+    const stagingDir = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "markdown_output_"),
     );
-    fs.writeFileSync(tempOutputPath, content);
-    return tempOutputPath;
+    try {
+      return await fn(stagingDir);
+    } finally {
+      await fs.promises.rm(stagingDir, { recursive: true, force: true });
+    }
   }
 
   private static async safeFetch(
@@ -164,32 +168,29 @@ export class Markdownify {
     projectRoot?: string;
   }): Promise<MarkdownResult> {
     try {
-      let inputPath: string;
-      let isTemporary = false;
-
       if (url) {
         const response = await this.safeFetch(url);
         const extension = inferExtensionFromUrl(url);
 
         const content = await this.readBodyWithLimit(response);
 
-        inputPath = await this.saveToTempFile(content, extension);
-        isTemporary = true;
-      } else if (filePath) {
+        // markitdown picks its converter from the extension, so keep it.
+        const text = await this.withStagingDir(async (stagingDir) => {
+          const inputPath = path.join(stagingDir, `input.${extension}`);
+          await fs.promises.writeFile(inputPath, content);
+          return this._markitdown(inputPath, projectRoot);
+        });
+        return { text };
+      }
+
+      if (filePath) {
         const expanded = expandHome(filePath);
         assertPathAllowed(expanded);
-        inputPath = expanded;
-      } else {
-        throw new Error("Either filePath or url must be provided");
+        const text = await this._markitdown(expanded, projectRoot);
+        return { text };
       }
 
-      const text = await this._markitdown(inputPath, projectRoot);
-
-      if (isTemporary) {
-        fs.unlinkSync(inputPath);
-      }
-
-      return { text };
+      throw new Error("Either filePath or url must be provided");
     } catch (e: unknown) {
       if (e instanceof Error) {
         throw new Error(`Error processing to Markdown: ${e.message}`);
