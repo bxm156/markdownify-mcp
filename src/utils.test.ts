@@ -1,4 +1,11 @@
-import { expect, test, describe, beforeEach, afterEach } from "bun:test";
+import {
+  expect,
+  test,
+  describe,
+  beforeEach,
+  afterEach,
+  spyOn,
+} from "bun:test";
 import {
   expandHome,
   validateUrl,
@@ -11,7 +18,9 @@ import {
   resolveRepomixPath,
   getAllowedPaths,
   assertPathAllowed,
+  redactUrl,
 } from "./utils";
+import dns from "node:dns";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -37,46 +46,175 @@ describe("expandHome", () => {
 });
 
 describe("validateUrl", () => {
-  test("accepts http URLs", () => {
-    expect(() => validateUrl("http://example.com")).not.toThrow();
+  let lookupSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    // Keep these tests offline: every hostname resolves to a public address
+    // unless a test says otherwise.
+    lookupSpy = spyOn(dns.promises, "lookup").mockResolvedValue([
+      { address: "93.184.215.14", family: 4 },
+    ] as any);
   });
 
-  test("accepts https URLs", () => {
-    expect(() => validateUrl("https://example.com")).not.toThrow();
+  afterEach(() => {
+    lookupSpy.mockRestore();
   });
 
-  test("rejects ftp URLs", () => {
-    expect(() => validateUrl("ftp://example.com")).toThrow(
+  test("accepts http URLs", async () => {
+    await expect(validateUrl("http://example.com")).resolves.toBeUndefined();
+  });
+
+  test("accepts https URLs", async () => {
+    await expect(validateUrl("https://example.com/")).resolves.toBeUndefined();
+    expect(lookupSpy).toHaveBeenCalledWith("example.com", {
+      all: true,
+      verbatim: true,
+    });
+  });
+
+  test("accepts public IP literals without a DNS lookup", async () => {
+    await expect(validateUrl("http://8.8.8.8/")).resolves.toBeUndefined();
+    await expect(
+      validateUrl("http://[2606:4700::1111]/"),
+    ).resolves.toBeUndefined();
+    expect(lookupSpy).not.toHaveBeenCalled();
+  });
+
+  test("rejects ftp URLs", async () => {
+    await expect(validateUrl("ftp://example.com")).rejects.toThrow(
       "Only http: and https: schemes are allowed.",
     );
   });
 
-  test("rejects file URLs", () => {
-    expect(() => validateUrl("file:///etc/passwd")).toThrow(
+  test("rejects file URLs", async () => {
+    await expect(validateUrl("file:///etc/passwd")).rejects.toThrow(
       "Only http: and https: schemes are allowed.",
     );
   });
 
-  test("rejects private IP addresses", () => {
-    expect(() => validateUrl("http://192.168.1.1")).toThrow(
+  test("rejects private IP addresses", async () => {
+    await expect(validateUrl("http://192.168.1.1")).rejects.toThrow(
       "potentially dangerous",
     );
   });
 
-  test("rejects localhost", () => {
-    expect(() => validateUrl("http://127.0.0.1")).toThrow(
+  test("rejects the IPv4 loopback address", async () => {
+    await expect(validateUrl("http://127.0.0.1")).rejects.toThrow(
       "potentially dangerous",
     );
   });
 
-  test("rejects link-local addresses", () => {
-    expect(() => validateUrl("http://169.254.169.254")).toThrow(
+  test("rejects link-local addresses", async () => {
+    await expect(validateUrl("http://169.254.169.254")).rejects.toThrow(
       "potentially dangerous",
     );
   });
 
-  test("throws on invalid URLs", () => {
-    expect(() => validateUrl("not-a-url")).toThrow();
+  test.each([
+    "http://localhost/",
+    "http://LOCALHOST./",
+    "http://app.localhost/",
+    "http://metadata/",
+    "http://metadata.google.internal/",
+    "http://[::1]/",
+    "http://[::]/",
+    "http://0.0.0.0/",
+    "http://[::ffff:127.0.0.1]/",
+    "http://[::ffff:169.254.169.254]/",
+    "http://[fd00::1]/",
+    "http://[fc00::1]/",
+    "http://[fe80::1]/",
+    "http://2130706433/", // 127.0.0.1 in decimal
+    "http://[::127.0.0.1]/", // IPv4-compatible
+    "http://[::7f00:1]/",
+    "http://[::a9fe:a9fe]/", // 169.254.169.254
+    "http://[fec0::1]/", // site-local
+    "http://[64:ff9b::7f00:1]/", // NAT64 of 127.0.0.1
+    "http://[64:ff9b::169.254.169.254]/",
+    "http://[::ffff:0:7f00:1]/", // IPv4-translated (SIIT) 127.0.0.1
+    "http://[::ffff:0:a9fe:a9fe]/",
+    // Local-use NAT64 64:ff9b:1::/48 is rejected outright (RFC 8215 section 5):
+    "http://[64:ff9b:1::7f00:1]/", // /96 placement of 127.0.0.1
+    "http://[64:ff9b:1::a9fe:a9fe]/",
+    "http://[64:ff9b:1::808:808]/", // /96 placement of public 8.8.8.8
+    "http://[64:ff9b:1:808:8:800:0:0]/", // /48 placement of 8.8.8.8
+    "http://[64:ff9b:1:7f00:0:100:808:808]/", // /48 placement of 127.0.0.1, nonzero suffix
+    "http://[64:ff9b:1:7f00:0:100::]/", // /48 placement of 127.0.0.1
+    "http://[64:ff9b:1:0:7f:0:100:0]/", // /64 placement of 127.0.0.1
+  ])("rejects %s", async (url) => {
+    await expect(validateUrl(url)).rejects.toThrow("potentially dangerous");
+  });
+
+  test("accepts NAT64, IPv4-translated and IPv4-mapped forms of public addresses", async () => {
+    await expect(validateUrl("http://[64:ff9b::808:808]/")).resolves.toBeUndefined();
+    await expect(validateUrl("http://[::ffff:0:808:808]/")).resolves.toBeUndefined();
+    await expect(validateUrl("http://[::ffff:8.8.8.8]/")).resolves.toBeUndefined();
+  });
+
+  test("rejects URLs with embedded credentials without echoing them", async () => {
+    for (const url of [
+      "http://admin:s3cret@127.0.0.1/?token=abc",
+      "https://user@example.com/",
+      "https://:pw@example.com/",
+    ]) {
+      const error = await validateUrl(url).catch((e: Error) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "URLs with embedded credentials are not allowed.",
+      );
+    }
+    expect(lookupSpy).not.toHaveBeenCalled();
+  });
+
+  test("names only origin and path in the rejection message", async () => {
+    const error = await validateUrl(
+      "http://127.0.0.1/admin/reset?token=abc#frag",
+    ).catch((e: Error) => e);
+    expect((error as Error).message).toBe(
+      "Fetching http://127.0.0.1/admin/reset is potentially dangerous, aborting.",
+    );
+  });
+
+  test("rejects hostnames that resolve to a private address", async () => {
+    lookupSpy.mockResolvedValue([{ address: "127.0.0.1", family: 4 }] as any);
+    await expect(validateUrl("http://127.0.0.1.nip.io/")).rejects.toThrow(
+      "potentially dangerous",
+    );
+  });
+
+  test("rejects hostnames where any resolved address is private", async () => {
+    lookupSpy.mockResolvedValue([
+      { address: "93.184.215.14", family: 4 },
+      { address: "::ffff:10.0.0.1", family: 6 },
+    ] as any);
+    await expect(validateUrl("https://example.com/")).rejects.toThrow(
+      "potentially dangerous",
+    );
+  });
+
+  test("rejects hostnames that fail to resolve", async () => {
+    lookupSpy.mockRejectedValue(
+      Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" }),
+    );
+    await expect(validateUrl("https://does-not-exist.example/")).rejects.toThrow(
+      "potentially dangerous",
+    );
+  });
+
+  test("throws on invalid URLs", async () => {
+    await expect(validateUrl("not-a-url")).rejects.toThrow();
+  });
+});
+
+describe("redactUrl", () => {
+  test("keeps origin and path, drops userinfo, query and fragment", () => {
+    expect(
+      redactUrl("https://u:p@bucket.example.com:8443/a/b.pdf?X-Amz-Signature=x#f"),
+    ).toBe("https://bucket.example.com:8443/a/b.pdf");
+  });
+
+  test("does not echo unparseable input", () => {
+    expect(redactUrl("not a url?token=abc")).toBe("<invalid URL>");
   });
 });
 
@@ -165,6 +303,34 @@ describe("isWithinDirectory", () => {
     expect(
       isWithinDirectory("/home/user/docs/../other/file.md", "/home/user/docs"),
     ).toBe(false);
+  });
+
+  test("returns false for a sibling sharing the directory name as a prefix", () => {
+    expect(isWithinDirectory("/tmp/a/share-evil/f.pdf", "/tmp/a/share")).toBe(
+      false,
+    );
+    expect(isWithinDirectory("/tmp/a/sharex", "/tmp/a/share")).toBe(false);
+  });
+
+  test("returns true for the directory itself", () => {
+    expect(isWithinDirectory("/tmp/a/share", "/tmp/a/share")).toBe(true);
+  });
+
+  test("returns true for a child whose name starts with two dots", () => {
+    expect(isWithinDirectory("/tmp/a/share/..f", "/tmp/a/share")).toBe(true);
+  });
+
+  test("accepts a directory given with a trailing separator", () => {
+    expect(isWithinDirectory("/tmp/a/share/f.pdf", "/tmp/a/share/")).toBe(
+      true,
+    );
+    expect(isWithinDirectory("/tmp/a/share-evil/f.pdf", "/tmp/a/share/")).toBe(
+      false,
+    );
+  });
+
+  test("treats / as containing every absolute path", () => {
+    expect(isWithinDirectory("/etc/passwd", "/")).toBe(true);
   });
 });
 
@@ -350,5 +516,86 @@ describe("getAllowedPaths / assertPathAllowed", () => {
     expect(() =>
       assertPathAllowed("/tmp/allowed/../etc/passwd"),
     ).toThrow("outside the allowed directories");
+  });
+
+  test("assertPathAllowed rejects siblings that share the allowed prefix", () => {
+    process.env.MD_ALLOWED_PATHS = "/tmp/a/share";
+    expect(() => assertPathAllowed("/tmp/a/share-evil/f.pdf")).toThrow(
+      "outside the allowed directories",
+    );
+    expect(() => assertPathAllowed("/tmp/a/sharex")).toThrow(
+      "outside the allowed directories",
+    );
+  });
+
+  test("assertPathAllowed permits the allowed dir and its descendants", () => {
+    process.env.MD_ALLOWED_PATHS = "/tmp/a/share";
+    expect(() => assertPathAllowed("/tmp/a/share")).not.toThrow();
+    expect(() => assertPathAllowed("/tmp/a/share/sub/f")).not.toThrow();
+  });
+
+  test("assertPathAllowed accepts an allowed dir with a trailing separator", () => {
+    process.env.MD_ALLOWED_PATHS = `/tmp/a/share${path.sep}`;
+    expect(() => assertPathAllowed("/tmp/a/share/f.pdf")).not.toThrow();
+    expect(() => assertPathAllowed("/tmp/a/share-evil/f.pdf")).toThrow(
+      "outside the allowed directories",
+    );
+  });
+
+  test("assertPathAllowed treats / as an allow-everything root", () => {
+    process.env.MD_ALLOWED_PATHS = "/";
+    expect(() => assertPathAllowed("/etc/passwd")).not.toThrow();
+  });
+
+  describe("with symlinks", () => {
+    let tmp: string;
+    let allowedDir: string;
+    let outsideDir: string;
+
+    beforeEach(() => {
+      tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-")));
+      allowedDir = path.join(tmp, "allowed");
+      outsideDir = path.join(tmp, "outside");
+      fs.mkdirSync(allowedDir);
+      fs.mkdirSync(outsideDir);
+      fs.writeFileSync(path.join(allowedDir, "inside.pdf"), "");
+      fs.writeFileSync(path.join(outsideDir, "secret.pdf"), "");
+      process.env.MD_ALLOWED_PATHS = allowedDir;
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    });
+
+    test("rejects a symlink inside the allowed dir pointing outside it", () => {
+      const link = path.join(allowedDir, "link.pdf");
+      fs.symlinkSync(path.join(outsideDir, "secret.pdf"), link);
+      expect(() => assertPathAllowed(link)).toThrow(
+        "outside the allowed directories",
+      );
+    });
+
+    test("rejects a not-yet-existing file under a symlinked dir pointing outside", () => {
+      const dirLink = path.join(allowedDir, "escape");
+      fs.symlinkSync(outsideDir, dirLink);
+      expect(() => assertPathAllowed(path.join(dirLink, "new.pdf"))).toThrow(
+        "outside the allowed directories",
+      );
+    });
+
+    test("accepts a symlink pointing to a file inside the allowed dir", () => {
+      const link = path.join(allowedDir, "alias.pdf");
+      fs.symlinkSync(path.join(allowedDir, "inside.pdf"), link);
+      expect(() => assertPathAllowed(link)).not.toThrow();
+    });
+
+    test("accepts files when the allowed dir itself is reached via a symlink", () => {
+      const allowedLink = path.join(tmp, "allowed-link");
+      fs.symlinkSync(allowedDir, allowedLink);
+      process.env.MD_ALLOWED_PATHS = allowedLink;
+      expect(() =>
+        assertPathAllowed(path.join(allowedDir, "inside.pdf")),
+      ).not.toThrow();
+    });
   });
 });
