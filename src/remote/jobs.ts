@@ -6,7 +6,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Converter, createConverter } from "./converter.js";
 import { quotaKey, validatePrincipal, type Principal, type QuotaOverride } from "./identity.js";
-import { checkRuntime, MAX_TIMER_MS, type RuntimeHealth } from "./health.js";
+import { checkRuntime, HEALTH_TIMEOUT_MS, MAX_TIMER_MS, type RuntimeHealth } from "./health.js";
 import { prepareMarkdownIndex, readMarkdownPage } from "./markdown.js";
 import { acquireLock, releaseLock } from "./lock.js";
 
@@ -15,7 +15,9 @@ export { ServiceError } from "./errors.js";
 export type JobStatus = "awaiting_upload" | "uploaded" | "queued" | "running" | "completed" | "failed" | "expired";
 type Job = { tenant_id: string; agent_id: string; id: string; filename: string; extension: string; size_bytes: number; token_hash?: string; upload_auth_hash?: string; status: JobStatus; created_at: string; expires_at: string; error?: string; error_code?: ErrorCode; error_details?: ErrorDetails };
 export type AuditEvent = { event: string; tenant_id: string; agent_id: string; job_id?: string; status?: string; reason?: string };
-export type JobServiceOptions = { dataDir: string; maxUploadBytes: number; maxStorageBytes: number; maxJobs: number; retentionMs: number; uploadTtlMs: number; conversionTimeoutMs: number; maxOutputBytes: number; concurrency: number; converter?: Converter; legacyOwner?: Principal; maxTenantJobs?: number; maxTenantStorageBytes?: number; maxTenantConcurrency?: number; maxAgentJobs?: number; maxAgentStorageBytes?: number; maxAgentConcurrency?: number; healthTimeoutMs?: number; quotaOverrides?: ReadonlyMap<string, QuotaOverride>; audit?: (event: AuditEvent) => void | Promise<void> };
+/** An audit callback, optionally with a probe that checks writability without writing a record (see createAuditLogger). */
+export type AuditSink = ((event: AuditEvent) => void | Promise<void>) & { probe?: () => Promise<void> };
+export type JobServiceOptions = { dataDir: string; maxUploadBytes: number; maxStorageBytes: number; maxJobs: number; retentionMs: number; uploadTtlMs: number; conversionTimeoutMs: number; maxOutputBytes: number; concurrency: number; converter?: Converter; legacyOwner?: Principal; maxTenantJobs?: number; maxTenantStorageBytes?: number; maxTenantConcurrency?: number; maxAgentJobs?: number; maxAgentStorageBytes?: number; maxAgentConcurrency?: number; healthTimeoutMs?: number; quotaOverrides?: ReadonlyMap<string, QuotaOverride>; audit?: AuditSink };
 const extensions = new Set([".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".md", ".csv", ".html", ".json"]);
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const tokenHash = (principal: Principal, id: string, tokenDigest: string) => hash(`${principal.tenantId}:${principal.agentId}:${id}:${tokenDigest}`);
@@ -40,6 +42,22 @@ export class JobService {
   private cleanupStats = { last_started_at: null as string | null, last_finished_at: null as string | null, failures_total: 0, consecutive_failed_sweeps: 0, last_error_code: null as string | null };
   private cleanupPending = new Set<string>();
   private failedLastSweep = new Set<string>();
+  /**
+   * Audit availability for readiness: true from the last failed write until the next successful write or recovery probe.
+   * auditSettled counts settled writes so a probe that overlaps a write cannot overwrite the write's newer verdict.
+   */
+  private auditFailing = false;
+  private auditSettled = 0;
+  private auditProbe?: { until: number; result: Promise<void> };
+  /**
+   * Read-audit coalescing. Polling is expected (SKILL.md), so read_status and read_markdown are recorded only on the
+   * first successful audit of each (event, job status) pair per job: a poll loop yields at most one record per state it
+   * observes. Keyed on job ID, which has exactly one immutable owner checked by owned() first, so this is per (owner, job).
+   * Bounded: at most 2 events x 7 statuses per job, only for jobs in this.jobs, dropped by forget() on deletion and
+   * tombstone removal. In memory only, so the first read per state after a restart is recorded again.
+   * authorization_denied, quota_denied and every mutation/lifecycle event are never coalesced.
+   */
+  private auditedReads = new Map<string, Set<string>>();
   constructor(private options: JobServiceOptions) {
     for (const [name, value] of Object.entries(options)) {
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`Invalid ${name}`);
@@ -72,14 +90,44 @@ export class JobService {
     try { validatePrincipal(principal); } catch { throw new ServiceError(401, "Invalid principal"); }
   }
   private async audit(event: string, principal: Principal, id?: string, status?: string, reason?: string) {
-    try { await this.options.audit?.({ event, tenant_id: principal.tenantId, agent_id: principal.agentId, ...(id && /^[0-9a-f-]{36}$/.test(id) ? { job_id: id } : {}), ...(status ? { status } : {}), ...(reason ? { reason } : {}) }); }
-    catch { throw new ServiceError(503, "Audit unavailable"); }
+    if (!this.options.audit) return;
+    try { await this.options.audit({ event, tenant_id: principal.tenantId, agent_id: principal.agentId, ...(id && /^[0-9a-f-]{36}$/.test(id) ? { job_id: id } : {}), ...(status ? { status } : {}), ...(reason ? { reason } : {}) }); }
+    catch { this.auditSettled++; this.auditFailing = true; throw new ServiceError(503, "Audit unavailable"); }
+    this.auditSettled++; this.auditFailing = false;
+  }
+  /** Coalesced read audit; see auditedReads. Called under the job lock after owned(), so checks and marks cannot race. */
+  private async auditRead(event: "read_status" | "read_markdown", principal: Principal, job: Job) {
+    const key = `${event}:${job.status}`;
+    if (this.auditedReads.get(job.id)?.has(key)) return;
+    await this.audit(event, principal, job.id, job.status);
+    // Mark only after a successful write, so a read that failed with 503 is recorded on its retry.
+    if (!this.jobs.has(job.id)) return;
+    const seen = this.auditedReads.get(job.id) ?? new Set<string>();
+    seen.add(key); this.auditedReads.set(job.id, seen);
+  }
+  /**
+   * While the last audit write failed, readiness runs the sink's non-writing probe (shared in flight, at most one per
+   * two seconds, bounded by the health timeout) so a replica drained by its own readiness can recover without traffic.
+   * Without a probe, only the next successful write clears the failure.
+   */
+  private async recoverAudit() {
+    const probe = this.options.audit?.probe;
+    if (!this.auditFailing || !probe) return;
+    if (!this.auditProbe || this.auditProbe.until <= Date.now()) {
+      const settled = this.auditSettled;
+      const result = Promise.resolve().then(() => probe.call(this.options.audit)).then(() => { if (this.auditSettled === settled) this.auditFailing = false; }, () => undefined)
+        .finally(() => { if (this.auditProbe?.result === result) this.auditProbe.until = Date.now() + 2000; });
+      this.auditProbe = { until: Infinity, result };
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([this.auditProbe.result, new Promise<void>(resolve => { timer = setTimeout(resolve, this.options.healthTimeoutMs ?? HEALTH_TIMEOUT_MS); })]);
+    clearTimeout(timer);
   }
   private async internalAudit(event: string, job: Job) {
     try { await this.audit(event, { tenantId: job.tenant_id, agentId: job.agent_id }, job.id, job.status); }
     catch { console.error("Job audit unavailable", event, job.id); }
   }
-  private forget(id: string) { this.jobs.delete(id); this.cleanupPending.delete(id); this.failedLastSweep.delete(id); }
+  private forget(id: string) { this.jobs.delete(id); this.cleanupPending.delete(id); this.failedLastSweep.delete(id); this.auditedReads.delete(id); }
   private async owned(principal: Principal, id: string) {
     this.validPrincipal(principal);
     const job = this.jobs.get(id);
@@ -277,7 +325,7 @@ export class JobService {
     await this.owned(principal, id);
     return this.locked(id, async () => {
       const job = await this.owned(principal, id); this.available(job);
-      await this.audit("read_status", principal, id, job.status);
+      await this.auditRead("read_status", principal, job);
       return { job_id: id, filename: job.filename, status: job.status, created_at: job.created_at, expires_at: job.expires_at, ...(job.error ? { error: job.error, error_info: { ...lookupError(job.error_code ?? legacyCode(job.error)), ...(job.error_details ? { details: job.error_details } : {}) } } : {}) };
     });
   }
@@ -286,7 +334,7 @@ export class JobService {
     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(max_chars) || max_chars < 1 || max_chars > 100_000) throw new ServiceError(400, "Invalid pagination parameters");
     return this.locked(id, async () => {
       const job = await this.owned(principal, id); this.available(job);
-      await this.audit("read_markdown", principal, id, job.status);
+      await this.auditRead("read_markdown", principal, job);
       if (job.status !== "completed") throw new ServiceError(409, "Markdown is not ready");
       try { return await readMarkdownPage(path.join(this.dir(id), "output.md"), { offset, max_chars }); }
       catch (error) { if (error instanceof RangeError) throw new ServiceError(400, "Offset exceeds Markdown length"); throw error; }
@@ -415,11 +463,13 @@ export class JobService {
       });
       this.healthCache = { until: Infinity, result };
     }
-    const runtime = await this.healthCache.result;
-    const ready = this.initialized && !this.closing && runtime.storage.writable && runtime.converter.available;
+    const [runtime] = await Promise.all([this.healthCache.result, this.recoverAudit()]);
+    // Read after the probe; never writes an audit record. A service without an audit sink has nothing that can fail.
+    const audit = { available: !this.auditFailing };
+    const ready = this.initialized && !this.closing && runtime.storage.writable && runtime.converter.available && audit.available;
     const base = { status: ready ? "ok" : "unavailable", ready, checked_at: runtime.checked_at,
       uptime_seconds: Math.floor(process.uptime()), memory_rss_bytes: process.memoryUsage().rss,
-      checks: { initialized: this.initialized, accepting_work: !this.closing, storage: runtime.storage, converter: runtime.converter } };
+      checks: { initialized: this.initialized, accepting_work: !this.closing, storage: runtime.storage, converter: runtime.converter, audit } };
     if (!principal) return base;
     const mine = [...this.jobs.values()].filter(j => j.tenant_id === principal.tenantId && j.agent_id === principal.agentId);
     const states = Object.fromEntries(["awaiting_upload", "uploaded", "queued", "running", "completed", "failed", "expired"].map(s => [s, mine.filter(j => j.status === s).length]));
@@ -440,8 +490,8 @@ export class JobService {
 
   /** Unauthenticated readiness verdict: booleans only, no capacity/process metrics. */
   async publicHealth() {
-    const { status, ready, checks: { initialized, accepting_work, storage, converter } } = await this.health();
-    return { status, ready, checks: { initialized, accepting_work, storage: { writable: storage.writable }, converter: { available: converter.available } } };
+    const { status, ready, checks: { initialized, accepting_work, storage, converter, audit } } = await this.health();
+    return { status, ready, checks: { initialized, accepting_work, storage: { writable: storage.writable }, converter: { available: converter.available }, audit: { available: audit.available } } };
   }
 
   async close() {

@@ -35,7 +35,7 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
       if (!probe && (!request.headers.host || !hosts.has(request.headers.host.toLowerCase()))) { reply(response, 403, "Host not allowed"); return; }
       if (!probe && request.headers.origin && request.headers.origin !== publicUrl.origin) { reply(response, 403, "Origin not allowed"); return; }
       if (url.search) { reply(response, 400, "Query parameters are not supported"); return; }
-      // /livez (and legacy /healthz) is liveness only; /readyz gates traffic on storage/converter/lifecycle.
+      // /livez (and legacy /healthz) is liveness only; /readyz gates traffic on storage/converter/audit/lifecycle.
       if (probe) {
         if (request.method !== "GET" && request.method !== "HEAD") { response.setHeader("Allow", "GET, HEAD"); reply(response, 405, "Method not allowed"); return; }
         const health = url.pathname === "/readyz" ? await service.publicHealth() : undefined;
