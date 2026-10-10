@@ -61,7 +61,7 @@ test("health measures storage, omits foreign usage, and fails readiness during s
   expect(ready.status).toBe(200);
   const body = await ready.json();
   for (const v of [body.free_bytes, body.checks.storage.free_bytes, body.memory_rss_bytes, body.uptime_seconds, body.checked_at, body.own_jobs]) expect(v).toBeUndefined();
-  expect(body).toEqual({ status: "ok", ready: true, checks: { initialized: true, accepting_work: true, storage: { writable: true }, converter: { available: true } } });
+  expect(body).toEqual({ status: "ok", ready: true, checks: { initialized: true, accepting_work: true, storage: { writable: true }, converter: { available: true }, audit: { available: true } } });
   expect((await fs.readdir(f.dataDir)).some(n => n.startsWith(".health-"))).toBe(false);
   await f.service.close();
   const notReady = await probe("/readyz");
@@ -158,7 +158,7 @@ test("hung storage probe reports 503 within the bound and a later probe retries"
     const [a, b] = await Promise.all([ready(), ready()]);
     expect(performance.now() - started).toBeLessThan(2000);
     expect([a.status, b.status]).toEqual([503, 503]); expect(calls).toBe(1);
-    expect((await a.json()).checks).toEqual({ initialized: true, accepting_work: true, storage: { writable: false }, converter: { available: true } });
+    expect((await a.json()).checks).toEqual({ initialized: true, accepting_work: true, storage: { writable: false }, converter: { available: true }, audit: { available: true } });
     expect((await ready()).status).toBe(503); expect(calls).toBe(1);
     // Expiring the response cache must not start more work on the hung mount.
     for (let i = 0; i < 3; i++) {
@@ -234,7 +234,7 @@ test("hung converter-executable search also reports 503 within the bound", async
     expect(performance.now() - started).toBeLessThan(2000);
     expect(r.status).toBe(503); expect(calls).toBe(1);
     // Only the converter search hung, so the settled storage check keeps its writable result.
-    expect((await r.json()).checks).toEqual({ initialized: true, accepting_work: true, storage: { writable: true }, converter: { available: false } });
+    expect((await r.json()).checks).toEqual({ initialized: true, accepting_work: true, storage: { writable: true }, converter: { available: false }, audit: { available: true } });
     release();
     await new Promise(r => setTimeout(r, 20));
     setSystemTime(new Date(Date.now() + 2100));
@@ -271,9 +271,9 @@ test("readyz 503 body stays minimal after shutdown", async () => {
   expect(response.status).toBe(503);
   const body = await response.json();
   expect(Object.keys(body).sort()).toEqual(["checks", "ready", "status"]);
-  expect(Object.keys(body.checks).sort()).toEqual(["accepting_work", "converter", "initialized", "storage"]);
+  expect(Object.keys(body.checks).sort()).toEqual(["accepting_work", "audit", "converter", "initialized", "storage"]);
   expect(body.checks.storage).toEqual({ writable: true }); expect(body.checks.converter).toEqual({ available: true });
-  expect(body).toEqual({ status: "unavailable", ready: false, checks: { initialized: true, accepting_work: false, storage: { writable: true }, converter: { available: true } } });
+  expect(body).toEqual({ status: "unavailable", ready: false, checks: { initialized: true, accepting_work: false, storage: { writable: true }, converter: { available: true }, audit: { available: true } } });
   for (const key of ["free_bytes", "uptime_seconds", "memory_rss_bytes", "checked_at", "own_jobs"]) expect(JSON.stringify(body)).not.toContain(key);
 });
 test("livez stays 200 while readyz is 503 for unwritable storage or a missing converter", async () => {
@@ -314,8 +314,8 @@ test("readiness is false before init() and flips to true after it", async () => 
   expect(ready.status).toBe(200); expect((await ready.json()).checks.initialized).toBe(true);
   expect((await f.request({ jsonrpc: "2.0", id: 2, method: "ping" })).status).toBe(200);
 });
-test("audit sink failure does not affect readiness today but fails closed on audited operations", async () => {
-  // Documents current behaviour: readiness does not reflect audit availability (tracked separately).
+test("audit sink failure fails closed on audited operations without disclosing the cause", async () => {
+  // Readiness is unaffected until a write fails; the failed-write readiness verdict is covered in audit-policy.test.ts.
   const f = await fixture(true, { audit: async () => { throw new Error("disk full"); } });
   const principal = { tenantId: "a", agentId: "a" };
   expect((await f.service.health(principal)).ready).toBe(true);
