@@ -1,12 +1,17 @@
 import {
   expect,
   test,
+  describe,
   mock,
   spyOn,
   beforeAll,
   afterAll,
+  beforeEach,
+  afterEach,
 } from "bun:test";
 import { Markdownify, MarkdownResult } from "./Markdownify";
+import { download } from "./download";
+import dns from "node:dns";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -91,13 +96,12 @@ test("Markdownify.toMarkdown converts image file to Markdown", async () => {
 test("Markdownify.toMarkdown converts URL content to Markdown", async () => {
   const testUrl = "https://example.com";
   const html = "<h1>Example Domain</h1>";
-  const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
-    (() =>
-      Promise.resolve({
-        arrayBuffer: () =>
-          Promise.resolve(new TextEncoder().encode(html).buffer),
-      })) as any,
-  );
+  const mockFetch = mock(() => Promise.resolve(new Response(html)));
+  const original = download.fetch;
+  download.fetch = mockFetch as any;
+  const lookupSpy = spyOn(dns.promises, "lookup").mockResolvedValue([
+    { address: "93.184.215.14", family: 4 },
+  ] as any);
 
   try {
     const result = await Markdownify.toMarkdown({ url: testUrl });
@@ -105,8 +109,172 @@ test("Markdownify.toMarkdown converts URL content to Markdown", async () => {
     expect(result).toBeDefined();
     expect(result.text).toContain("# Example Domain");
   } finally {
-    fetchSpy.mockRestore();
+    download.fetch = original;
+    lookupSpy.mockRestore();
   }
+});
+
+describe("Markdownify.safeFetch", () => {
+  const safeFetch = (url: string) => Markdownify["safeFetch"](url);
+  let lookupSpy: ReturnType<typeof spyOn>;
+  let originalFetch: typeof download.fetch;
+
+  // Install a fresh fetch stub per test (rather than spying on whatever an
+  // earlier test left in global.fetch) and put the previous one back after.
+  const stubFetch = (impl: (url: string) => Promise<Response>) => {
+    const stub = mock(impl);
+    download.fetch = stub as unknown as typeof download.fetch;
+    return stub;
+  };
+
+  beforeEach(() => {
+    originalFetch = download.fetch;
+    lookupSpy = spyOn(dns.promises, "lookup").mockResolvedValue([
+      { address: "93.184.215.14", family: 4 },
+    ] as any);
+  });
+
+  afterEach(() => {
+    download.fetch = originalFetch;
+    lookupSpy.mockRestore();
+  });
+
+  const redirect = (location?: string) =>
+    new Response(null, {
+      status: 302,
+      headers: location ? { location } : {},
+    });
+
+  test("rejects a redirect to the cloud metadata address", async () => {
+    const fetchStub = stubFetch(async () =>
+      redirect("http://169.254.169.254/latest/meta-data/"),
+    );
+    await expect(safeFetch("https://example.com/")).rejects.toThrow(
+      "potentially dangerous",
+    );
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+  });
+
+  test("follows up to 10 redirects", async () => {
+    let calls = 0;
+    const fetchStub = stubFetch(async () =>
+      ++calls <= 10 ? redirect(`/hop-${calls}`) : new Response("ok"),
+    );
+    const response = await safeFetch("https://example.com/");
+    expect(await response.text()).toBe("ok");
+    expect(fetchStub).toHaveBeenCalledTimes(11);
+  });
+
+  test("gives up after too many redirects", async () => {
+    const fetchStub = stubFetch(async () => redirect("/again"));
+    await expect(safeFetch("https://example.com/")).rejects.toThrow(
+      "Too many redirects",
+    );
+    expect(fetchStub).toHaveBeenCalledTimes(11);
+  });
+
+  test("resolves a relative Location against the current URL", async () => {
+    const fetchStub = stubFetch(async (url) =>
+      url === "https://example.com/a/b"
+        ? redirect("../c?x=1")
+        : new Response("done"),
+    );
+    await safeFetch("https://example.com/a/b");
+    expect(fetchStub.mock.calls.map((call) => call[0])).toEqual([
+      "https://example.com/a/b",
+      "https://example.com/c?x=1",
+    ]);
+  });
+
+  test("returns a 3xx response without a Location header as-is", async () => {
+    stubFetch(async () => redirect());
+    const response = await safeFetch("https://example.com/");
+    expect(response.status).toBe(302);
+  });
+
+  test("throws on an HTTP error status", async () => {
+    stubFetch(
+      async () =>
+        new Response("boom", {
+          status: 500,
+          statusText: "Internal Server Error",
+        }),
+    );
+    await expect(safeFetch("https://example.com/")).rejects.toThrow(
+      "failed with HTTP 500 Internal Server Error",
+    );
+  });
+
+  test("does not echo a redirect target's query string in HTTP errors", async () => {
+    stubFetch(async (url) =>
+      url === "https://example.com/file"
+        ? redirect("https://bucket.example.com/f.pdf?X-Amz-Signature=secret")
+        : new Response("denied", { status: 403, statusText: "Forbidden" }),
+    );
+    const error = await safeFetch("https://example.com/file").catch(
+      (e: Error) => e,
+    );
+    expect((error as Error).message).toBe(
+      "Fetching https://bucket.example.com/f.pdf failed with HTTP 403 Forbidden",
+    );
+  });
+
+  test("rejects a redirect to a URL with embedded credentials", async () => {
+    stubFetch(async () => redirect("https://admin:pw@example.com/"));
+    await expect(safeFetch("https://example.com/")).rejects.toThrow(
+      "URLs with embedded credentials are not allowed.",
+    );
+  });
+
+  test("passes validated addresses and a deadline to the pinned transport", async () => {
+    const fetchStub = stubFetch(async () => new Response("ok"));
+    await safeFetch("https://example.com/");
+    const args = fetchStub.mock.calls[0] as unknown[];
+    expect(args[1]).toEqual([{ address: "93.184.215.14", family: 4 }]);
+    expect(args[2]).toBeInstanceOf(AbortSignal);
+    expect(lookupSpy).toHaveBeenCalledTimes(1);
+  });
+  test("hung DNS lookup stops at the whole-exchange deadline without connecting", async () => {
+    lookupSpy.mockImplementation(() => new Promise(() => {}));
+    const fetchStub = stubFetch(async () => new Response("unexpected"));
+    const start = performance.now();
+    await expect(Markdownify["safeFetch"]("https://example.com", 10, 20)).rejects.toThrow();
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+});
+
+describe("Markdownify.readBodyWithLimit", () => {
+  const readBodyWithLimit = (response: Response, maxBytes?: number) =>
+    Markdownify["readBodyWithLimit"](response, maxBytes);
+
+  test("returns the body when it fits", async () => {
+    const body = await readBodyWithLimit(new Response("hello"), 5);
+    expect(body.toString()).toBe("hello");
+  });
+
+  test("rejects a declared Content-Length over the limit", async () => {
+    const response = new Response("x", {
+      headers: { "content-length": String(51 * 1024 * 1024) },
+    });
+    await expect(readBodyWithLimit(response)).rejects.toThrow(
+      "download limit",
+    );
+  });
+
+  test("aborts a streamed body once it passes the limit", async () => {
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls++;
+        controller.enqueue(new Uint8Array(4));
+      },
+    });
+    await expect(readBodyWithLimit(new Response(stream), 10)).rejects.toThrow(
+      "download limit",
+    );
+    expect(pulls).toBeLessThan(10);
+  });
 });
 
 test("Markdownify.get retrieves existing Markdown file", async () => {
@@ -142,6 +310,80 @@ test("Markdownify.get throws error for non-existent file", async () => {
     "File does not exist",
   );
 });
+
+describe("Markdownify.get with a ~ path", () => {
+  let home: string;
+  let homedirSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-home-"));
+    // Bun caches os.homedir() at startup, so stub it rather than setting HOME.
+    homedirSpy = spyOn(os, "homedir").mockReturnValue(home);
+  });
+
+  afterEach(() => {
+    homedirSpy.mockRestore();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test("reads a Markdown file under the home directory", async () => {
+    fs.writeFileSync(path.join(home, "n.md"), "# Notes");
+    const result = await Markdownify.get({ filePath: "~/n.md" });
+    expect(result.text).toBe("# Notes");
+    expect(result.path).toBe("~/n.md");
+  });
+
+  test("rejects a non-Markdown file before touching the filesystem", async () => {
+    const existsSpy = spyOn(fs, "existsSync");
+    try {
+      await expect(Markdownify.get({ filePath: "~/x.txt" })).rejects.toThrow(
+        "Required file is not a Markdown file.",
+      );
+      expect(existsSpy).not.toHaveBeenCalled();
+    } finally {
+      existsSpy.mockRestore();
+    }
+  });
+
+  test("reports a missing file", async () => {
+    await expect(Markdownify.get({ filePath: "~/missing.md" })).rejects.toThrow(
+      "File does not exist",
+    );
+  });
+});
+
+test("Markdownify.toMarkdown explains a missing markitdown executable", async () => {
+  const saved = process.env.MARKITDOWN_PATH;
+  process.env.MARKITDOWN_PATH = path.join(tempDir, "no-such-markitdown");
+  try {
+    await expect(
+      Markdownify.toMarkdown({ filePath: path.join(sampleDataDir, "test.pdf") }),
+    ).rejects.toThrow("markitdown executable not found");
+  } finally {
+    if (saved === undefined) delete process.env.MARKITDOWN_PATH;
+    else process.env.MARKITDOWN_PATH = saved;
+  }
+});
+
+test.skipIf(process.platform === "win32")(
+  "Markdownify.fromRepo reports empty repomix output",
+  async () => {
+    const saved = process.env.REPOMIX_PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-repomix-"));
+    const stub = path.join(dir, "repomix");
+    fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    process.env.REPOMIX_PATH = stub;
+    try {
+      await expect(
+        Markdownify.fromRepo({ repoUrl: "octocat/Hello-World" }),
+      ).rejects.toThrow("repomix produced no output");
+    } finally {
+      if (saved === undefined) delete process.env.REPOMIX_PATH;
+      else process.env.REPOMIX_PATH = saved;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 networkTest("Markdownify.fromRepo converts a git repo to markdown via shorthand", async () => {
   const result = await Markdownify.fromRepo({

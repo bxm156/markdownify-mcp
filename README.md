@@ -330,6 +330,8 @@ CI tests every push and PR, including real PDF/Office conversions, Docker builds
 
 The upstream local stdio entry point remains `dist/index.js` (`bun start`) with local-path and web conversion tools. It is separate from the remote `dist/remote/index.js` service and its seven remote tools. Local mode needs its own Python/dependency setup; the original `Dockerfile` builds stdio mode, while `Dockerfile.remote` builds the service documented here.
 
+URL conversion in stdio mode (`webpage-to-markdown` and the other URL tools) accepts only `http:`/`https:` URLs without embedded credentials. It resolves the hostname and refuses loopback, private, link-local, unique-local and cloud-metadata addresses, then connects only to the addresses it checked (re-checking every redirect hop, up to 10). Each download has a 30-second deadline covering DNS, redirects and the body, and a 50 MiB cap on the decompressed body. Because the connection is pinned to the checked address, **`HTTPS_PROXY`/`HTTP_PROXY` are not used** for these downloads; the server prints a one-line note on stderr at startup when they are set. Run it where the target sites are directly reachable.
+
 ## Further documentation
 
 Documentation site: [bxm156.github.io/markdownify-mcp](https://bxm156.github.io/markdownify-mcp/) renders these pages with search. Preview it locally with `python -m venv .venv && . .venv/bin/activate && pip install -r docs/requirements.txt && mkdocs serve`.
