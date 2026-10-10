@@ -294,7 +294,7 @@ describe("agent isolation and tenant budgets", () => {
     const user = { tenantId: "user-1", agentId: "user-1" };
     for (const [caps, scope] of [[{ maxTenantJobs: 5, maxAgentJobs: 2 }, "agent"], [{ maxTenantJobs: 2, maxAgentJobs: 5 }, "tenant"]] as const) {
       const { instance } = await service({ maxJobs: 10, ...caps });
-      const limits = (await instance.health(user)).limits;
+      const limits = (await instance.health(user) as any).limits;
       expect([limits.tenant_jobs, limits.agent_jobs]).toEqual([caps.maxTenantJobs, caps.maxAgentJobs]);
       await instance.createUpload(user, { filename: "a.txt", size_bytes: 1 }); await instance.createUpload(user, { filename: "b.txt", size_bytes: 1 });
       const denied = await instance.createUpload(user, { filename: "c.txt", size_bytes: 1 }).catch(e => e);

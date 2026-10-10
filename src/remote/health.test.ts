@@ -104,7 +104,7 @@ test("slow readiness probes remain single-flight and cache TTL starts after comp
   const original = fs.statfs;
   let release!: () => void, calls = 0;
   const gate = new Promise<void>(resolve => { release = resolve; });
-  const probe = spyOn(fs, "statfs").mockImplementation(async (target: any) => {
+  const probe = spyOn(fs, "statfs").mockImplementation(async (target: any): Promise<any> => {
     calls++;
     await gate;
     return original(target);
@@ -151,7 +151,7 @@ test("hung storage probe reports 503 within the bound and a later probe retries"
   const original = fs.statfs;
   let release!: () => void, calls = 0;
   const gate = new Promise<void>(resolve => { release = resolve; });
-  const probe = spyOn(fs, "statfs").mockImplementation(async (target: any) => { calls++; await gate; return original(target); });
+  const probe = spyOn(fs, "statfs").mockImplementation(async (target: any): Promise<any> => { calls++; await gate; return original(target); });
   const ready = () => fetch(f.base + "/readyz", { headers: { Host: "127.0.0.1" } });
   try {
     const started = performance.now();

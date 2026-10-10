@@ -102,7 +102,7 @@ process.stdout.write(JSON.stringify(ids)+'\\n');`);
     const blocked = scope === "global" ? carol : scope === "tenant" ? bob : alice;
     await expect(instance.createUpload(blocked, { filename: "blocked.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 507 });
     expect(await fs.stat(path.join(options.dataDir, id, "output.md.index.json")).then(value => value.isFile())).toBe(true);
-    await eventually(async () => { await instance.cleanup(); return fs.readdir(path.join(options.dataDir, id)).catch(() => []); }, files => !files.includes("output.md"), "expiration cleanup");
+    await eventually(async () => { await instance.cleanup(); return fs.readdir(path.join(options.dataDir, id)).catch((): string[] => []); }, files => !files.includes("output.md"), "expiration cleanup");
     await expect(fs.stat(path.join(options.dataDir, id, "input.txt"))).rejects.toThrow();
     await expect(fs.stat(path.join(options.dataDir, id, "output.md.index.json"))).rejects.toThrow();
     const replacement = await instance.createUpload(blocked, { filename: "replacement.txt", size_bytes: 1 });

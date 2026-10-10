@@ -103,7 +103,7 @@ function requestVia(
       }
       const status = response.statusCode ?? 500;
       const hasBody = !NO_BODY_STATUSES.includes(status);
-      resolve(new Response(hasBody ? (Readable.toWeb(body) as ReadableStream<Uint8Array>) : null, {
+      resolve(new Response(hasBody ? (Readable.toWeb(body) as unknown as ReadableStream<Uint8Array>) : null, {
         status,
         statusText: response.statusMessage,
         headers,

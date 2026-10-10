@@ -17,6 +17,15 @@ jobs:
         with:
           python-version: '3.12'
       - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Type-check tests, scripts and examples
+        run: bun run typecheck
+      - name: Reject bare assert in Python scripts (python -O strips them)
+        shell: bash
+        run: |
+          if grep -nE '^\s*assert ' scripts/*.py; then
+            echo '::error::Use an explicit raise instead of assert in scripts/*.py' >&2
+            exit 1
+          fi
       - run: bun run build:remote
       - run: bun test src/remote
       - run: python -m pip install 'markitdown[pdf,docx,xlsx,pptx]==0.1.5'
@@ -33,6 +42,9 @@ jobs:
         run: |
           python -m pip install 'litellm[mcp]==1.104.0'
           python scripts/litellm-health-smoke.py
+          python -O scripts/litellm-health-smoke.py
+      - name: Verify LiteLLM health smoke rejects 403, 500, timeout and unexpected success
+        run: python -O scripts/litellm_health_smoke_test.py
       - run: docker build -f Dockerfile.remote -t markdownify-remote:ci .
       - name: Verify container HTTP upload workflow
         shell: bash
@@ -43,19 +55,13 @@ jobs:
           trap 'docker rm -f -v markdownify-ci >/dev/null 2>&1 || true' EXIT
           docker run -d --name markdownify-ci -p 127.0.0.1:8000:8000 \
             -e MD_API_KEY -e MD_PUBLIC_BASE_URL=http://localhost:8000 markdownify-remote:ci
-          ready=0
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent --max-time 1 http://localhost:8000/readyz >/dev/null; then
-              ready=1
-              break
-            fi
-            sleep 1
-          done
-          if [ "$ready" -ne 1 ]; then
-            docker logs markdownify-ci
-            exit 1
-          fi
+          bash scripts/wait-for-container.sh markdownify-ci
           MCP_TOKEN="$MD_API_KEY" bun scripts/remote-http-smoke.ts
+          # The documented streaming helper (also shipped in the image) against the same container.
+          example_output="$RUNNER_TEMP/upload-and-convert.md"
+          MCP_TOKEN="$MD_API_KEY" CONVERSION_DEADLINE_MS=120000 \
+            bun examples/upload-and-convert.ts src/sample-data/test.pdf "$example_output"
+          grep -q 'Test PDF content' "$example_output"
       - name: Prepare disposable agent registry
         run: bun scripts/create-test-agent-registry.ts "$RUNNER_TEMP/markdownify-agents.json" "$GITHUB_ENV"
       - name: Verify container agent isolation
@@ -67,16 +73,32 @@ jobs:
             -v "$RUNNER_TEMP/markdownify-agents.json:/run/markdownify-agents.json:ro" \
             -e MD_AUTH_FILE=/run/markdownify-agents.json \
             -e MD_PUBLIC_BASE_URL=http://localhost:8000 markdownify-remote:ci
-          ready=0
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent --max-time 1 http://localhost:8000/readyz >/dev/null; then
-              ready=1
-              break
-            fi
-            sleep 1
-          done
-          if [ "$ready" -ne 1 ]; then
-            docker logs markdownify-agents-ci
-            exit 1
-          fi
+          bash scripts/wait-for-container.sh markdownify-agents-ci
           bun scripts/multitenant-http-smoke.ts
+  stdio-and-compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell script syntax
+        shell: bash
+        run: for f in scripts/*.sh setup.sh; do bash -n "$f"; done
+      - name: Validate compose files
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Compose resolves env_file and bind sources: use the documented examples and a placeholder registry.
+          # .dockerignore excludes .env.* and secrets, so these never reach an image build context.
+          cp .env.remote.example .env.remote
+          cp .env.multitenant.example .env.multitenant
+          cp .env.jwt.example .env.jwt
+          mkdir -p secrets
+          printf '{"credentials":[]}\n' > secrets/agents.json
+          for file in compose.remote.yaml compose.multitenant.yaml compose.jwt.yaml; do
+            echo "Validating $file"
+            docker compose -f "$file" config -q
+          done
+      - name: Build stdio image and convert a PDF over stdio
+        run: bash scripts/docker-smoke-test.sh
+        env:
+          IMAGE: markdownify-mcp:ci
