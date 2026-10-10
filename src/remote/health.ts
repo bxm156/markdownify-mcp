@@ -8,6 +8,14 @@ export type RuntimeHealth = { checked_at: string; storage: { writable: boolean; 
 export const HEALTH_TIMEOUT_MS = 5000;
 /** Largest delay setTimeout honours; Node clamps anything above it to 1 ms. */
 export const MAX_TIMER_MS = 2 ** 31 - 1;
+/** Paths probed for the converter executable: a path is used as given; a bare name is looked up on PATH,
+ * with PATHEXT suffixes on Windows. `env` and `platform` are parameters so both platforms' rules are testable anywhere. */
+export function converterCandidates(exe: string, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string[] {
+  const paths = platform === "win32" ? path.win32 : path.posix;
+  if (paths.isAbsolute(exe) || /[\\/]/.test(exe)) return [exe];
+  const suffixes = platform === "win32" && !paths.extname(exe) ? (env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";") : [""];
+  return (env.PATH ?? "").split(paths.delimiter).filter(Boolean).flatMap(dir => suffixes.map(suffix => paths.join(dir, exe + suffix)));
+}
 const inFlight = new Map<string, Promise<RuntimeHealth>>();
 /** Keep the underlying filesystem work single-flight even after its response deadline. */
 export function checkRuntime(dataDir: string, customConverter: boolean, timeoutMs = HEALTH_TIMEOUT_MS): Promise<RuntimeHealth> {
@@ -37,12 +45,7 @@ async function runRuntime(dataDir: string, customConverter: boolean, timeoutMs: 
   })();
   const converter = (async () => {
     if (customConverter) return;
-    const exe = resolveMarkitdownPath(process.cwd());
-    const candidates = path.isAbsolute(exe) || /[\\/]/.test(exe) ? [exe] : (process.env.PATH ?? "").split(path.delimiter).filter(Boolean).flatMap(dir => {
-      const suffixes = process.platform === "win32" && !path.extname(exe) ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";") : [""];
-      return suffixes.map(suffix => path.join(dir, exe + suffix));
-    });
-    for (const candidate of candidates) {
+    for (const candidate of converterCandidates(resolveMarkitdownPath(process.cwd()))) {
       if (abandoned) return;
       try { if (!(await fs.stat(candidate)).isFile()) continue; await fs.access(candidate, process.platform === "win32" ? constants.F_OK : constants.X_OK); result.converter.available = true; break; } catch {}
     }
