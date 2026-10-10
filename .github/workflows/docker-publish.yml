@@ -26,6 +26,7 @@ jobs:
       - name: Build and test source
         run: |
           bun install --frozen-lockfile --ignore-scripts
+          bun run typecheck
           bun run build:remote
           bun test src/remote
           python -m pip install 'markitdown[pdf,docx,xlsx,pptx]==0.1.5'
@@ -57,12 +58,7 @@ jobs:
             -v "$RUNNER_TEMP/markdownify-agents.json:/run/markdownify-agents.json:ro" \
             -e MD_AUTH_FILE=/run/markdownify-agents.json \
             -e MD_PUBLIC_BASE_URL=http://localhost:8000 markdownify-remote:publish-candidate
-          ready=0
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent --max-time 1 http://localhost:8000/readyz >/dev/null; then ready=1; break; fi
-            sleep 1
-          done
-          if [ "$ready" -ne 1 ]; then docker logs markdownify-publish-test; exit 1; fi
+          bash scripts/wait-for-container.sh markdownify-publish-test
           bun scripts/multitenant-http-smoke.ts
       - name: Check publication configuration
         id: publication
