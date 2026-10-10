@@ -21,8 +21,9 @@ async function* textChunks(output: string, start = 0) {
 async function getIndex(output: string): Promise<Index> {
   const stat = await fs.stat(output);
   try {
-    const cached: Index = JSON.parse(await fs.readFile(indexPath(output), "utf8"));
-    if (cached.version === 1 && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs && Number.isSafeInteger(cached.total_chars) && cached.total_chars >= 0 && Array.isArray(cached.checkpoints) && cached.checkpoints.length === Math.floor(cached.total_chars / stride) + 1 && cached.checkpoints.every((point, i) => point.chars === i * stride && Number.isSafeInteger(point.bytes) && point.bytes >= 0 && point.bytes <= stat.size && (i === 0 ? point.bytes === 0 : point.bytes > cached.checkpoints[i - 1].bytes))) return cached;
+    // Any JSON value may be cached here (null, arrays, null checkpoints): wrong shapes are rebuilt, never thrown.
+    const cached: Index | null = JSON.parse(await fs.readFile(indexPath(output), "utf8"));
+    if (cached !== null && typeof cached === "object" && cached.version === 1 && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs && Number.isSafeInteger(cached.total_chars) && cached.total_chars >= 0 && Array.isArray(cached.checkpoints) && cached.checkpoints.length === Math.floor(cached.total_chars / stride) + 1 && cached.checkpoints.every((point, i) => point !== null && typeof point === "object" && point.chars === i * stride && Number.isSafeInteger(point.bytes) && point.bytes >= 0 && point.bytes <= stat.size && (i === 0 ? point.bytes === 0 : point.bytes > cached.checkpoints[i - 1].bytes))) return cached;
   } catch (error) {
     if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
