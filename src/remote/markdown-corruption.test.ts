@@ -34,7 +34,7 @@ describe("cached index that disagrees with the file", () => {
     const index = await readIndex(file);
     index.checkpoints[1].bytes += 1; // Still increasing and within the file, so it passes shape validation.
     await fs.writeFile(indexOf(file), JSON.stringify(index));
-    await expect(readMarkdownPage(file, { offset: 4096, max_chars: 3 })).rejects.toThrow();
+    await expect(readMarkdownPage(file, { offset: 4096, max_chars: 3 })).rejects.toMatchObject({ name: "TypeError", code: "ERR_ENCODING_INVALID_ENCODED_DATA" });
   });
 });
 

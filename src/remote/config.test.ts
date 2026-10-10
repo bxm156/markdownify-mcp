@@ -29,7 +29,7 @@ describe("remote configuration", () => {
   });
   test("rejects credential-bearing and non-origin URLs", () => {
     for (const value of ["https://user:pass@example.com", "file:///tmp/test", "https://example.com/path", "https://example.com?token=x"]) {
-      expect(() => loadConfig({ ...env, MD_PUBLIC_BASE_URL: value })).toThrow();
+      expect(() => loadConfig({ ...env, MD_PUBLIC_BASE_URL: value }), value).toThrow("MD_PUBLIC_BASE_URL must be an HTTP(S) origin without credentials, query or path");
     }
   });
 });

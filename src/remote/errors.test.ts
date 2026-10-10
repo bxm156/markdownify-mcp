@@ -1,10 +1,11 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { JobService, type JobServiceOptions } from "./jobs.js";
 import { errorResponse, lookupError } from "./errors.js";
+import { waitFor } from "./test-helpers.js";
 const actor = { tenantId: "t", agentId: "a" };
 const instances: JobService[] = [], dirs: string[] = [];
 afterEach(async () => { await Promise.all(instances.splice(0).map(s => s.close())); await Promise.all(dirs.splice(0).map(d => fs.rm(d, { recursive: true, force: true }))); });
@@ -45,20 +46,13 @@ test("real subprocess output limit remains distinct and persisted across restart
   await service.close();
   const custom = new JobService({ ...options, converter: async (_input, output) => { await fs.writeFile(output, "x".repeat(20)); } }); instances.push(custom); await custom.init();
   const job = await custom.createUpload(actor, { filename: "x.txt", size_bytes: 1 }); await custom.upload(actor, job.upload_id, job.upload_token, Readable.from(["x"])); await custom.startConversion(actor, job.upload_id);
-  let status; for (let i = 0; i < 100; i++) { status = await custom.getStatus(actor, job.upload_id); if (status.status === "failed") break; await new Promise(r => setTimeout(r, 10)); }
-  expect(status?.error_info).toMatchObject({ code: "OUTPUT_LIMIT_EXCEEDED", retryable: false, details: { limit_bytes: 10 } });
+  const status = await waitFor(async () => { const current = await custom.getStatus(actor, job.upload_id); return current.status === "failed" && current; }, { label: "output-limit failure" });
+  expect(status.error_info).toMatchObject({ code: "OUTPUT_LIMIT_EXCEEDED", retryable: false, details: { limit_bytes: 10 } });
   await custom.close(); const restarted = new JobService(options); instances.push(restarted); await restarted.init();
-  expect((await restarted.getStatus(actor, job.upload_id)).error_info).toEqual(status?.error_info);
+  expect((await restarted.getStatus(actor, job.upload_id)).error_info).toEqual(status.error_info);
 });
 
-async function failedStatus(service: JobService, id: string) {
-  for (let i = 0; i < 200; i++) {
-    const status = await service.getStatus(actor, id);
-    if (status.status === "failed") return status;
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-  throw new Error("Conversion did not fail");
-}
+const failedStatus = (service: JobService, id: string) => waitFor(async () => { const status = await service.getStatus(actor, id); return status.status === "failed" && status; }, { timeoutMs: 3000, label: "conversion failure" });
 async function startTestJob(service: JobService) {
   const job = await service.createUpload(actor, { filename: "x.txt", size_bytes: 1 });
   await service.upload(actor, job.upload_id, job.upload_token, Readable.from(["x"]));
@@ -70,7 +64,14 @@ test("shutdown cancellation stays cancelled when cleanup crosses the conversion 
   const running = new Promise<void>(resolve => { entered = resolve; });
   const stopped = new Promise<void>(resolve => { aborted = resolve; });
   const cleanup = new Promise<void>(resolve => { release = resolve; });
-  const { service } = await fixture({ conversionTimeoutMs: 1000, converter: async (_input, _output, signal) => {
+  // Capture the conversion deadline timer (a distinctive delay) so the test can fire it after the abort
+  // instead of sleeping past it: the late deadline must not turn the cancellation into a timeout.
+  const deadline = 123_457, deadlines: Array<() => void> = [], realSetTimeout = globalThis.setTimeout;
+  const timers = spyOn(globalThis, "setTimeout").mockImplementation(((handler: any, ms?: number, ...args: any[]) => {
+    if (ms === deadline) deadlines.push(() => handler(...args));
+    return realSetTimeout(handler, ms, ...args);
+  }) as any);
+  const { service } = await fixture({ conversionTimeoutMs: deadline, converter: async (_input, _output, signal) => {
     signal.addEventListener("abort", aborted, { once: true });
     entered();
     await cleanup;
@@ -78,8 +79,8 @@ test("shutdown cancellation stays cancelled when cleanup crosses the conversion 
   } });
   const id = await startTestJob(service); await running;
   const closing = service.close();
-  try { await stopped; await new Promise(resolve => setTimeout(resolve, 1100)); }
-  finally { release(); await closing; }
+  try { await stopped; expect(deadlines).toHaveLength(1); deadlines[0]!(); }
+  finally { release(); await closing; timers.mockRestore(); }
   expect((await service.getStatus(actor, id)).error_info?.code).toBe("CONVERSION_CANCELLED");
 });
 for (const mode of ["document", "missing-executable", "index"] as const) {

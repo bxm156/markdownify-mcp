@@ -41,7 +41,7 @@ test("provisioning refuses existing token destinations without changing keys or 
   const tokenFile = path.join(directory, "a.token");
   await provision("tenant", "a", registry, tokenFile);
   const beforeRegistry = await fs.readFile(registry, "utf8"), beforeToken = await fs.readFile(tokenFile, "utf8");
-  await expect(provision("tenant", "b", registry, tokenFile)).rejects.toThrow();
+  await expect(provision("tenant", "b", registry, tokenFile)).rejects.toMatchObject({ stderr: expect.stringContaining("EEXIST") });
   expect(await fs.readFile(registry, "utf8")).toBe(beforeRegistry);
   expect(await fs.readFile(tokenFile, "utf8")).toBe(beforeToken);
   expect((await fs.readdir(directory)).some(name => /\.lock$|\.tmp$/.test(name))).toBe(false);
@@ -57,7 +57,7 @@ test("concurrent provisioning cannot lose successful credentials and failed oper
   for (const [index, result] of results.entries()) {
     const agent = ["a", "b", "c", "d"][index], tokenFile = path.join(directory, `${agent}.token`);
     if (result.status === "rejected") {
-      await expect(fs.stat(tokenFile)).rejects.toThrow();
+      await expect(fs.stat(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
       await provision("tenant", agent, registry, tokenFile);
     }
   }
@@ -70,11 +70,11 @@ test("concurrent provisioning cannot lose successful credentials and failed oper
 test("invalid identities and corrupted registry fail before creating a usable credential", async () => {
   const { directory, registry } = await fixture();
   const tokenFile = path.join(directory, "rejected.token");
-  await expect(provision("../tenant", "a", registry, tokenFile)).rejects.toThrow();
+  await expect(provision("../tenant", "a", registry, tokenFile)).rejects.toMatchObject({ stderr: expect.stringContaining("Invalid principal") });
   expect(await fs.readdir(directory)).toEqual([]);
   await fs.writeFile(registry, "{corrupted");
-  await expect(provision("tenant", "a", registry, tokenFile)).rejects.toThrow();
+  await expect(provision("tenant", "a", registry, tokenFile)).rejects.toMatchObject({ stderr: expect.stringContaining("Existing credential registry is invalid or unreadable") });
   expect(await fs.readFile(registry, "utf8")).toBe("{corrupted");
-  await expect(fs.stat(tokenFile)).rejects.toThrow();
+  await expect(fs.stat(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
   expect((await fs.readdir(directory)).sort()).toEqual(["agents.json"]);
 });

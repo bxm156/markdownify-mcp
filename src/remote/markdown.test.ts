@@ -45,10 +45,10 @@ test("large late pages use persisted byte checkpoints and reuse index across cal
 test("empty output, invalid pagination and malformed UTF-8", async () => {
   const empty = await output("");
   expect(await readMarkdownPage(empty)).toEqual({ markdown: "", next_offset: null, total_chars: 0 });
-  await expect(readMarkdownPage(empty, { offset: -1 })).rejects.toThrow("Invalid pagination");
-  await expect(readMarkdownPage(empty, { max_chars: 100001 })).rejects.toThrow("Invalid pagination");
+  await expect(readMarkdownPage(empty, { offset: -1 })).rejects.toMatchObject({ name: "RangeError", message: "Invalid pagination parameters" });
+  await expect(readMarkdownPage(empty, { max_chars: 100001 })).rejects.toMatchObject({ name: "RangeError", message: "Invalid pagination parameters" });
   const invalid = await output(Buffer.from([0xf0, 0x9f]));
-  await expect(prepareMarkdownIndex(invalid)).rejects.toThrow();
+  await expect(prepareMarkdownIndex(invalid)).rejects.toMatchObject({ name: "TypeError", code: "ERR_ENCODING_INVALID_ENCODED_DATA" });
   await expect(fs.stat(`${invalid}.index.json`)).rejects.toMatchObject({ code: "ENOENT" });
 });
 

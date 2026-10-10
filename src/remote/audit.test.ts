@@ -40,7 +40,7 @@ test("filesystem audit failure rejects the event and later writes recover withou
   await audit({ event: "upload_created", tenant_id: "tenantA", agent_id: "agentA" });
   await fs.rename(target, saved);
   await fs.mkdir(target);
-  await expect(audit({ event: "job_deleted", tenant_id: "tenantA", agent_id: "agentA" })).rejects.toThrow();
+  await expect(audit({ event: "job_deleted", tenant_id: "tenantA", agent_id: "agentA" })).rejects.toMatchObject({ code: expect.stringMatching(/^(EISDIR|EPERM|EACCES)$/) });
   await fs.rmdir(target);
   await fs.rename(saved, target);
   await audit({ event: "read_markdown", tenant_id: "tenantA", agent_id: "agentA" });

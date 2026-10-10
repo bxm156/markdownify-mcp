@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -9,9 +9,10 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { hashToken, loadAuthenticator } from "./auth.js";
 import { createHttpServer } from "./http.js";
 import { JobService } from "./jobs.js";
+import { waitFor } from "./test-helpers.js";
 
 const cleanups: Array<() => Promise<void>> = [];
-afterEach(async () => { while (cleanups.length) await cleanups.pop()!(); });
+afterEach(async () => { setSystemTime(); while (cleanups.length) await cleanups.pop()!(); });
 const OLD_A = "old-agent-a-" + "a".repeat(32);
 const NEW_A = "new-agent-a-" + "a".repeat(32);
 const TOKEN_B = "agent-b-" + "b".repeat(32);
@@ -20,9 +21,12 @@ function parsed(result: any): any {
   expect(result.isError).not.toBe(true);
   return JSON.parse(result.content[0].text);
 }
-function errorText(result: any): string {
+/** Asserts a tool failure carries the expected stable error code and returns its human-readable message. */
+function errorText(result: any, code: string): string {
   expect(result.isError).toBe(true);
-  return JSON.parse(result.content[0].text).error;
+  const body = JSON.parse(result.content[0].text);
+  expect(body.error_info.code).toBe(code);
+  return body.error;
 }
 
 async function deployment(uploadTtlMs = 60_000) {
@@ -74,14 +78,11 @@ async function deployment(uploadTtlMs = 60_000) {
 }
 
 async function completed(client: Client, id: string) {
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
+  await waitFor(async () => {
     const status = parsed(await client.callTool({ name: "get_conversion_status", arguments: { job_id: id } }));
-    if (status.status === "completed") return;
     if (status.status === "failed") throw new Error("Fixture conversion failed");
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-  throw new Error("Fixture conversion deadline exceeded");
+    return status.status === "completed";
+  }, { timeoutMs: 5000, label: `conversion of ${id}` });
 }
 
 test("credential revocation survives restart while rotated owner keeps the reservation", async () => {
@@ -93,7 +94,7 @@ test("credential revocation survives restart while rotated owner keeps the reser
   expect(forbidden.status).toBe(401);
   expect((await fixture.upload(upload.upload_id, OLD_A, upload.required_headers, "private")).status).toBe(401);
   const b = await fixture.client(TOKEN_B);
-  expect(errorText(await b.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } }))).toBe("Job not found");
+  expect(errorText(await b.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } }), "JOB_NOT_FOUND")).toBe("Job not found");
   expect((await fixture.upload(upload.upload_id, TOKEN_B, upload.required_headers, "private")).status).toBe(404);
   const a = await fixture.client(NEW_A);
   expect(parsed(await a.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } })).status).toBe("awaiting_upload");
@@ -101,20 +102,20 @@ test("credential revocation survives restart while rotated owner keeps the reser
   parsed(await a.callTool({ name: "start_conversion", arguments: { upload_id: upload.upload_id } }));
   await completed(a, upload.upload_id);
   expect(parsed(await a.callTool({ name: "get_markdown", arguments: { job_id: upload.upload_id } })).markdown).toBe("# Converted\nprivate");
-  expect(errorText(await b.callTool({ name: "delete_job", arguments: { job_id: upload.upload_id } }))).toBe("Job not found");
+  expect(errorText(await b.callTool({ name: "delete_job", arguments: { job_id: upload.upload_id } }), "JOB_NOT_FOUND")).toBe("Job not found");
   parsed(await a.callTool({ name: "delete_job", arguments: { job_id: upload.upload_id } }));
 });
 
 test("foreign and unknown IDs remain indistinguishable after expiration", async () => {
-  const fixture = await deployment(300);
+  const fixture = await deployment();
   const a = await fixture.client(OLD_A), b = await fixture.client(TOKEN_B);
   const upload = parsed(await a.callTool({ name: "create_upload", arguments: { filename: "expires.txt", size_bytes: 1 } }));
-  await new Promise(resolve => setTimeout(resolve, Math.max(0, Date.parse(upload.expires_at) - Date.now()) + 30));
-  expect(errorText(await a.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } }))).toBe("Job expired");
+  setSystemTime(new Date(Date.parse(upload.expires_at) + 1000));
+  expect(errorText(await a.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } }), "JOB_EXPIRED")).toBe("Job expired");
   const missing = randomUUID();
   for (const name of ["start_conversion", "get_conversion_status", "get_markdown", "delete_job"]) {
     for (const id of [upload.upload_id, missing]) {
-      expect(errorText(await b.callTool({ name, arguments: name === "start_conversion" ? { upload_id: id } : { job_id: id } }))).toBe("Job not found");
+      expect(errorText(await b.callTool({ name, arguments: name === "start_conversion" ? { upload_id: id } : { job_id: id } }), "JOB_NOT_FOUND")).toBe("Job not found");
     }
   }
   for (const id of [upload.upload_id, missing]) {
@@ -138,8 +139,8 @@ test("parallel agents preserve separate output and ownership across a restart", 
   const againA = await fixture.client(OLD_A), againB = await fixture.client(TOKEN_B);
   expect(parsed(await againA.callTool({ name: "get_markdown", arguments: { job_id: first.upload_id } })).markdown).toBe("# Converted\nprivate-A");
   expect(parsed(await againB.callTool({ name: "get_markdown", arguments: { job_id: second.upload_id } })).markdown).toBe("# Converted\nprivate-B");
-  expect(errorText(await againA.callTool({ name: "get_markdown", arguments: { job_id: second.upload_id } }))).toBe("Job not found");
-  expect(errorText(await againB.callTool({ name: "get_markdown", arguments: { job_id: first.upload_id } }))).toBe("Job not found");
+  expect(errorText(await againA.callTool({ name: "get_markdown", arguments: { job_id: second.upload_id } }), "JOB_NOT_FOUND")).toBe("Job not found");
+  expect(errorText(await againB.callTool({ name: "get_markdown", arguments: { job_id: first.upload_id } }), "JOB_NOT_FOUND")).toBe("Job not found");
   expect((await fixture.request("/mcp", "legacy-shared-key-" + "x".repeat(32), { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status).toBe(401);
   parsed(await againA.callTool({ name: "delete_job", arguments: { job_id: first.upload_id } }));
   expect(parsed(await againB.callTool({ name: "get_markdown", arguments: { job_id: second.upload_id } })).markdown).toContain("private-B");
