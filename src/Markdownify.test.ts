@@ -537,3 +537,136 @@ test("Markdownify.toMarkdown handles error from _markitdown method", async () =>
 
   Markdownify["_markitdown"] = originalMarkitdown;
 });
+
+describe("Markdownify.toMarkdown staging directory", () => {
+  let isolatedTmp: string;
+  let originalFetch: typeof download.fetch;
+  let lookupSpy: ReturnType<typeof spyOn>;
+
+  const listStaged = () => fs.readdirSync(isolatedTmp);
+
+  beforeEach(() => {
+    // A fresh, empty TMPDIR per test makes "nothing left behind" exact.
+    isolatedTmp = fs.mkdtempSync(path.join(tempDir, "staging-"));
+    for (const key of tempVariables) process.env[key] = isolatedTmp;
+    originalFetch = download.fetch;
+    lookupSpy = spyOn(dns.promises, "lookup").mockResolvedValue([
+      { address: "93.184.215.14", family: 4 },
+    ] as any);
+  });
+
+  afterEach(() => {
+    for (const key of tempVariables) process.env[key] = tempDir;
+    download.fetch = originalFetch;
+    lookupSpy.mockRestore();
+    fs.rmSync(isolatedTmp, { recursive: true, force: true });
+  });
+
+  test("concurrent conversions get distinct inputs and outputs and leave nothing behind", async () => {
+    const names = Array.from({ length: 4 }, (_, i) => `Page${i}`);
+    // Hold every conversion open until all of them have staged their input,
+    // so they are guaranteed to overlap (and to share a millisecond).
+    let release!: () => void;
+    const allStaged = new Promise<void>((resolve) => (release = resolve));
+    const stagedPaths: string[] = [];
+    const stagedWhileRunning: string[][] = [];
+
+    download.fetch = mock(async (url: string) => {
+      const name = new URL(url).pathname.slice(1);
+      return new Response(`<h1>Heading ${name}</h1>`);
+    }) as unknown as typeof download.fetch;
+
+    const realMarkitdown = Markdownify["_markitdown"];
+    const markitdownSpy = spyOn(Markdownify as any, "_markitdown").mockImplementation(
+      async (inputPath: string, projectRoot: string) => {
+        stagedPaths.push(inputPath);
+        if (stagedPaths.length === names.length) {
+          stagedWhileRunning.push(listStaged());
+          release();
+        }
+        await allStaged;
+        return realMarkitdown.call(Markdownify, inputPath, projectRoot);
+      },
+    );
+
+    try {
+      const results = await Promise.all(
+        names.map((name) =>
+          Markdownify.toMarkdown({ url: `https://example.com/${name}` }),
+        ),
+      );
+
+      results.forEach((result, i) => {
+        expect(result.text).toContain(`# Heading ${names[i]}`);
+      });
+      expect(new Set(stagedPaths).size).toBe(names.length);
+      expect(new Set(stagedPaths.map((p) => path.dirname(p))).size).toBe(
+        names.length,
+      );
+      expect(stagedWhileRunning[0]).toHaveLength(names.length);
+      expect(listStaged()).toEqual([]);
+    } finally {
+      markitdownSpy.mockRestore();
+    }
+    // Each conversion spawns a real markitdown process; allow for slow starts.
+  }, 60_000);
+
+  test("keeps the extension inferred from the URL on the staged input", async () => {
+    download.fetch = mock(
+      async () => new Response("%PDF-not-really"),
+    ) as unknown as typeof download.fetch;
+    const markitdownSpy = spyOn(Markdownify as any, "_markitdown").mockResolvedValue("ok");
+    try {
+      await Markdownify.toMarkdown({ url: "https://example.com/doc.pdf" });
+      const staged = markitdownSpy.mock.calls[0][0] as string;
+      expect(path.extname(staged)).toBe(".pdf");
+      expect(path.dirname(staged).startsWith(isolatedTmp)).toBe(true);
+      expect(listStaged()).toEqual([]);
+    } finally {
+      markitdownSpy.mockRestore();
+    }
+  });
+
+  test("removes the staging directory when the converter fails", async () => {
+    download.fetch = mock(
+      async () => new Response("<h1>x</h1>"),
+    ) as unknown as typeof download.fetch;
+    let existedDuringRun = false;
+    const markitdownSpy = spyOn(Markdownify as any, "_markitdown").mockImplementation(
+      async (inputPath: string) => {
+        existedDuringRun = fs.existsSync(inputPath);
+        throw new Error("converter exploded");
+      },
+    );
+    try {
+      await expect(
+        Markdownify.toMarkdown({ url: "https://example.com/page" }),
+      ).rejects.toThrow("Error processing to Markdown: converter exploded");
+      expect(existedDuringRun).toBe(true);
+      expect(listStaged()).toEqual([]);
+    } finally {
+      markitdownSpy.mockRestore();
+    }
+  });
+
+  test("leaves nothing behind when the download is too large", async () => {
+    download.fetch = mock(
+      async () =>
+        new Response("x", {
+          headers: { "content-length": String(51 * 1024 * 1024) },
+        }),
+    ) as unknown as typeof download.fetch;
+    await expect(
+      Markdownify.toMarkdown({ url: "https://example.com/big" }),
+    ).rejects.toThrow("download limit");
+    expect(listStaged()).toEqual([]);
+  });
+
+  test("leaves nothing behind after a successful file conversion", async () => {
+    const result = await Markdownify.toMarkdown({
+      filePath: path.join(sampleDataDir, "test.pdf"),
+    });
+    expect(result.text).toContain("Test PDF content");
+    expect(listStaged()).toEqual([]);
+  });
+});
