@@ -67,17 +67,161 @@ function realpathOfDeepestExisting(target: string): string {
   }
 }
 
-export function assertPathAllowed(filePath: string): void {
-  const allowed = getAllowedPaths();
+/**
+ * Checks an already-resolved real path against the allowlist. `displayPath`
+ * is the path the caller asked for, used only in the error message.
+ */
+export function assertRealPathAllowed(
+  realPath: string,
+  displayPath: string,
+  allowed: string[] | null = getAllowedPaths(),
+): void {
   if (!allowed) return;
-  const resolved = realpathOfDeepestExisting(expandHome(filePath));
   const allowedReal = allowed.map(realpathOfDeepestExisting);
-  if (!allowedReal.some((dir) => isWithinDirectory(resolved, dir))) {
+  if (!allowedReal.some((dir) => isWithinDirectory(realPath, dir))) {
     throw new Error(
-      `Path "${filePath}" is outside the allowed directories. ` +
+      `Path "${displayPath}" is outside the allowed directories. ` +
         `Set MD_ALLOWED_PATHS to a ${path.delimiter}-separated list that includes a parent directory ` +
         `(currently allowed: ${allowed.join(path.delimiter)}).`,
     );
+  }
+}
+
+/**
+ * Path-based allowlist check. It only says where `filePath` points *now*; a
+ * caller that goes on to read the file must use openLocalFile, which repeats
+ * the decision against the file it actually opened.
+ */
+export function assertPathAllowed(filePath: string): void {
+  const allowed = getAllowedPaths();
+  if (!allowed) return;
+  assertRealPathAllowed(
+    realpathOfDeepestExisting(expandHome(filePath)),
+    filePath,
+    allowed,
+  );
+}
+
+/**
+ * Test-only gates. They let tests change the filesystem at exact points in
+ * openLocalFile instead of racing it with sleeps. Production code never sets them.
+ */
+export const _fileAccessTestHooks: {
+  /** After the path-based allowlist check, before the file is opened. */
+  afterValidate?: (realPath: string) => void | Promise<void>;
+  /** After the opened file has been validated, before any byte is read. */
+  afterOpen?: (realPath: string) => void | Promise<void>;
+} = {};
+
+// O_NOFOLLOW (POSIX) makes open fail if the final component is a symlink.
+// O_NONBLOCK keeps open from hanging on a FIFO with no writer, so fstat can
+// reject it; it does not change reads from regular files. Neither exists on
+// Windows, where the constants are undefined and contribute nothing.
+const OPEN_FLAGS_FOLLOW =
+  fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0);
+const OPEN_FLAGS_NOFOLLOW = OPEN_FLAGS_FOLLOW | (fs.constants.O_NOFOLLOW ?? 0);
+
+export type OpenedLocalFile = {
+  handle: fs.promises.FileHandle;
+  /** Size in bytes at open time (fstat). */
+  size: number;
+};
+
+/**
+ * Returns the real path of the file behind `handle` and proves it is the same
+ * file that was opened.
+ *
+ * On Linux the kernel reports the opened file's current location through
+ * /proc/self/fd. readlink (not realpath) is used deliberately: realpath would
+ * walk the returned path through the filesystem again and reintroduce a
+ * path-based race. The answer is about the open file itself, so no later
+ * rename or symlink swap of the final component or any ancestor can change
+ * which bytes the caller reads.
+ *
+ * Elsewhere (macOS, BSD, Windows), or when /proc is unavailable, the path is
+ * resolved again after the open and its device/inode must match the handle's.
+ * That rejects any swap that is still in place after the open, but an attacker
+ * able to modify directories on the path could in principle swap twice within
+ * the gap between those two calls.
+ */
+export async function resolveOpenedFile(
+  handle: fs.promises.FileHandle,
+  openedPath: string,
+  stats: fs.BigIntStats,
+  { useProcFd = process.platform === "linux" }: { useProcFd?: boolean } = {},
+): Promise<string> {
+  if (useProcFd) {
+    try {
+      const linked = await fs.promises.readlink(`/proc/self/fd/${handle.fd}`);
+      if (path.isAbsolute(linked)) return linked;
+    } catch {
+      // /proc is not mounted (some sandboxes): fall through.
+    }
+  }
+  const realPath = await fs.promises.realpath(openedPath);
+  const current = await fs.promises.stat(realPath, { bigint: true });
+  if (current.dev !== stats.dev || current.ino !== stats.ino) {
+    throw new Error(
+      `Path "${openedPath}" changed while it was being opened; refusing to read it.`,
+    );
+  }
+  return realPath;
+}
+
+/**
+ * Opens a local regular file for reading.
+ *
+ * Without an allowlist (MD_ALLOWED_PATHS / MD_SHARE_DIR unset) any readable
+ * file is permitted, so this only checks that the opened file is a regular
+ * file. With an allowlist the decision is tied to the opened file, not to a
+ * path that could be swapped afterwards: the path is resolved and checked,
+ * opened with O_NOFOLLOW, and the opened file's own location is checked again
+ * (see resolveOpenedFile). The caller must read only through the returned
+ * handle and must close it.
+ */
+export async function openLocalFile(filePath: string): Promise<OpenedLocalFile> {
+  const allowed = getAllowedPaths();
+  let target = filePath;
+  if (allowed) {
+    assertPathAllowed(filePath); // early, friendly rejection
+    // Resolve legitimate symlinks first, so O_NOFOLLOW only refuses a final
+    // component that was swapped for a symlink after this point.
+    target = await fs.promises.realpath(filePath);
+    assertRealPathAllowed(target, filePath, allowed);
+    await _fileAccessTestHooks.afterValidate?.(target);
+  }
+
+  let handle: fs.promises.FileHandle;
+  try {
+    handle = await fs.promises.open(
+      target,
+      allowed ? OPEN_FLAGS_NOFOLLOW : OPEN_FLAGS_FOLLOW,
+    );
+  } catch (e: unknown) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    // ELOOP (Linux, macOS) or EMLINK (FreeBSD): the final component became a symlink.
+    if (allowed && (code === "ELOOP" || code === "EMLINK")) {
+      throw new Error(
+        `Path "${filePath}" changed while it was being opened; refusing to read it.`,
+      );
+    }
+    throw e;
+  }
+
+  try {
+    const stats = await handle.stat({ bigint: true });
+    if (!stats.isFile()) {
+      throw new Error(`Path "${filePath}" is not a regular file.`);
+    }
+    if (allowed) {
+      const openedReal = await resolveOpenedFile(handle, target, stats);
+      assertRealPathAllowed(openedReal, filePath, allowed);
+      await _fileAccessTestHooks.afterOpen?.(target);
+    }
+    return { handle, size: Number(stats.size) };
+  } catch (e) {
+    await handle.close();
+    throw e;
   }
 }
 

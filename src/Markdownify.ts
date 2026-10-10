@@ -15,7 +15,9 @@ import {
   isMarkdownFile,
   resolveMarkitdownPath,
   resolveRepomixPath,
-  assertPathAllowed,
+  getAllowedPaths,
+  openLocalFile,
+  type OpenedLocalFile,
 } from "./utils.js";
 const execFileAsync = promisify(execFile);
 
@@ -158,6 +160,46 @@ export class Markdownify {
     return Buffer.concat(chunks);
   }
 
+  /**
+   * Copies the bytes behind an already-validated handle into `stagingDir`,
+   * keeping the original extension (markitdown picks its converter from it).
+   * Reads go through the handle with explicit offsets, never through a path,
+   * so the copy is exactly the file that passed the allowlist check.
+   */
+  private static async stageOpenedFile(
+    handle: fs.promises.FileHandle,
+    size: number,
+    originalPath: string,
+    stagingDir: string,
+    maxBytes = MAX_DOWNLOAD_BYTES,
+  ): Promise<string> {
+    const tooLarge = new Error(
+      `File "${originalPath}" exceeds the ${maxBytes}-byte limit for local conversion.`,
+    );
+    if (size > maxBytes) throw tooLarge;
+
+    const stagedPath = path.join(
+      stagingDir,
+      `input${path.extname(originalPath)}`,
+    );
+    const out = await fs.promises.open(stagedPath, "wx", 0o600);
+    try {
+      const buffer = Buffer.alloc(1024 * 1024);
+      let position = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+        if (bytesRead === 0) break;
+        position += bytesRead;
+        // The file may grow after fstat; enforce the limit on what is read.
+        if (position > maxBytes) throw tooLarge;
+        await out.write(buffer, 0, bytesRead);
+      }
+    } finally {
+      await out.close();
+    }
+    return stagedPath;
+  }
+
   static async toMarkdown({
     filePath,
     url,
@@ -185,9 +227,39 @@ export class Markdownify {
 
       if (filePath) {
         const expanded = expandHome(filePath);
-        assertPathAllowed(expanded);
-        const text = await this._markitdown(expanded, projectRoot);
-        return { text };
+
+        if (!getAllowedPaths()) {
+          // No allowlist: every readable file is permitted, so a path swap
+          // cannot widen access. Pass the path straight to markitdown rather
+          // than doubling the I/O with a private copy, but refuse
+          // directories, FIFOs, devices and sockets like the allowlisted path.
+          const stats = await fs.promises.stat(expanded);
+          if (!stats.isFile()) {
+            throw new Error(`Path "${filePath}" is not a regular file.`);
+          }
+          const text = await this._markitdown(expanded, projectRoot);
+          return { text };
+        }
+
+        // Allowlist: markitdown is a separate process that would reopen the
+        // path, so a symlink or ancestor swapped after validation could
+        // change what it reads. Open and validate the file here, then hand
+        // markitdown a private copy of exactly those bytes.
+        const { handle, size } = await openLocalFile(expanded);
+        try {
+          const text = await this.withStagingDir(async (stagingDir) => {
+            const stagedPath = await this.stageOpenedFile(
+              handle,
+              size,
+              expanded,
+              stagingDir,
+            );
+            return this._markitdown(stagedPath, projectRoot);
+          });
+          return { text };
+        } finally {
+          await handle.close();
+        }
       }
 
       throw new Error("Either filePath or url must be provided");
@@ -267,13 +339,25 @@ export class Markdownify {
       throw new Error("Required file is not a Markdown file.");
     }
 
-    assertPathAllowed(resolvedPath);
-
-    if (!fs.existsSync(resolvedPath)) {
-      throw new Error("File does not exist");
+    // Read through a handle validated by openLocalFile, so the allowlist
+    // decision applies to the bytes returned (see toMarkdown). It checks the
+    // path before opening, so an outside path is reported as such, not as missing.
+    let opened: OpenedLocalFile;
+    try {
+      opened = await openLocalFile(resolvedPath);
+    } catch (e: unknown) {
+      if ((e as NodeJS.ErrnoException)?.code === "ENOENT") {
+        throw new Error("File does not exist");
+      }
+      throw e;
     }
 
-    const text = await fs.promises.readFile(resolvedPath, "utf-8");
+    let text: string;
+    try {
+      text = await opened.handle.readFile("utf-8");
+    } finally {
+      await opened.handle.close();
+    }
 
     return {
       path: filePath,

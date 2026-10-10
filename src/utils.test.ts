@@ -18,6 +18,9 @@ import {
   resolveRepomixPath,
   getAllowedPaths,
   assertPathAllowed,
+  assertRealPathAllowed,
+  openLocalFile,
+  resolveOpenedFile,
   redactUrl,
 } from "./utils";
 import dns from "node:dns";
@@ -597,5 +600,121 @@ describe("getAllowedPaths / assertPathAllowed", () => {
         assertPathAllowed(path.join(allowedDir, "inside.pdf")),
       ).not.toThrow();
     });
+  });
+});
+
+describe("opened-file validation", () => {
+  const savedAllowed = process.env.MD_ALLOWED_PATHS;
+  const savedShare = process.env.MD_SHARE_DIR;
+  let tmp: string;
+  let allowedDir: string;
+  let outsideDir: string;
+  let target: string;
+
+  beforeEach(() => {
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-open-")));
+    allowedDir = path.join(tmp, "allowed");
+    outsideDir = path.join(tmp, "outside");
+    fs.mkdirSync(path.join(allowedDir, "sub"), { recursive: true });
+    fs.mkdirSync(path.join(outsideDir, "sub"), { recursive: true });
+    target = path.join(allowedDir, "sub", "doc.txt");
+    fs.writeFileSync(target, "inside");
+    fs.writeFileSync(path.join(outsideDir, "sub", "doc.txt"), "outside");
+    delete process.env.MD_SHARE_DIR;
+    process.env.MD_ALLOWED_PATHS = allowedDir;
+  });
+
+  afterEach(() => {
+    if (savedAllowed === undefined) delete process.env.MD_ALLOWED_PATHS;
+    else process.env.MD_ALLOWED_PATHS = savedAllowed;
+    if (savedShare === undefined) delete process.env.MD_SHARE_DIR;
+    else process.env.MD_SHARE_DIR = savedShare;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const withOpened = async <T>(fn: (h: fs.promises.FileHandle, st: fs.BigIntStats) => Promise<T>) => {
+    const handle = await fs.promises.open(target, "r");
+    try {
+      return await fn(handle, await handle.stat({ bigint: true }));
+    } finally {
+      await handle.close();
+    }
+  };
+
+  test("assertRealPathAllowed uses the same message as assertPathAllowed", () => {
+    expect(() => assertRealPathAllowed(path.join(outsideDir, "x"), "shown.pdf")).toThrow(
+      'Path "shown.pdf" is outside the allowed directories.',
+    );
+    expect(() => assertRealPathAllowed(target, "shown.pdf")).not.toThrow();
+  });
+
+  for (const useProcFd of [false, true]) {
+    const run = useProcFd ? test.skipIf(process.platform !== "linux") : test;
+    const label = useProcFd ? "/proc/self/fd" : "dev/ino fallback";
+
+    run(`${label}: returns the real path of an unchanged file`, async () => {
+      const real = await withOpened((h, st) => resolveOpenedFile(h, target, st, { useProcFd }));
+      expect(real).toBe(target);
+    });
+
+    run(`${label}: an ancestor moved out of the allowed tree after open is caught`, async () => {
+      const result = await withOpened(async (h, st) => {
+        // Move the opened file's directory outside, and plant an innocent
+        // replacement at the old path.
+        fs.renameSync(path.join(allowedDir, "sub"), path.join(outsideDir, "moved"));
+        fs.mkdirSync(path.join(allowedDir, "sub"));
+        fs.writeFileSync(target, "replacement");
+        try {
+          const real = await resolveOpenedFile(h, target, st, { useProcFd });
+          assertRealPathAllowed(real, target);
+          return "accepted";
+        } catch (e) {
+          return (e as Error).message;
+        }
+      });
+      expect(result).toMatch(
+        useProcFd ? /outside the allowed directories/ : /changed while it was being opened/,
+      );
+    });
+  }
+
+  test("dev/ino fallback: an ancestor swapped for a symlink outside is caught", async () => {
+    const handle = await fs.promises.open(path.join(outsideDir, "sub", "doc.txt"), "r");
+    try {
+      // The handle points outside; the path now resolves outside too, so the
+      // re-resolved real path is outside and fails the allowlist.
+      fs.rmSync(path.join(allowedDir, "sub"), { recursive: true });
+      fs.symlinkSync(path.join(outsideDir, "sub"), path.join(allowedDir, "sub"));
+      const st = await handle.stat({ bigint: true });
+      const real = await resolveOpenedFile(handle, target, st, { useProcFd: false });
+      expect(() => assertRealPathAllowed(real, target)).toThrow(
+        "outside the allowed directories",
+      );
+    } finally {
+      await handle.close();
+    }
+  });
+
+  test("openLocalFile returns a handle and size for an allowed file", async () => {
+    const { handle, size } = await openLocalFile(target);
+    try {
+      expect(size).toBe(6);
+      expect(await handle.readFile("utf-8")).toBe("inside");
+    } finally {
+      await handle.close();
+    }
+  });
+
+  test("openLocalFile reports a missing file with ENOENT", async () => {
+    await expect(openLocalFile(path.join(allowedDir, "missing.txt"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  test("openLocalFile without an allowlist opens any regular file but not a directory", async () => {
+    delete process.env.MD_ALLOWED_PATHS;
+    const { handle } = await openLocalFile(path.join(outsideDir, "sub", "doc.txt"));
+    await handle.close();
+    await expect(openLocalFile(outsideDir)).rejects.toThrow("is not a regular file");
   });
 });

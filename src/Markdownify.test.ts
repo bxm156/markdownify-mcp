@@ -11,6 +11,8 @@ import {
 } from "bun:test";
 import { Markdownify, MarkdownResult } from "./Markdownify";
 import { download } from "./download";
+import { _fileAccessTestHooks } from "./utils";
+import { execFileSync } from "child_process";
 import dns from "node:dns";
 import fs from "fs";
 import path from "path";
@@ -668,5 +670,265 @@ describe("Markdownify.toMarkdown staging directory", () => {
     });
     expect(result.text).toContain("Test PDF content");
     expect(listStaged()).toEqual([]);
+  });
+});
+
+describe("Markdownify local files under MD_ALLOWED_PATHS", () => {
+  const posixOnly = test.skipIf(process.platform === "win32");
+  const savedAllowed = process.env.MD_ALLOWED_PATHS;
+  const savedShare = process.env.MD_SHARE_DIR;
+  let isolatedTmp: string;
+  let root: string;
+  let allowedDir: string;
+  let outsideDir: string;
+  let markitdownSpy: ReturnType<typeof spyOn>;
+  let staged: { path: string; content: string }[];
+
+  const listStaged = () => fs.readdirSync(isolatedTmp);
+  const SECRET = "OUTSIDE SECRET";
+
+  beforeEach(() => {
+    // Staging goes to its own empty TMPDIR so "nothing left behind" is
+    // exact; fixtures live elsewhere so they never show up in it.
+    isolatedTmp = fs.mkdtempSync(path.join(tempDir, "staging-"));
+    for (const key of tempVariables) process.env[key] = isolatedTmp;
+    root = fs.realpathSync(fs.mkdtempSync(path.join(tempDir, "allowlist-")));
+    allowedDir = path.join(root, "allowed");
+    outsideDir = path.join(root, "outside");
+    fs.mkdirSync(path.join(allowedDir, "sub"), { recursive: true });
+    fs.mkdirSync(path.join(outsideDir, "sub"), { recursive: true });
+    fs.writeFileSync(path.join(allowedDir, "sub", "doc.txt"), "allowed content");
+    fs.writeFileSync(path.join(outsideDir, "sub", "doc.txt"), SECRET);
+    fs.writeFileSync(path.join(outsideDir, "secret.txt"), SECRET);
+    delete process.env.MD_SHARE_DIR;
+    process.env.MD_ALLOWED_PATHS = allowedDir;
+
+    // Record exactly what reaches the converter, then run the real one.
+    staged = [];
+    const realMarkitdown = Markdownify["_markitdown"];
+    markitdownSpy = spyOn(Markdownify as any, "_markitdown").mockImplementation(
+      async (inputPath: string, projectRoot: string) => {
+        staged.push({
+          path: inputPath,
+          content: fs.readFileSync(inputPath, "latin1"),
+        });
+        return realMarkitdown.call(Markdownify, inputPath, projectRoot);
+      },
+    );
+  });
+
+  afterEach(() => {
+    markitdownSpy.mockRestore();
+    delete _fileAccessTestHooks.afterValidate;
+    delete _fileAccessTestHooks.afterOpen;
+    if (savedAllowed === undefined) delete process.env.MD_ALLOWED_PATHS;
+    else process.env.MD_ALLOWED_PATHS = savedAllowed;
+    if (savedShare === undefined) delete process.env.MD_SHARE_DIR;
+    else process.env.MD_SHARE_DIR = savedShare;
+    for (const key of tempVariables) process.env[key] = tempDir;
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(isolatedTmp, { recursive: true, force: true });
+  });
+
+  const neverSawSecret = () => {
+    for (const { content } of staged) expect(content).not.toContain(SECRET);
+  };
+
+  test("converts an allowed regular file from a private copy and cleans it up", async () => {
+    const docx = path.join(allowedDir, "report.docx");
+    fs.copyFileSync(path.join(sampleDataDir, "test.docx"), docx);
+
+    const result = await Markdownify.toMarkdown({ filePath: docx });
+
+    expect(result.text).toContain("Test DOCX content");
+    expect(staged).toHaveLength(1);
+    // markitdown read a private copy (same extension), never the original path.
+    expect(staged[0].path).not.toBe(docx);
+    expect(path.extname(staged[0].path)).toBe(".docx");
+    expect(staged[0].path.startsWith(isolatedTmp + path.sep)).toBe(true);
+    expect(staged[0].content).toBe(fs.readFileSync(docx, "latin1"));
+    expect(listStaged()).toEqual([]);
+  }, 30_000);
+
+  test("still accepts a symlink that resolves inside the allowed directory", async () => {
+    const alias = path.join(allowedDir, "alias.txt");
+    fs.symlinkSync(path.join(allowedDir, "sub", "doc.txt"), alias);
+    const result = await Markdownify.toMarkdown({ filePath: alias });
+    expect(result.text).toContain("allowed content");
+    expect(listStaged()).toEqual([]);
+  }, 30_000);
+
+  test("final component swapped for a symlink after validation is refused", async () => {
+    const target = path.join(allowedDir, "sub", "doc.txt");
+    let gateReached = false;
+    _fileAccessTestHooks.afterValidate = () => {
+      gateReached = true;
+      fs.rmSync(target);
+      fs.symlinkSync(path.join(outsideDir, "secret.txt"), target);
+    };
+
+    await expect(Markdownify.toMarkdown({ filePath: target })).rejects.toThrow(
+      "changed while it was being opened",
+    );
+    expect(gateReached).toBe(true);
+    expect(markitdownSpy).not.toHaveBeenCalled();
+    neverSawSecret();
+    expect(listStaged()).toEqual([]);
+  });
+
+  test("ancestor directory swapped for a symlink after validation is refused", async () => {
+    const target = path.join(allowedDir, "sub", "doc.txt");
+    let gateReached = false;
+    _fileAccessTestHooks.afterValidate = () => {
+      gateReached = true;
+      fs.renameSync(path.join(allowedDir, "sub"), path.join(root, "parked"));
+      fs.symlinkSync(path.join(outsideDir, "sub"), path.join(allowedDir, "sub"));
+    };
+
+    await expect(Markdownify.toMarkdown({ filePath: target })).rejects.toThrow(
+      "outside the allowed directories",
+    );
+    expect(gateReached).toBe(true);
+    expect(markitdownSpy).not.toHaveBeenCalled();
+    neverSawSecret();
+    expect(listStaged()).toEqual([]);
+  });
+
+  test("swaps after the opened file is validated cannot change the bytes converted", async () => {
+    const target = path.join(allowedDir, "sub", "doc.txt");
+    _fileAccessTestHooks.afterOpen = () => {
+      // Swap both the ancestor and the final component before any byte is read.
+      fs.renameSync(path.join(allowedDir, "sub"), path.join(root, "parked"));
+      fs.mkdirSync(path.join(allowedDir, "sub"));
+      fs.symlinkSync(path.join(outsideDir, "secret.txt"), target);
+    };
+
+    const result = await Markdownify.toMarkdown({ filePath: target });
+
+    expect(result.text).toContain("allowed content");
+    expect(result.text).not.toContain(SECRET);
+    neverSawSecret();
+    expect(listStaged()).toEqual([]);
+  }, 30_000);
+
+  test("removes the private copy when the converter fails", async () => {
+    let existedDuringRun = false;
+    markitdownSpy.mockImplementation(async (inputPath: string) => {
+      existedDuringRun = fs.existsSync(inputPath);
+      throw new Error("converter exploded");
+    });
+    await expect(
+      Markdownify.toMarkdown({ filePath: path.join(allowedDir, "sub", "doc.txt") }),
+    ).rejects.toThrow("Error processing to Markdown: converter exploded");
+    expect(existedDuringRun).toBe(true);
+    expect(listStaged()).toEqual([]);
+  });
+
+  test("refuses a directory with and without an allowlist", async () => {
+    await expect(Markdownify.toMarkdown({ filePath: allowedDir })).rejects.toThrow(
+      "is not a regular file",
+    );
+    delete process.env.MD_ALLOWED_PATHS;
+    await expect(Markdownify.toMarkdown({ filePath: allowedDir })).rejects.toThrow(
+      "is not a regular file",
+    );
+    expect(markitdownSpy).not.toHaveBeenCalled();
+    expect(listStaged()).toEqual([]);
+  });
+
+  posixOnly("refuses a FIFO without blocking, with and without an allowlist", async () => {
+    const fifo = path.join(allowedDir, "pipe.txt");
+    execFileSync("mkfifo", [fifo]);
+    await expect(Markdownify.toMarkdown({ filePath: fifo })).rejects.toThrow(
+      "is not a regular file",
+    );
+    delete process.env.MD_ALLOWED_PATHS;
+    await expect(Markdownify.toMarkdown({ filePath: fifo })).rejects.toThrow(
+      "is not a regular file",
+    );
+    expect(markitdownSpy).not.toHaveBeenCalled();
+    expect(listStaged()).toEqual([]);
+  });
+
+  test("refuses a file outside the allowed directories before opening it", async () => {
+    const openSpy = spyOn(fs.promises, "open");
+    try {
+      await expect(
+        Markdownify.toMarkdown({ filePath: path.join(outsideDir, "secret.txt") }),
+      ).rejects.toThrow("outside the allowed directories");
+      expect(openSpy).not.toHaveBeenCalled();
+    } finally {
+      openSpy.mockRestore();
+    }
+    expect(listStaged()).toEqual([]);
+  });
+
+  test("stageOpenedFile enforces the size limit before and during the copy", async () => {
+    const file = path.join(allowedDir, "big.txt");
+    fs.writeFileSync(file, "0123456789");
+    const stage = (size: number) =>
+      Markdownify["withStagingDir"](async (dir: string) => {
+        const handle = await fs.promises.open(file, "r");
+        try {
+          return await Markdownify["stageOpenedFile"](handle, size, file, dir, 4);
+        } finally {
+          await handle.close();
+        }
+      });
+    // Declared (fstat) size over the limit.
+    await expect(stage(10)).rejects.toThrow("exceeds the 4-byte limit");
+    // File grew past the limit after fstat reported a small size.
+    await expect(stage(2)).rejects.toThrow("exceeds the 4-byte limit");
+    expect(listStaged()).toEqual([]);
+  });
+
+  describe("Markdownify.get", () => {
+    test("reads an allowed Markdown file", async () => {
+      const md = path.join(allowedDir, "notes.md");
+      fs.writeFileSync(md, "# Allowed notes");
+      const result = await Markdownify.get({ filePath: md });
+      expect(result.text).toBe("# Allowed notes");
+    });
+
+    test("refuses an ancestor swapped for a symlink after validation", async () => {
+      fs.writeFileSync(path.join(allowedDir, "sub", "notes.md"), "# Allowed");
+      fs.writeFileSync(path.join(outsideDir, "sub", "notes.md"), SECRET);
+      _fileAccessTestHooks.afterValidate = () => {
+        fs.renameSync(path.join(allowedDir, "sub"), path.join(root, "parked"));
+        fs.symlinkSync(path.join(outsideDir, "sub"), path.join(allowedDir, "sub"));
+      };
+      await expect(
+        Markdownify.get({ filePath: path.join(allowedDir, "sub", "notes.md") }),
+      ).rejects.toThrow("outside the allowed directories");
+    });
+
+    test("refuses a final component swapped for a symlink after validation", async () => {
+      const md = path.join(allowedDir, "notes.md");
+      fs.writeFileSync(md, "# Allowed");
+      fs.writeFileSync(path.join(outsideDir, "secret.md"), SECRET);
+      _fileAccessTestHooks.afterValidate = () => {
+        fs.rmSync(md);
+        fs.symlinkSync(path.join(outsideDir, "secret.md"), md);
+      };
+      await expect(Markdownify.get({ filePath: md })).rejects.toThrow(
+        "changed while it was being opened",
+      );
+    });
+
+    test("reports outside paths and missing files distinctly", async () => {
+      await expect(
+        Markdownify.get({ filePath: path.join(outsideDir, "missing.md") }),
+      ).rejects.toThrow("outside the allowed directories");
+      await expect(
+        Markdownify.get({ filePath: path.join(allowedDir, "missing.md") }),
+      ).rejects.toThrow("File does not exist");
+    });
+
+    test("refuses a directory named like a Markdown file", async () => {
+      fs.mkdirSync(path.join(allowedDir, "dir.md"));
+      await expect(
+        Markdownify.get({ filePath: path.join(allowedDir, "dir.md") }),
+      ).rejects.toThrow("is not a regular file");
+    });
   });
 });
