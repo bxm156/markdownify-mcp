@@ -6,7 +6,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Converter, createConverter } from "./converter.js";
 import { validatePrincipal, type Principal } from "./identity.js";
-import { checkRuntime, type RuntimeHealth } from "./health.js";
+import { checkRuntime, MAX_TIMER_MS, type RuntimeHealth } from "./health.js";
 import { prepareMarkdownIndex, readMarkdownPage } from "./markdown.js";
 
 import { ServiceError, errorInfo, lookupError, legacyCode, type ErrorCode, type ErrorDetails } from "./errors.js";
@@ -14,7 +14,7 @@ export { ServiceError } from "./errors.js";
 export type JobStatus = "awaiting_upload" | "uploaded" | "queued" | "running" | "completed" | "failed" | "expired";
 type Job = { tenant_id: string; agent_id: string; id: string; filename: string; extension: string; size_bytes: number; token_hash?: string; upload_auth_hash?: string; status: JobStatus; created_at: string; expires_at: string; error?: string; error_code?: ErrorCode; error_details?: ErrorDetails };
 export type AuditEvent = { event: string; tenant_id: string; agent_id: string; job_id?: string; status?: string; reason?: string };
-export type JobServiceOptions = { dataDir: string; maxUploadBytes: number; maxStorageBytes: number; maxJobs: number; retentionMs: number; uploadTtlMs: number; conversionTimeoutMs: number; maxOutputBytes: number; concurrency: number; converter?: Converter; legacyOwner?: Principal; maxTenantJobs?: number; maxTenantStorageBytes?: number; maxTenantConcurrency?: number; maxAgentJobs?: number; maxAgentStorageBytes?: number; maxAgentConcurrency?: number; audit?: (event: AuditEvent) => void | Promise<void> };
+export type JobServiceOptions = { dataDir: string; maxUploadBytes: number; maxStorageBytes: number; maxJobs: number; retentionMs: number; uploadTtlMs: number; conversionTimeoutMs: number; maxOutputBytes: number; concurrency: number; converter?: Converter; legacyOwner?: Principal; maxTenantJobs?: number; maxTenantStorageBytes?: number; maxTenantConcurrency?: number; maxAgentJobs?: number; maxAgentStorageBytes?: number; maxAgentConcurrency?: number; healthTimeoutMs?: number; audit?: (event: AuditEvent) => void | Promise<void> };
 const extensions = new Set([".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".md", ".csv", ".html", ".json"]);
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const tokenHash = (principal: Principal, id: string, tokenDigest: string) => hash(`${principal.tenantId}:${principal.agentId}:${id}:${tokenDigest}`);
@@ -36,6 +36,7 @@ export class JobService {
     for (const [name, value] of Object.entries(options)) {
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`Invalid ${name}`);
     }
+    if ((options.healthTimeoutMs ?? 0) > MAX_TIMER_MS) throw new Error(`Invalid healthTimeoutMs: must be at most ${MAX_TIMER_MS} ms`);
     this.options.dataDir = path.resolve(options.dataDir);
     this.converter = options.converter ?? createConverter({ maxOutputBytes: options.maxOutputBytes });
   }
@@ -363,7 +364,7 @@ export class JobService {
   async health(principal?: Principal) {
     if (principal) { this.validPrincipal(principal); }
     if (!this.healthCache || this.healthCache.until <= Date.now()) {
-      const result = checkRuntime(this.options.dataDir, !!this.options.converter).finally(() => {
+      const result = checkRuntime(this.options.dataDir, !!this.options.converter, this.options.healthTimeoutMs).finally(() => {
         if (this.healthCache?.result === result) this.healthCache.until = Date.now() + 2000;
       });
       this.healthCache = { until: Infinity, result };

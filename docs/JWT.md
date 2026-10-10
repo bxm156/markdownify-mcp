@@ -160,4 +160,4 @@ Client syntax references: [Codex](https://learn.chatgpt.com/docs/extend/mcp?surf
 
 ## Health monitoring
 
-LiteLLM 1.104 probes MCP initialization without a user. JWT mode permits only readiness-gated initialization/ping from requests with no Authorization header; a presented but invalid JWT gets 401 on every method, and all job tools and discovery still require a valid agent. Use GET /livez for liveness, GET /readyz for real process/storage/converter readiness, and authenticated get_service_health for private per-user metrics. See [health behavior and limits](HEALTH.md).
+LiteLLM 1.104 probes MCP initialization without a user. JWT mode permits only readiness-gated initialization/ping from requests with no Authorization header; a presented but invalid JWT gets 401 on every method, and all job tools and discovery still require a valid agent. Use GET /livez for liveness, GET /readyz for lifecycle/storage/converter readiness, and authenticated get_service_health for private per-user metrics. See [health behavior and limits](HEALTH.md).
