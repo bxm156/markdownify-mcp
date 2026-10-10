@@ -78,6 +78,8 @@ process.stdout.write(JSON.stringify(ids)+'\\n');`);
     const before = await Promise.all(ids.map(id => fs.readFile(path.join(dataDir, id, "job.json"), "utf8").then(JSON.parse)));
     expect(before.map(job => job.status)).toEqual(["running", "queued", "queued", "queued"]);
     const exited = new Promise<void>(resolve => child.once("exit", () => resolve())); child.kill("SIGKILL"); await exited;
+    // The child is confirmed stopped. Model the documented operator recovery step.
+    await fs.rm(path.join(dataDir, ".lock"));
     let activeTeam = 0, maxActiveTeam = 0;
     const { instance } = await service({ dataDir, concurrency: 3, maxTenantConcurrency: 1, maxAgentConcurrency: 1, converter: async (input, output) => {
       const manifest = JSON.parse(await fs.readFile(path.join(path.dirname(input), "job.json"), "utf8"));

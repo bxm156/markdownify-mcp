@@ -34,6 +34,8 @@ async function main() {
   };
   process.once("SIGINT", () => { void shutdown(); });
   process.once("SIGTERM", () => { void shutdown(); });
+  // A closed terminal or supervisor hang-up would otherwise terminate without releasing the volume lock.
+  process.once("SIGHUP", () => { void shutdown(); });
 }
 
 main().catch(error => {

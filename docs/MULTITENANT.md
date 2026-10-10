@@ -169,6 +169,67 @@ Audit records live in `MD_DATA_DIR/audit.jsonl`, with timestamps, tenant/agent I
 
 This milestone supplies application-level file isolation for distinct credentials, bounded resources, and restart-safe ownership. The converter subprocess is not a security sandbox against malicious document parser exploits. Use trusted document sources or additional parser isolation for hostile uploads. Multiple service replicas, distributed storage/queues, and a credential-management UI remain separate work.
 
+## Inspecting and purging a retired user's artifacts
+
+Retention cleanup runs at startup and periodically. Once a job's `expires_at` passes (`MD_RETENTION_MS` after upload or completion, `MD_UPLOAD_TTL_MS` for an abandoned upload), it erases the input, `output.md` and its index, and leaves a metadata-only tombstone that is removed one retention period later. Running conversions are skipped until they finish. Each job is cleaned independently: a failure on one job is logged and retried on the next sweep while other jobs continue, and an overrunning sweep is never started twice. A job whose cleanup fails stays inaccessible to its owner (`Job expired`) and keeps its quota reservation until the tombstone is committed.
+
+Operators see cleanup failures on stderr. Each sweep with failures logs one line per failed job, for example `Job cleanup failed { event: "job_cleanup_failed", job_id: "…", status: "completed", code: "EACCES" }`, and one summary line, `Job cleanup sweep incomplete { event: "job_cleanup_sweep_failed", jobs_failed, failures_total, consecutive_failed_sweeps, last_error_code, duration_ms }`. Neither contains paths, filenames, error messages or document contents. Alert on the `job_cleanup_sweep_failed` event. Agents see only their own jobs' cleanup state through `get_service_health` (see [HEALTH.md](HEALTH.md)), never service-wide totals.
+
+A common cause is a volume restored or copied with the wrong owner. The Compose service runs as UID/GID 10001 with all capabilities dropped, so it cannot repair ownership itself, and neither can the purge tool below when run the same way. Fix it once as root with the service stopped:
+
+```sh
+docker compose -f compose.multitenant.yaml stop markdownify
+docker compose -f compose.multitenant.yaml run --rm --no-deps --user 0:0 --cap-add CHOWN --cap-add DAC_OVERRIDE --entrypoint chown markdownify -R 10001:10001 /data
+docker compose -f compose.multitenant.yaml start markdownify
+```
+
+For a native process, run `chown -R` as root to the account that runs the service.
+
+When a user's LiteLLM access or credential is revoked, their agent can no longer call `delete_job`, and no agent can list or delete another agent's jobs. Their files still expire on the schedule above. To remove them sooner, or when cleanup keeps failing, use privileged operator access to the data volume. This maintenance path is separate from agent access: never expose it through MCP, LiteLLM or an agent credential. Revoke the credential first (registry or JWT signer) so no new jobs appear.
+
+The data volume contains:
+
+| Path under `MD_DATA_DIR` | Contents |
+| --- | --- |
+| `<job-id>/job.json` | Manifest: `id`, `tenant_id`, `agent_id`, `status`, `filename`, `created_at`, `expires_at`; salted upload-token hashes only until the upload completes |
+| `<job-id>/input.<ext>` | Uploaded document |
+| `<job-id>/output.md`, `<job-id>/output.md.index.json` | Converted Markdown and its pagination index |
+| `<job-id>/input.part`, `output.part`, `job.json.<uuid>.tmp` | Crash partials; removed at startup |
+| `audit.jsonl`, `audit.jsonl.1`–`.3` | Metadata-only audit history shared by all agents |
+| `.lock` | PID (informational only) plus a random per-acquisition token of the running service, or of a running `purge-owner --apply`; removed when that process exits, but left behind by SIGKILL, an OOM kill or a host crash, and never removed by a process whose lock was replaced by another one |
+
+Stop the service before changing the volume. One process owns each data volume and loads every manifest only at startup, so edits under a running service race its in-memory state. The service creates `.lock` exclusively and refuses startup whenever that file exists, with `Data directory is in use: MD_DATA_DIR/.lock exists`. Graceful shutdown on SIGTERM, SIGINT or SIGHUP removes it, and so does every other process exit the runtime can observe: the forced exit when shutdown exceeds its 10-second deadline, an uncaught exception, or a startup failure. A SIGKILL (`docker kill`, or `docker stop` exceeding `stop_grace_period`), an OOM kill or a host crash leaves it behind, and every restart then fails with that message. With `restart: unless-stopped` the container then keeps restarting and failing, so stop it explicitly before removing the lock. A process only ever removes a lock whose contents (its PID plus a random per-start token) it wrote itself, so a hung old process cannot remove a newer service's lock. Automatic PID-based reclamation is unsafe because PIDs are reused and differ between container namespaces, so remove a leftover lock manually:
+
+```sh
+docker compose -f compose.multitenant.yaml stop markdownify   # also stops a crash-restart loop
+docker compose -f compose.multitenant.yaml ps --all              # confirm no markdownify container is running or restarting
+docker compose -f compose.multitenant.yaml run --rm --no-deps --entrypoint rm markdownify -f /data/.lock
+docker compose -f compose.multitenant.yaml start markdownify
+```
+
+For a native process, stop it (and any supervisor that restarts it), confirm that it is not running, and run `rm -f "$MD_DATA_DIR/.lock"`. The purge tool refuses to run while any lock exists, and refuses a path that contains neither job manifests nor `audit.jsonl`. It follows a symlinked data directory and never reads document contents. It is a dry run unless `--apply` is given. A dry run reads manifests and file sizes only and writes nothing, so it also works on a read-only snapshot or mount. `--apply` needs write access and holds the lock for the whole run, so the service cannot start and load half-deleted directories during a purge. A completed purge, or one interrupted with SIGINT, SIGTERM or SIGHUP, leaves no lock; only SIGKILL (or an OOM kill or host crash) leaves one behind, to be removed as above:
+
+```sh
+docker compose -f compose.multitenant.yaml stop markdownify
+# Dry run: lists the owner's job IDs, states and byte counts, plus skipped and unreadable directories.
+docker compose -f compose.multitenant.yaml run --rm --no-deps markdownify node dist/remote/purge-owner.js /data <tenant_id> <agent_id>
+# After reviewing the list, remove those job directories.
+docker compose -f compose.multitenant.yaml run --rm --no-deps markdownify node dist/remote/purge-owner.js /data <tenant_id> <agent_id> --apply
+# Confirm before restarting (the running service holds the lock, so purge-owner refuses afterwards): "jobs" must be empty.
+docker compose -f compose.multitenant.yaml run --rm --no-deps markdownify node dist/remote/purge-owner.js /data <tenant_id> <agent_id>
+docker compose -f compose.multitenant.yaml start markdownify
+```
+
+For a native process, run `node dist/remote/purge-owner.js "$MD_DATA_DIR" <tenant_id> <agent_id> [--apply]` with the process stopped, and repeat the dry run before restarting it. The tool always prints a JSON report:
+
+- `jobs`: the owner's jobs, each `listed` (dry run), `deleted`, or `failed` with an errno-style `code`. A failure on one job does not stop the others.
+- `skipped`: directories it will not touch: `missing_manifest` (an interrupted create, removed by the service at startup), `legacy_unowned` (a manifest without owner fields, only usable with `MD_LEGACY_OWNER`), `malformed_owner` (a manifest with only one of `tenant_id`/`agent_id`, or a non-string value), and `id_mismatch` (a manifest whose `id` differs from its directory name). Startup refuses `malformed_owner` and `id_mismatch`, and `legacy_unowned` unless `MD_LEGACY_OWNER` is set, so inspect them manually.
+- `unreadable`: manifests that could not be read or parsed. Ownership is never guessed; startup refuses these too.
+
+The exit status is 0 only when no job failed and no manifest was unreadable, 1 otherwise or when a precondition fails, and 2 for usage errors. Rerun with `--apply` after fixing a failure; already deleted jobs are simply absent. Do not delete job directories by hand from manifest contents: a directory's name, not the manifest's `id` field, is what the service loads.
+
+Audit entries for the retired agent contain only IDs and event codes and rotate out of the bounded history; export or filter `audit.jsonl` according to your own retention policy while the service is stopped. After the confirming dry run lists no jobs, restart the service and check that no `job_cleanup_sweep_failed` line follows the next sweep.
+
 ## Verification
 
 ```sh
