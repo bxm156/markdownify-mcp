@@ -28,7 +28,7 @@ MCP controls the job; the runtime transfers the bytes. Connecting an MCP client 
 
 ## Install the server
 
-For agents using LiteLLM, the recommended authentication is now [short-lived LiteLLM-signed JWTs](docs/JWT.md), using its open-source outbound signer and a distinct machine user per agent. This requires no Enterprise gateway JWT login. Follow that guide for `compose.jwt.yaml` and gateway client configuration. Binary uploads receive separate one-job credentials valid for at most five minutes.
+For agents using LiteLLM, the recommended authentication is now [short-lived LiteLLM-signed JWTs](docs/JWT.md), using its open-source outbound signer and a distinct machine user per agent. This requires no Enterprise gateway JWT login. Follow that guide for `compose.jwt.yaml` and gateway client configuration. Binary uploads receive separate one-job credentials valid for at most five minutes. The LiteLLM user ID is the owner; revoking a key or user in LiteLLM stops new admissions, and already-issued tokens and upload grants expire on their own ([details](docs/JWT.md#revocation-is-bounded-not-immediate)).
 
 The steps below remain the standalone per-agent credential-registry alternative. Their direct-client examples use registry tokens; use the gateway examples in the JWT guide for the recommended setup.
 
@@ -302,7 +302,7 @@ Verify forwarding with two distinct agents in your own LiteLLM deployment. [Iden
 
 ## Limits and troubleshooting
 
-Defaults are 25 MiB per input and output, 24-hour retention, 15-minute upload tokens and a 120-second conversion timeout. Global, tenant and agent budgets also limit job admission and concurrent conversions. Small inputs reserve the maximum output budget. Configure limits in [.env.multitenant.example](.env.multitenant.example); [quota details](docs/MULTITENANT.md#budgets-and-scheduling).
+Defaults are 25 MiB per input and output, 24-hour retention, 15-minute upload tokens and a 120-second conversion timeout. Global, tenant and agent budgets also limit job admission and concurrent conversions. Small inputs reserve the maximum output budget. Configure limits in [.env.multitenant.example](.env.multitenant.example); [quota details](docs/MULTITENANT.md#budgets-and-scheduling). In JWT mode tenant and agent limits both apply to each LiteLLM user ([effective limits](docs/JWT.md#effective-per-user-limits)). Operators can set per-agent caps with `MD_QUOTA_OVERRIDES_FILE` ([operator quota overrides](docs/MULTITENANT.md#operator-quota-overrides)).
 
 | Symptom | Check |
 | --- | --- |
@@ -330,14 +330,18 @@ CI tests every push and PR, including real PDF/Office conversions, Docker builds
 
 The upstream local stdio entry point remains `dist/index.js` (`bun start`) with local-path and web conversion tools. It is separate from the remote `dist/remote/index.js` service and its seven remote tools. Local mode needs its own Python/dependency setup; the original `Dockerfile` builds stdio mode, while `Dockerfile.remote` builds the service documented here.
 
+URL conversion in stdio mode (`webpage-to-markdown` and the other URL tools) accepts only `http:`/`https:` URLs without embedded credentials. It resolves the hostname and refuses loopback, private, link-local, unique-local and cloud-metadata addresses, then connects only to the addresses it checked (re-checking every redirect hop, up to 10). Each download has a 30-second deadline covering DNS, redirects and the body, and a 50 MiB cap on the decompressed body. Because the connection is pinned to the checked address, **`HTTPS_PROXY`/`HTTP_PROXY` are not used** for these downloads; the server prints a one-line note on stderr at startup when they are set. Run it where the target sites are directly reachable.
+
 ## Further documentation
+
+Documentation site: [bxm156.github.io/markdownify-mcp](https://bxm156.github.io/markdownify-mcp/) renders these pages with search. Preview it locally with `python -m venv .venv && . .venv/bin/activate && pip install -r docs/requirements.txt && mkdocs serve`.
 
 - [Fresh deployment quickstart](docs/QUICKSTART.md)
 - [Remote HTTP settings and operations](docs/REMOTE.md)
 - [Private-agent credentials, quotas and LiteLLM](docs/MULTITENANT.md)
 - [Agent usage skill](SKILL.md)
 - [Container images and Docker Hub publishing](docs/CONTAINERS.md)
-- [Health monitoring: real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). GET /livez (alias /healthz) is a liveness probe; GET /readyz returns 503 until storage, the converter and startup are ready and publishes only boolean checks. Authenticated agents can call `get_service_health` for their own queue/reservation metrics and configured limits; identity-free probes never gain file access.
+- [Health monitoring: real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). GET /livez (alias /healthz) is a liveness probe; GET /readyz returns 503 until storage, the converter and startup are ready and publishes only boolean checks. Authenticated agents can call `get_service_health` for their own queue/reservation metrics, configured limits and effective limits; identity-free probes never gain file access.
 
 ## License
 

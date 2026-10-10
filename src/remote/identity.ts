@@ -8,3 +8,7 @@ export function validatePrincipal(value: unknown): Principal {
   if (typeof tenantId !== "string" || typeof agentId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(tenantId) || !/^[A-Za-z0-9_-]{1,64}$/.test(agentId)) throw new Error("Invalid principal");
   return Object.freeze({ tenantId, agentId });
 }
+
+/** Operator-configured agent-scope caps for one principal; absent fields keep the configured defaults. */
+export type QuotaOverride = { maxJobs?: number; maxStorageBytes?: number; maxConcurrency?: number };
+export const quotaKey = (principal: Principal) => `${principal.tenantId}\n${principal.agentId}`;

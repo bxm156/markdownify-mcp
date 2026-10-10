@@ -88,7 +88,8 @@ test("HTTP enforces authentication, host/origin checks and bounded JSON", async 
   expect((await request("/healthz")).status).toBe(200);
   expect((await request("/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status).toBe(401);
   expect((await request("/mcp", { method: "POST", headers: { Authorization: "Bearer wrong", "Content-Type": "application/json" }, body: "{}" })).status).toBe(401);
-  expect((await request("/healthz", { headers: { Origin: "https://attacker.invalid" } })).status).toBe(403);
+  expect((await request("/mcp", { method: "POST", headers: { Origin: "https://attacker.invalid", "Content-Type": "application/json" }, body: "{}" })).status).toBe(403);
+  expect((await request("/healthz", { headers: { Origin: "https://attacker.invalid" } })).status).toBe(200);
   const headers = { Authorization: `Bearer ${options.apiKey}`, "Content-Type": "application/json" };
   expect((await request("/mcp", { headers })).status).toBe(405);
   expect((await request("/mcp?token=secret", { method: "POST", headers, body: "{}" })).status).toBe(400);

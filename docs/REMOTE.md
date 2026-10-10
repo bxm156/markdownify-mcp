@@ -113,6 +113,7 @@ For PowerShell use `$env:MCP_URL='...'` (and similarly for other variables) inst
 | `MD_UPLOAD_TTL_MS` | 900,000 (15 minutes) | Abandoned upload expiry |
 | `MD_CONVERSION_TIMEOUT_MS` | 120,000 (2 minutes) | Converter process deadline |
 | `MD_CONCURRENCY` | 2 | Maximum active converters |
+| `MD_QUOTA_OVERRIDES_FILE` | unset | Optional operator-managed per-principal agent caps; see [MULTITENANT.md](MULTITENANT.md#operator-quota-overrides) |
 
 Storage reservations are conservative: even a small file reserves the full configured Markdown output limit. Increase storage or lower output limits to accommodate more live jobs. JSON manifests and scratch buffers add overhead; the application budget is not a filesystem quota. Use a dedicated volume with adequate free space. Store it on an encrypted disk if document confidentiality requires it. Do not log upload authorization headers or whole `create_upload` results in agent traces.
 
