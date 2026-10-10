@@ -10,3 +10,7 @@ dist
 TODO
 *.pdf
 !src/sample-data/test.pdf
+
+# MkDocs build output
+site/
+__pycache__/
