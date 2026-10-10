@@ -35,7 +35,7 @@ This abbreviated example illustrates the shape; follow the actual returned next_
 | MARKDOWN_NOT_READY | Check status; poll queued/running, follow failed-job guidance | Concurrency queues work |
 | AUDIT_UNAVAILABLE / INTERNAL_ERROR | Operator recovery before retrying | Storage/permissions/service health |
 
-Quota details contain configured `scope` and limits, never usage counts or other owners' IDs. `reserved_bytes` is the space required by the attempted upload, not total used storage. Unknown lookup codes return `UNKNOWN_ERROR_CODE` with `isError: true`. Request/schema/auth errors also carry guidance.
+Quota details contain configured `scope` and limits, never usage counts or other owners' IDs. For `scope: "agent"` the limit is the caller's own operator override when one is configured. `reserved_bytes` is the space required by the attempted upload, not total used storage. Unknown lookup codes return `UNKNOWN_ERROR_CODE` with `isError: true`. Request/schema/auth errors also carry guidance.
 
 `retryable` never means unlimited or immediate retries. Follow next_steps with backoff and a deadline; quota failures require capacity to change. Delete only your own known unneeded jobs when authorized. Retain job IDs because there is no listing tool. Calling start_conversion again does not restart failed jobs.
 

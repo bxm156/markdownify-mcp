@@ -302,7 +302,7 @@ Verify forwarding with two distinct agents in your own LiteLLM deployment. [Iden
 
 ## Limits and troubleshooting
 
-Defaults are 25 MiB per input and output, 24-hour retention, 15-minute upload tokens and a 120-second conversion timeout. Global, tenant and agent budgets also limit job admission and concurrent conversions. Small inputs reserve the maximum output budget. Configure limits in [.env.multitenant.example](.env.multitenant.example); [quota details](docs/MULTITENANT.md#budgets-and-scheduling). In JWT mode tenant and agent limits both apply to each LiteLLM user ([effective limits](docs/JWT.md#effective-per-user-limits)).
+Defaults are 25 MiB per input and output, 24-hour retention, 15-minute upload tokens and a 120-second conversion timeout. Global, tenant and agent budgets also limit job admission and concurrent conversions. Small inputs reserve the maximum output budget. Configure limits in [.env.multitenant.example](.env.multitenant.example); [quota details](docs/MULTITENANT.md#budgets-and-scheduling). In JWT mode tenant and agent limits both apply to each LiteLLM user ([effective limits](docs/JWT.md#effective-per-user-limits)). Operators can set per-agent caps with `MD_QUOTA_OVERRIDES_FILE` ([operator quota overrides](docs/MULTITENANT.md#operator-quota-overrides)).
 
 | Symptom | Check |
 | --- | --- |
@@ -341,7 +341,7 @@ Documentation site: [bxm156.github.io/markdownify-mcp](https://bxm156.github.io/
 - [Private-agent credentials, quotas and LiteLLM](docs/MULTITENANT.md)
 - [Agent usage skill](SKILL.md)
 - [Container images and Docker Hub publishing](docs/CONTAINERS.md)
-- [Health monitoring: real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). GET /livez (alias /healthz) is a liveness probe; GET /readyz returns 503 until storage, the converter and startup are ready and publishes only boolean checks. Authenticated agents can call `get_service_health` for their own queue/reservation metrics and configured limits; identity-free probes never gain file access.
+- [Health monitoring: real readiness and LiteLLM 1.104 probes](docs/HEALTH.md). GET /livez (alias /healthz) is a liveness probe; GET /readyz returns 503 until storage, the converter and startup are ready and publishes only boolean checks. Authenticated agents can call `get_service_health` for their own queue/reservation metrics, configured limits and effective limits; identity-free probes never gain file access.
 
 ## License
 
