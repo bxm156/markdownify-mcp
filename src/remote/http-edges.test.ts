@@ -79,7 +79,7 @@ function raw(port: number, parts: Array<string | Buffer>): Promise<RawResponse> 
       let json: any; try { json = JSON.parse(body); } catch { json = undefined; }
       finish(undefined, { status: Number(statusLine.split(" ")[1]), statusLine, headers, body, json });
     };
-    socket.on("data", data => { buffer = Buffer.concat([buffer, data]); attempt(false); });
+    socket.on("data", (data: Buffer) => { buffer = Buffer.concat([buffer, data]); attempt(false); });
     // The server may reset the connection after replying early (e.g. 413 with an unread body); only fail if no response arrived.
     socket.on("error", error => { if (!done && !buffer.length) finish(error); });
     socket.on("close", () => { attempt(true); if (!done) finish(new Error(`Connection closed before a full response: ${buffer.toString("latin1")}`)); });
