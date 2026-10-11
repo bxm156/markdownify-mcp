@@ -4,6 +4,13 @@
 #
 # The script is also sourceable (scripts/docker-smoke-test.test.sh does so) to
 # test wait_for_response without Docker.
+#
+# Usage: scripts/docker-smoke-test.sh   (no arguments; needs Docker)
+# Env:   IMAGE          tag to build and run (default markdownify-mcp:smoke)
+#        SMOKE_TIMEOUT  seconds to wait for the tools/call answer (default 60)
+# Exit:  0 on PASS; 1 on a missing fixture, a failed build, no answer in
+#        time, a container that exits first, an isError result, or output
+#        without the expected text.
 set -euo pipefail
 
 # wait_for_response ID TIMEOUT_SECONDS
@@ -47,6 +54,7 @@ wait_for_response() {
 }
 
 main() {
+  # Run from the repo root: the build context and sample-data live there.
   cd "$(dirname "$0")/.."
 
   local image="${IMAGE:-markdownify-mcp:smoke}"
@@ -76,6 +84,9 @@ main() {
   # The container's stdin must stay open until the response arrives, otherwise
   # the server may exit on EOF before it answers. The feeder therefore idles
   # until the reader below drops the "done" marker.
+  # Exit statuses of this pipeline are ignored (|| true; the feeder may die
+  # of SIGPIPE). The reader runs in a subshell, so it hands its verdict back
+  # through $tmp/rc. MD_ALLOWED_PATHS exercises the allowlist code path.
   {
     printf '%s\n' \
       '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \

@@ -1,4 +1,19 @@
-"""Optional integration check using LiteLLM 1.104.0's actual unauthenticated health client."""
+"""Optional integration check using LiteLLM 1.104.0's actual unauthenticated health client.
+
+Starts the compiled remote server (dist/remote/index.js under MD_TEST_NODE,
+default ``node``) in JWT mode on a free loopback port, waits for /readyz, and
+then uses LiteLLM's real MCPClient, without credentials, to check that:
+
+* anonymous initialize + ping succeeds (what LiteLLM's MCP health check does);
+* anonymous tool discovery is denied with HTTP 401 and no other status;
+* the public readiness payload reports writable storage and an available
+  converter and does not leak per-principal data (``own_jobs``).
+
+Usage: python scripts/litellm-health-smoke.py [--self-test], from the repo
+root. ``--self-test`` runs only the 401 classifier regression cases (no
+server). Requires litellm==1.104.0. Failures raise AssertionError (exit 1);
+``check`` is used instead of ``assert`` so this holds under ``python -O``.
+"""
 import asyncio
 import importlib.metadata
 import json
@@ -12,6 +27,8 @@ import urllib.error
 import socket
 import sys
 
+# Must be set before litellm is imported: use the bundled model cost map
+# instead of downloading one.
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 import httpx
 # LiteLLM 1.104's MCP client is built on the httpx2 fork, so the status errors it raises are
@@ -69,6 +86,7 @@ def is_only_http_401(exc):
 
 
 def _status_error(module, status, url="http://127.0.0.1:40123/mcp"):
+    """Return a real ``module.HTTPStatusError`` for ``status``, raised the way a client raises it."""
     request = module.Request("POST", url)
     try:
         module.Response(status, request=request).raise_for_status()
@@ -136,6 +154,11 @@ def self_test():
 
 
 async def verify(base, timeout=10):
+    """Run the anonymous health and discovery checks against the server at ``base``.
+
+    Raises AssertionError if initialize/ping fails or discovery is not denied
+    with exactly HTTP 401.
+    """
     client = MCPClient(server_url=base + "/mcp", extra_headers={"Host": "127.0.0.1"}, timeout=timeout)
     async def noop(session):
         await session.send_ping()
@@ -157,11 +180,13 @@ async def verify(base, timeout=10):
         raise AssertionError("Anonymous discovery unexpectedly succeeded")
 
 def main():
+    """Run the self-test, then (unless ``--self-test``) start the server and check it."""
     check(importlib.metadata.version("litellm") == "1.104.0", "LiteLLM 1.104.0 is required")
     self_test()
     if "--self-test" in sys.argv[1:]:
         print("401-only classifier self-test passed")
         return
+    # Borrow a free port; it is released again before the server binds it.
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]

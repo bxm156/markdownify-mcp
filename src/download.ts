@@ -1,3 +1,17 @@
+/**
+ * Pinned-address HTTP(S) client for URL conversions.
+ *
+ * download.fetch connects only to addresses the caller has already vetted
+ * (utils.resolvePublicAddresses), racing them RFC 8305 (Happy Eyeballs)
+ * style, and never resolves the hostname itself, so DNS cannot change the
+ * answer between validation and connection. It does not follow redirects
+ * (the caller re-validates each hop) and deliberately ignores proxy
+ * variables (see proxyWarning.ts).
+ *
+ * Invariants: the module imports nothing local, so tests can load it under
+ * plain Node as well as Bun; it uses only node: APIs that behave alike in
+ * both; and it returns a WHATWG Response, so callers treat it like fetch().
+ */
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
@@ -6,8 +20,10 @@ import { Readable } from "node:stream";
 import tls from "node:tls";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 
+/** One vetted address, in the shape dns.lookup({ all: true }) returns. */
 export type ResolvedAddress = { address: string; family: number };
 
+/** Same as server.readPackageVersion, duplicated so this module imports nothing local. */
 function readPackageVersion(): string {
   try {
     const packageJson = JSON.parse(
@@ -63,6 +79,7 @@ function isVerificationError(code: string): boolean {
   );
 }
 
+/** Statuses that never carry a body; the Response constructor rejects one for them. */
 const NO_BODY_STATUSES = [204, 205, 304];
 
 /**
@@ -157,6 +174,7 @@ export function resetConnectionMemory(limit = CONNECTION_MEMORY_LIMIT): void {
   familyMemoryLimit = limit;
 }
 
+/** Records the winning family for `hostname`, evicting the least recently won beyond the limit. */
 function rememberWinner(hostname: string, family: number): void {
   familyMemory.delete(hostname);
   familyMemory.set(hostname, family === 4 ? "ipv4" : "ipv6");
@@ -187,6 +205,12 @@ export function interleaveFamilies(addresses: ResolvedAddress[], preferred = 6):
   return ordered;
 }
 
+/**
+ * A decompressor for the response's Content-Encoding, or undefined for none.
+ * Requests ask for `identity`, so this only matters for servers that compress
+ * anyway. Stacked ("gzip, br") and unknown encodings throw rather than hand
+ * markitdown compressed bytes. The caller's size cap counts decoded bytes.
+ */
 function createDecoder(contentEncoding: string | null) {
   const encoding = (contentEncoding ?? "").trim().toLowerCase();
   if (encoding === "" || encoding === "identity") return undefined;
@@ -208,6 +232,7 @@ function createDecoder(contentEncoding: string | null) {
   }
 }
 
+/** Where to connect: TLS or not, the bare hostname (SNI, certificate check, family memory) and port. */
 type Target = { secure: boolean; hostname: string; port: number };
 
 function targetOf(url: string): Target {
@@ -230,6 +255,7 @@ const ignoreError = () => {};
  * and the certificate identity check, exactly as https.request would.
  */
 function openSocket(target: Target, selected: ResolvedAddress): net.Socket {
+  // Cast: one implementation cannot satisfy every overload of Node's LookupFunction type.
   const lookup = ((_host: string, options: { all?: boolean }, callback: (...args: any[]) => void) => {
     // Answer asynchronously like dns.lookup does. A synchronous answer lets
     // an immediate connect error (EAFNOSUPPORT) fire on the socket before
@@ -249,6 +275,12 @@ function openSocket(target: Target, selected: ResolvedAddress): net.Socket {
   });
 }
 
+/**
+ * One address attempt in connectFirst. `budget` is its connect timer (absent
+ * once lifted, or never set for the last possible attempt), `failure` the
+ * code it failed with, and `released` marks that its timer and listeners are
+ * gone (and, unless it won, its socket destroyed).
+ */
 type Attempt = {
   selected: ResolvedAddress;
   socket: net.Socket;
@@ -283,6 +315,10 @@ function connectFirst(
   let staggerTimer: ReturnType<typeof setTimeout> | undefined;
   let settled = false;
 
+  /**
+   * Detaches `attempt` once (idempotent). With `destroy` its socket is also
+   * destroyed, keeping a no-op error listener so a late error is not uncaught.
+   */
   const release = (attempt: Attempt, destroy: boolean) => {
     if (attempt.released) return;
     attempt.released = true;
@@ -305,6 +341,7 @@ function connectFirst(
     for (const attempt of attempts) release(attempt, attempt !== winner);
   };
 
+  /** ConnectFailedError for the attempts so far; any still in flight report `pendingCode`. */
   const combinedError = (pendingCode: string, cause?: unknown) =>
     new ConnectFailedError(
       url,
@@ -381,6 +418,7 @@ function connectFirst(
           settle();
           onFailure(combinedError("unknown"));
         } else {
+          // Others are still in flight; if only one is left, lift its budget.
           exemptLastPossible();
         }
       },
@@ -388,6 +426,7 @@ function connectFirst(
     attempts.push(attempt);
     socket.once(readyEvent, attempt.onReady);
     socket.on("error", attempt.onError);
+    // The last possible attempt never gets a budget; see CONNECT_TIMEOUT_MS.
     if (!isLastPossible(attempt)) {
       const budget = setTimeout(() => {
         // A timer that was already due when its budget was lifted must not fire.
@@ -444,19 +483,27 @@ function requestOver(url: string, socket: net.Socket, signal: AbortSignal): Prom
       let body: Readable = response;
       if (decoder) {
         const activeDecoder = decoder;
+        // Tie both ends together: a failed response fails the body stream, and
+        // a cancelled or failed body tears down the response (and socket).
         response.on("error", (error) => activeDecoder.destroy(error));
         activeDecoder.on("close", () => response.destroy());
         body = response.pipe(activeDecoder);
+        // They describe the encoded bytes, not the decoded body.
         headers.delete("content-encoding");
         headers.delete("content-length");
       }
+      // statusCode is always set on a client response; `?? 500` only satisfies its type.
       const status = response.statusCode ?? 500;
       const hasBody = !NO_BODY_STATUSES.includes(status);
+      // The double cast: Readable.toWeb is typed with node:stream/web's
+      // ReadableStream, which TypeScript does not equate with the global one
+      // that Response accepts; at runtime they are the same class.
       resolve(new Response(hasBody ? (Readable.toWeb(body) as unknown as ReadableStream<Uint8Array>) : null, {
         status,
         statusText: response.statusMessage,
         headers,
       }));
+      // Drain an unused response so the connection can finish and close.
       if (!hasBody) response.resume();
     });
     // Until the request attaches its own socket listeners (it announces that
@@ -470,6 +517,10 @@ function requestOver(url: string, socket: net.Socket, signal: AbortSignal): Prom
   });
 }
 
+/**
+ * The pinned-address client. An object rather than a bare function so tests
+ * can replace `download.fetch` (Markdownify calls it through this object).
+ */
 export const download = {
   /**
    * Direct connection with DNS pinned to the validated addresses, raced

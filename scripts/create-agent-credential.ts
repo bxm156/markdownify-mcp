@@ -1,4 +1,20 @@
-/** Operator-only utility: never expose this as an MCP tool. */
+/**
+ * Operator-only utility: never expose this as an MCP tool.
+ *
+ * Adds one bearer credential for <tenant>/<agent> to the remote server's
+ * credential registry (the file MD_AUTH_FILE names). The registry stores only
+ * the token's SHA-256; the token itself is written once to a new file (mode
+ * 0600) and never printed.
+ *
+ * Usage: bun scripts/create-agent-credential.ts <tenant> <agent> <registry.json> <token.txt>
+ *
+ * An exclusive `<registry>.lock` (created with O_EXCL) serialises concurrent
+ * runs; one left behind by a crash must be removed by hand. The registry is
+ * replaced atomically (temp file + rename), the token file must not exist
+ * yet, and if the registry update fails the token file is removed again so no
+ * unregistered token is left behind. Any error, including an existing
+ * registry that does not validate, throws and exits non-zero.
+ */
 import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -17,10 +33,12 @@ const temporary = `${registry}.${randomUUID()}.tmp`;
 let tokenCreated = false, committed = false;
 try {
   let existing: { credentials: Array<Record<string, unknown>> } = { credentials: [] };
+  // A missing registry starts empty; an unreadable or invalid one aborts the run.
   try { existing = JSON.parse(await fs.readFile(registry, "utf8")); createAuthenticator(existing); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Existing credential registry is invalid or unreadable"); }
   const token = randomBytes(32).toString("hex");
   const updated = { credentials: [...existing.credentials, { tenant_id: tenantId, agent_id: agentId, token_sha256: hashToken(token) }] };
+  // Validate the result (e.g. no duplicate hash) before anything is written.
   createAuthenticator(updated);
   await fs.writeFile(destination, `${token}\n`, { flag: "wx", mode: 0o600 });
   tokenCreated = true;

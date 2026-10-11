@@ -2,6 +2,10 @@
 # Wait until a started container answers /readyz AND Docker reports its image HEALTHCHECK as healthy.
 # Usage: scripts/wait-for-container.sh <container> [base-url] [timeout-seconds]
 # On failure prints the health log and container logs, then exits 1.
+# Exit: 0 once /readyz has answered and Docker reports healthy; 1 if the
+# container is missing, stops, has no HEALTHCHECK, turns unhealthy, or the
+# timeout (default 90 s) passes. base-url defaults to http://localhost:8000.
+# Requires curl and docker.
 set -euo pipefail
 
 name="${1:?usage: wait-for-container.sh <container> [base-url] [timeout-seconds]}"
@@ -11,6 +15,7 @@ deadline=$((SECONDS + timeout))
 ready=0
 health=unknown
 
+# A /readyz success is remembered; the container state is re-read every second.
 while [ "$SECONDS" -lt "$deadline" ]; do
   if [ "$ready" -eq 0 ] && curl --fail --silent --max-time 1 "$base/readyz" >/dev/null; then
     ready=1
