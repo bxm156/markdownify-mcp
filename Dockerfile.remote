@@ -5,6 +5,10 @@ RUN bun install --frozen-lockfile --ignore-scripts
 COPY tsconfig.json ./
 COPY src ./src
 RUN bun run build:remote
+# The example client is compiled to plain Node JavaScript. Its only import is
+# @modelcontextprotocol/sdk, left external and resolved from the runtime node_modules.
+COPY examples/upload-and-convert.ts ./examples/upload-and-convert.ts
+RUN bun build examples/upload-and-convert.ts --target=node --packages=external --outfile build-examples/upload-and-convert.js
 
 # Install afresh so TypeScript and other development-only packages stay out of runtime.
 FROM oven/bun:1.4.2 AS production-deps
@@ -31,7 +35,7 @@ COPY --from=build /app/dist ./dist
 COPY --from=production-deps /app/node_modules ./node_modules
 COPY package.json LICENSE SKILL.md ./
 COPY docs/REMOTE.md docs/MULTITENANT.md docs/CONTAINERS.md docs/QUICKSTART.md docs/ERRORS.md docs/JWT.md docs/HEALTH.md ./docs/
-COPY examples/upload-and-convert.ts ./examples/upload-and-convert.ts
+COPY --from=build /app/build-examples/upload-and-convert.js ./examples/upload-and-convert.js
 RUN mkdir /data && chown 10001:10001 /data
 ENV NODE_ENV=production MD_HOST=0.0.0.0 MD_PORT=8000 MD_DATA_DIR=/data
 USER 10001:10001
