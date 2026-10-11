@@ -165,7 +165,7 @@ Reservations count input bytes plus the maximum output size for every non-expire
 
 New manifests persist immutable owner IDs. For a fresh deployment, leave `MD_LEGACY_OWNER` unset and use a new data volume. No client or data migration is required. The server retains an explicit recovery option for unowned manifests from older test deployments; assigning an owner is an operator-only operation and never happens automatically.
 
-Audit records live in `MD_DATA_DIR/audit.jsonl`, with timestamps, tenant/agent IDs, job IDs, event/status codes, and limited reason codes. They exclude filenames, document content, and bearer/upload tokens. Rotation bounds local history to a 4 MiB active file and three archives. Export metadata to your logging system if longer retention is needed. Audit metadata itself identifies agents and should have restricted operator access.
+Audit records live in `MD_DATA_DIR/audit.jsonl`, with timestamps, tenant/agent IDs, job IDs, event/status codes, and limited reason codes. They exclude filenames, document content, and bearer/upload tokens. Rotation bounds local history to a 4 MiB active file and three archives (`audit.jsonl.1` newest to `.3` oldest); no more files are ever kept. Rotation is resumable: if a step fails (for example a rename returns `EBUSY`), the triggering record is refused and the next write completes the interrupted shift into the free slot instead of starting over, and the oldest archive is deleted only when all three exist, so a failed rotation never drops a generation early. Export metadata to your logging system if longer retention is needed. Audit metadata itself identifies agents and should have restricted operator access.
 
 ### Audited events
 
@@ -200,13 +200,14 @@ Readiness reports the audit sink. After a failed audit write, from a caller's op
 
 A record the audit logger rejects before touching storage (for example `Invalid audit metadata`, which indicates a bug, not a disk problem) still refuses the operation with `AUDIT_UNAVAILABLE`, but does not mark the sink unavailable or affect readiness. Each distinct rejection message is logged once.
 
-Readiness transitions and rejected records are logged to stderr as single-line JSON for operator alerting. They carry no paths, error messages or metadata values:
+Readiness transitions, rejected records and rotation failures are logged to stderr as single-line JSON for operator alerting. They carry no paths, error messages or metadata values:
 
 | Event | When | Fields |
 | --- | --- | --- |
 | `audit_sink_unavailable` | The first failed write after the sink was available (not repeated per failed write or probe) | `code`: errno-style code such as `EIO`, `ENOSPC`, `EACCES`, or `UNKNOWN` |
 | `audit_sink_recovered` | The sink became available again | `via`: `write` (a write succeeded) or `probe` (two consecutive probes passed) |
 | `audit_record_rejected` | The logger rejected a record before writing; once per distinct message per process | `message`: a fixed string such as `Invalid audit metadata` |
+| `audit_rotation_failed` | A step of log rotation failed, so the triggering record was refused; once until a rotation succeeds | `code`: errno-style code such as `EBUSY`, `EACCES`, or `UNKNOWN` |
 
 This milestone supplies application-level file isolation for distinct credentials, bounded resources, and restart-safe ownership. The converter subprocess is not a security sandbox against malicious document parser exploits. Use trusted document sources or additional parser isolation for hostile uploads. Multiple service replicas, distributed storage/queues, and a credential-management UI remain separate work.
 
