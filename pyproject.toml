@@ -1,9 +1,9 @@
 [project]
-name = "ocr"
+name = "markdownify-mcp-converter"
 version = "0.1.0"
-description = "Add your description here"
+description = "Python environment holding the MarkItDown converter used by the markdownify MCP servers"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
-    "markitdown[all]>=0.1.5",
+    "markitdown[all]==0.1.5",
 ]

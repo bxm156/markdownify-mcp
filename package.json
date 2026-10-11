@@ -4,8 +4,12 @@
   "description": "MCP Markdownify Server - Model Context Protocol Server for Converting Almost Anything to Markdown",
   "license": "MIT",
   "author": "@zcaceres (@zachcaceres | zach.dev)",
-  "homepage": "https://github.com/zcaceres/markdownify-mcp",
-  "bugs": "https://github.com/zcaceres/markdownify-mcp/issues",
+  "homepage": "https://github.com/bxm156/markdownify-mcp",
+  "bugs": "https://github.com/bxm156/markdownify-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bxm156/markdownify-mcp.git"
+  },
   "type": "module",
   "engines": {
     "node": ">=22"
