@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { createConverter } from "./converter.js";
+import { conversionAbort, createConverter } from "./converter.js";
 import { ServiceError } from "./errors.js";
 import { JobService, type JobServiceOptions } from "./jobs.js";
 import type { Principal } from "./identity.js";
@@ -46,13 +46,23 @@ describe("subprocess converter", () => {
     const pid = await waitForPid(pidFile);
     await waitFor(async () => (await fs.readFile(output, "utf8").catch(() => "")) === "partial output", { timeoutMs: 5000, label: "streamed partial output" });
     expect(alive(pid)).toBe(true);
+    // A reason that is not a conversion abort reason falls back to a cancellation, never CONVERSION_FAILED.
     controller.abort();
     const error = await rejection;
-    // Current behaviour: the SIGKILLed child surfaces as CONVERSION_FAILED rather than the abort reason;
-    // JobService classifies cancellation and timeout from the signal state, not from this error.
     expect(error).toBeInstanceOf(ServiceError);
-    expect(error.code).toBe("CONVERSION_FAILED");
+    expect(error).toMatchObject({ statusCode: 409, code: "CONVERSION_CANCELLED" });
     // The converter waits for the child to close before rejecting, so the PID is already reaped.
+    expect(alive(pid)).toBe(false);
+  });
+
+  test("an abort while the child runs rejects with the abort reason", async () => {
+    const dir = await tempDir(), { executable, pidFile } = await fakeConverter(dir, hang);
+    const converter = createConverter({ executable, maxOutputBytes: 1000 });
+    const controller = new AbortController(), reason = conversionAbort.interrupted();
+    const rejection = converter(path.join(dir, "input.txt"), path.join(dir, "out.part"), controller.signal).then(() => null, error => error);
+    const pid = await waitForPid(pidFile);
+    controller.abort(reason);
+    expect(await rejection).toBe(reason);
     expect(alive(pid)).toBe(false);
   });
 
@@ -60,9 +70,14 @@ describe("subprocess converter", () => {
     const dir = await tempDir(), output = path.join(dir, "out.part");
     // Spawning this missing executable would reject with ENOENT, not the abort reason.
     const converter = createConverter({ executable: path.join(dir, "missing-markitdown"), maxOutputBytes: 1000 });
-    const controller = new AbortController(), reason = new Error("cancelled before start");
+    const controller = new AbortController(), reason = conversionAbort.timedOut(50);
     controller.abort(reason);
     await expect(converter(path.join(dir, "input.txt"), output, controller.signal)).rejects.toBe(reason);
+    // Any other reason, including a ServiceError with an unrelated code, becomes a cancellation.
+    for (const other of [new Error("cancelled before start"), new ServiceError(413, "Converted Markdown exceeds output limit", "OUTPUT_LIMIT_EXCEEDED")]) {
+      const aborted = new AbortController(); aborted.abort(other);
+      await expect(converter(path.join(dir, "input.txt"), output, aborted.signal)).rejects.toMatchObject({ statusCode: 409, code: "CONVERSION_CANCELLED" });
+    }
     expect(await exists(output)).toBe(false);
   });
 
@@ -94,7 +109,7 @@ describe("subprocess converter inside the job service", () => {
     return { instance, dataDir, id: job.upload_id, jobDir: path.join(dataDir, job.upload_id) };
   }
 
-  test("shutdown during conversion kills the child and removes the partial output", async () => {
+  test("shutdown during conversion kills the child, removes the partial output and persists CONVERSION_INTERRUPTED", async () => {
     const dir = await tempDir(), { executable, pidFile } = await fakeConverter(dir, hang);
     const { instance, id, jobDir } = await service(executable);
     await instance.startConversion(alice, id);
@@ -103,7 +118,7 @@ describe("subprocess converter inside the job service", () => {
     await instance.close();
     expect(alive(pid)).toBe(false);
     expect((await fs.readdir(jobDir)).sort()).toEqual(["input.txt", "job.json"]);
-    expect(JSON.parse(await fs.readFile(path.join(jobDir, "job.json"), "utf8"))).toMatchObject({ status: "failed", error_code: "CONVERSION_CANCELLED" });
+    expect(JSON.parse(await fs.readFile(path.join(jobDir, "job.json"), "utf8"))).toMatchObject({ status: "failed", error: "Conversion interrupted by server restart", error_code: "CONVERSION_INTERRUPTED" });
   });
 
   test("a missing converter executable maps to INTERNAL_ERROR without leaking its path", async () => {

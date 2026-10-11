@@ -60,6 +60,12 @@ jobs:
             -e MD_PUBLIC_BASE_URL=http://localhost:8000 markdownify-remote:publish-candidate
           bash scripts/wait-for-container.sh markdownify-publish-test
           bun scripts/multitenant-http-smoke.ts
+          # The documented streaming helper against the same multitenant container, as agent "a".
+          # MD_TEST_AGENT_KEYS (JSON, masked) was exported by the registry step through GITHUB_ENV.
+          example_output="$RUNNER_TEMP/upload-and-convert.md"
+          MCP_TOKEN="$(jq -r .a <<<"$MD_TEST_AGENT_KEYS")" CONVERSION_DEADLINE_MS=120000 \
+            bun examples/upload-and-convert.ts src/sample-data/test.pdf "$example_output"
+          grep -q 'Test PDF content' "$example_output"
       - name: Check publication configuration
         id: publication
         shell: bash

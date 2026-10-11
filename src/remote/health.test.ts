@@ -219,11 +219,13 @@ test("malformed request target is rejected with 400, not 500", async () => {
 test("Host bypass matches probe paths exactly", async () => {
   const f = await fixture();
   const cases: Array<[string, number]> = [
-    ["/livez/", 403], ["/LIVEZ", 403], ["//livez", 403], ["/%6civez", 403], ["/readyz/", 403], ["/healthz.json", 403],
+    ["/livez/", 403], ["/LIVEZ", 403], ["/%6civez", 403], ["/readyz/", 403], ["/healthz.json", 403],
     ["/livez?x=1", 400],
-    // Current behaviour: the fragment is dropped and an absolute-form target's authority is ignored, so these
-    // still reach /livez. Acceptable because probe bodies are boolean-only and carry no per-user data.
-    ["/livez#frag", 200], ["http://evil.example/livez", 200],
+    // Targets that are not origin-form carry their own authority and are refused before the probe exemption.
+    ["//livez", 400], ["//evil.example/livez", 400], ["http://evil.example/livez", 400],
+    // Current behaviour: the fragment is dropped, so this still reaches /livez. Acceptable because probe bodies
+    // are boolean-only and carry no per-user data.
+    ["/livez#frag", 200],
   ];
   for (const [target, status] of cases) expect([target, statusOf(await rawGet(f.base, target, "10.0.0.7:8000"))]).toEqual([target, status]);
 });

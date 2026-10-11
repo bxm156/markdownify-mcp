@@ -15,8 +15,9 @@ import {
   isMarkdownFile,
   resolveMarkitdownPath,
   resolveRepomixPath,
-  getAllowedPaths,
   openLocalFile,
+  readOpenedFile,
+  MAX_LOCAL_FILE_BYTES,
   type OpenedLocalFile,
 } from "./utils.js";
 const execFileAsync = promisify(execFile);
@@ -25,7 +26,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const FETCH_TIMEOUT_MS = 30_000;
-const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024; // 50 MiB
+// URL downloads and local files share one input budget (50 MiB).
+const MAX_DOWNLOAD_BYTES = MAX_LOCAL_FILE_BYTES;
 
 export type MarkdownResult = {
   path?: string;
@@ -164,40 +166,42 @@ export class Markdownify {
    * Copies the bytes behind an already-validated handle into `stagingDir`,
    * keeping the original extension (markitdown picks its converter from it).
    * Reads go through the handle with explicit offsets, never through a path,
-   * so the copy is exactly the file that passed the allowlist check.
+   * so the copy is exactly the file that was opened and checked.
    */
   private static async stageOpenedFile(
     handle: fs.promises.FileHandle,
-    size: number,
     originalPath: string,
     stagingDir: string,
-    maxBytes = MAX_DOWNLOAD_BYTES,
+    maxBytes = MAX_LOCAL_FILE_BYTES,
   ): Promise<string> {
-    const tooLarge = new Error(
-      `File "${originalPath}" exceeds the ${maxBytes}-byte limit for local conversion.`,
-    );
-    if (size > maxBytes) throw tooLarge;
-
     const stagedPath = path.join(
       stagingDir,
       `input${path.extname(originalPath)}`,
     );
     const out = await fs.promises.open(stagedPath, "wx", 0o600);
     try {
-      const buffer = Buffer.alloc(1024 * 1024);
-      let position = 0;
-      for (;;) {
-        const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
-        if (bytesRead === 0) break;
-        position += bytesRead;
-        // The file may grow after fstat; enforce the limit on what is read.
-        if (position > maxBytes) throw tooLarge;
-        await out.write(buffer, 0, bytesRead);
+      // The file may grow after fstat; readOpenedFile enforces the limit on
+      // what is actually read.
+      for await (const chunk of readOpenedFile(handle, originalPath, maxBytes)) {
+        await out.write(chunk);
       }
     } finally {
       await out.close();
     }
     return stagedPath;
+  }
+
+  /** Reads an opened Markdown file as UTF-8, refusing more than `maxBytes`. */
+  private static async readOpenedText(
+    handle: fs.promises.FileHandle,
+    displayPath: string,
+    maxBytes = MAX_LOCAL_FILE_BYTES,
+  ): Promise<string> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of readOpenedFile(handle, displayPath, maxBytes)) {
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks).toString("utf-8");
   }
 
   static async toMarkdown({
@@ -228,29 +232,25 @@ export class Markdownify {
       if (filePath) {
         const expanded = expandHome(filePath);
 
-        if (!getAllowedPaths()) {
-          // No allowlist: every readable file is permitted, so a path swap
-          // cannot widen access. Pass the path straight to markitdown rather
-          // than doubling the I/O with a private copy, but refuse
-          // directories, FIFOs, devices and sockets like the allowlisted path.
-          const stats = await fs.promises.stat(expanded);
-          if (!stats.isFile()) {
-            throw new Error(`Path "${filePath}" is not a regular file.`);
-          }
-          const text = await this._markitdown(expanded, projectRoot);
-          return { text };
-        }
-
-        // Allowlist: markitdown is a separate process that would reopen the
-        // path, so a symlink or ancestor swapped after validation could
-        // change what it reads. Open and validate the file here, then hand
-        // markitdown a private copy of exactly those bytes.
-        const { handle, size } = await openLocalFile(expanded);
+        // markitdown is a separate process that would reopen the path, so
+        // whatever the path names by then (a swapped symlink or ancestor, a
+        // FIFO, a file that grew past the cap) is what it would read. In both
+        // modes, with or without MD_ALLOWED_PATHS, open and check the file
+        // here (regular file, size cap, allowlist if set) and hand markitdown
+        // a private copy of exactly those bytes, at the cost of copying up
+        // to MAX_LOCAL_FILE_BYTES.
+        //
+        // Passing the open descriptor instead (/proc/self/fd/N, or the fd as
+        // markitdown's stdin with an --extension hint) would avoid the copy,
+        // but /proc/self/fd/N drops the extension markitdown uses to pick a
+        // converter, is Linux-only, and neither form bounds a file that grows
+        // after fstat: markitdown reads stdin to the end. One copy path keeps
+        // both modes identical and the cap exact on every platform.
+        const { handle } = await openLocalFile(expanded);
         try {
           const text = await this.withStagingDir(async (stagingDir) => {
             const stagedPath = await this.stageOpenedFile(
               handle,
-              size,
               expanded,
               stagingDir,
             );
@@ -340,8 +340,10 @@ export class Markdownify {
     }
 
     // Read through a handle validated by openLocalFile, so the allowlist
-    // decision applies to the bytes returned (see toMarkdown). It checks the
-    // path before opening, so an outside path is reported as such, not as missing.
+    // decision and the MAX_LOCAL_FILE_BYTES cap apply to the bytes returned
+    // (see toMarkdown); a file over the cap is refused before any byte is
+    // read. It checks the path before opening, so an outside path is
+    // reported as such, not as missing.
     let opened: OpenedLocalFile;
     try {
       opened = await openLocalFile(resolvedPath);
@@ -354,7 +356,7 @@ export class Markdownify {
 
     let text: string;
     try {
-      text = await opened.handle.readFile("utf-8");
+      text = await this.readOpenedText(opened.handle, filePath);
     } finally {
       await opened.handle.close();
     }

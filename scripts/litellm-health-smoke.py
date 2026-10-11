@@ -54,13 +54,18 @@ def http_status_codes(exc):
     return sorted({e.response.status_code for e in _walk(exc) if isinstance(e, HTTP_STATUS_ERRORS)})
 
 
-def has_http_401(exc):
-    """True only if a real HTTP status error with status 401 is in the chain/groups of exc.
+def is_only_http_401(exc):
+    """True only if exc carries at least one real HTTP 401 status error and no other HTTP status.
+
+    Policy: anonymous discovery must be denied with 401 and nothing else. A 403, 500 or any other
+    status anywhere in the chain/groups fails, even next to a 401: a 500 means the gateway is
+    broken whatever else was observed. Non-HTTP members (cancellation, transport wrappers) are
+    ignored, since anyio groups them with the status error.
 
     Message text is deliberately not consulted: a timeout or 500 whose URL happens to contain
     "401" (for example a random port 40123) must not count as an authorization failure.
     """
-    return 401 in http_status_codes(exc)
+    return http_status_codes(exc) == [401]
 
 
 def _status_error(module, status, url="http://127.0.0.1:40123/mcp"):
@@ -73,31 +78,45 @@ def _status_error(module, status, url="http://127.0.0.1:40123/mcp"):
 
 
 def self_test():
-    """Regression cases for the 401 classifier. Runs before the integration check."""
+    """Regression cases for the 401-only classifier. Runs before the integration check."""
     for module in (httpx, httpx2):
         name = module.__name__
-        check(has_http_401(_status_error(module, 401)), f"{name} 401 not recognised")
+        check(is_only_http_401(_status_error(module, 401)), f"{name} 401 not recognised")
         if GROUPS:
             nested = ExceptionGroup("mcp", [RuntimeError("wrapper"), ExceptionGroup("inner", [_status_error(module, 401)])])
-            check(has_http_401(nested), f"{name} 401 nested in exception groups not recognised")
+            check(is_only_http_401(nested), f"{name} 401 nested in exception groups not recognised")
             # anyio cancellation produces a BaseExceptionGroup (not ExceptionGroup) when a member is a BaseException.
             base_group = BaseExceptionGroup("cancelled", [asyncio.CancelledError(), _status_error(module, 401)])
-            check(type(base_group) is BaseExceptionGroup and has_http_401(base_group), f"{name} 401 in BaseExceptionGroup not recognised")
-            check(not has_http_401(BaseExceptionGroup("cancelled", [asyncio.CancelledError(), _status_error(module, 500)])),
+            check(type(base_group) is BaseExceptionGroup and is_only_http_401(base_group), f"{name} 401 in BaseExceptionGroup not recognised")
+            check(not is_only_http_401(BaseExceptionGroup("cancelled", [asyncio.CancelledError(), _status_error(module, 500)])),
                   f"{name} 500 in BaseExceptionGroup misclassified as 401")
-            mixed = ExceptionGroup("mcp", [_status_error(module, 500), _status_error(module, 401)])
-            check(http_status_codes(mixed) == [401, 500] and has_http_401(mixed), f"{name} mixed 401+500 group not fully reported")
+            # Mixed statuses fail in either order, flat or nested, and across the two httpx flavours.
+            for other in (500, 403):
+                mixed = ExceptionGroup("mcp", [_status_error(module, other), _status_error(module, 401)])
+                check(http_status_codes(mixed) == sorted([401, other]), f"{name} mixed 401+{other} group not fully reported")
+                check(not is_only_http_401(mixed), f"{name} mixed 401+{other} group accepted as 401")
+                reversed_nested = ExceptionGroup("mcp", [_status_error(module, 401), ExceptionGroup("inner", [_status_error(module, other)])])
+                check(not is_only_http_401(reversed_nested), f"{name} nested 401 then {other} accepted as 401")
+            mixed_base = BaseExceptionGroup("cancelled", [asyncio.CancelledError(), _status_error(module, 401), _status_error(module, 500)])
+            check(not is_only_http_401(mixed_base), f"{name} 401+500 in BaseExceptionGroup accepted as 401")
+            cross = ExceptionGroup("mcp", [_status_error(httpx, 401), _status_error(httpx2, 500)])
+            check(not is_only_http_401(cross), "401 (httpx) + 500 (httpx2) accepted as 401")
+            # Repeated 401s and non-HTTP members next to a 401 are still a plain denial.
+            check(is_only_http_401(ExceptionGroup("mcp", [_status_error(module, 401), _status_error(module, 401)])),
+                  f"{name} duplicate 401s not recognised")
+            check(is_only_http_401(ExceptionGroup("mcp", [RuntimeError("wrapper"), _status_error(module, 401)])),
+                  f"{name} 401 beside a non-HTTP error not recognised")
         chained = RuntimeError("session failed")
         chained.__cause__ = _status_error(module, 401)
-        check(has_http_401(chained), f"{name} 401 via __cause__ not recognised")
+        check(is_only_http_401(chained), f"{name} 401 via __cause__ not recognised")
         for status in (403, 500):
-            check(not has_http_401(_status_error(module, status)), f"{name} {status} misclassified as 401")
+            check(not is_only_http_401(_status_error(module, status)), f"{name} {status} misclassified as 401")
             check(http_status_codes(_status_error(module, status)) == [status], f"{name} {status} not reported")
-        check(not has_http_401(_status_error(module, 500, "http://127.0.0.1:401/mcp")), f"{name} 500 at port 401 misclassified")
-    check(not has_http_401(TimeoutError("timed out connecting to http://127.0.0.1:40123/mcp")), "timeout mentioning 401 misclassified")
-    check(not has_http_401(RuntimeError("HTTP 401 Unauthorized")), "message text alone must not count as 401")
+        check(not is_only_http_401(_status_error(module, 500, "http://127.0.0.1:401/mcp")), f"{name} 500 at port 401 misclassified")
+    check(not is_only_http_401(TimeoutError("timed out connecting to http://127.0.0.1:40123/mcp")), "timeout mentioning 401 misclassified")
+    check(not is_only_http_401(RuntimeError("HTTP 401 Unauthorized")), "message text alone must not count as 401")
     if GROUPS:
-        check(not has_http_401(ExceptionGroup("mcp", [TimeoutError("http://127.0.0.1:40123/mcp")])), "grouped timeout misclassified")
+        check(not is_only_http_401(ExceptionGroup("mcp", [TimeoutError("http://127.0.0.1:40123/mcp")])), "grouped timeout misclassified")
     else:
         print("Python < 3.11: skipping ExceptionGroup classifier cases")
     for malformed in ([None, "x", 401], 401, "401", {401: None}, (e for e in ()), object()):
@@ -112,7 +131,7 @@ def self_test():
     check(http_status_codes(RaisingExceptions("odd")) == [], "raising .exceptions property not ignored")
     tuple_group = RuntimeError("tuple group")
     tuple_group.exceptions = ("x", _status_error(httpx, 401))
-    check(has_http_401(tuple_group), "401 in a tuple-valued .exceptions not recognised")
+    check(is_only_http_401(tuple_group), "401 in a tuple-valued .exceptions not recognised")
     check(http_status_codes(TimeoutError("x")) == [], "no status codes expected for a timeout")
 
 
@@ -130,10 +149,10 @@ async def verify(base, timeout=10):
     try:
         await client.run_with_session(forbidden, quiet_on_error=True)
     except Exception as exc:
-        if not has_http_401(exc):
+        if not is_only_http_401(exc):
             codes = http_status_codes(exc)
             detail = f"HTTP {codes}" if codes else "no HTTP status error (transport error or timeout)"
-            raise AssertionError(f"Anonymous discovery failed for a reason other than HTTP 401: {detail}") from exc
+            raise AssertionError(f"Anonymous discovery must fail with HTTP 401 and no other status: {detail}") from exc
     else:
         raise AssertionError("Anonymous discovery unexpectedly succeeded")
 
@@ -141,7 +160,7 @@ def main():
     check(importlib.metadata.version("litellm") == "1.104.0", "LiteLLM 1.104.0 is required")
     self_test()
     if "--self-test" in sys.argv[1:]:
-        print("401 classifier self-test passed")
+        print("401-only classifier self-test passed")
         return
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

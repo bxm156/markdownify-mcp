@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Markdownify } from "./Markdownify.js";
-import { createServer } from "./server.js";
+import { createServer, readPackageVersion } from "./server.js";
 import * as tools from "./tools.js";
 
 const allTools = Object.values(tools);
@@ -34,6 +35,20 @@ type TextResult = { isError?: boolean; content: { type: string; text: string }[]
 async function call(name: string, args?: Record<string, unknown>) {
   return (await client.callTool({ name, arguments: args })) as TextResult;
 }
+
+describe("server info", () => {
+  test("reports the version from package.json", async () => {
+    const pkg = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
+    );
+    expect(typeof pkg.version).toBe("string");
+    expect(client.getServerVersion()).toEqual({
+      name: "mcp-markdownify-server",
+      version: pkg.version,
+    });
+    expect(readPackageVersion()).toBe(pkg.version);
+  });
+});
 
 describe("listTools", () => {
   test("returns the declared tools with names, descriptions, schemas and annotations", async () => {
@@ -225,6 +240,62 @@ describe("dispatch", () => {
       expect(res.isError).toBe(true);
       expect(res.content[0].text).toMatch(/^Error: Invalid arguments: filepath: /);
       expect(toMarkdown).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("strict per-tool schemas", () => {
+    test("unknown keys are rejected", async () => {
+      const res = await call(tools.WebpageToMarkdownTool.name, {
+        url: "https://example.com",
+        filepath: "/etc/passwd",
+      });
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toMatch(/^Error: Invalid arguments: .*filepath/);
+      expect(toMarkdown).not.toHaveBeenCalled();
+    });
+
+    test("fields that belong to another tool are rejected", async () => {
+      const res = await call(tools.PDFToMarkdownTool.name, {
+        filepath: "/tmp/a.pdf",
+        branch: "main",
+      });
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toMatch(/^Error: Invalid arguments: .*branch/);
+      const res2 = await call(tools.GetMarkdownFileTool.name, {
+        filepath: "/tmp/a.md",
+        compress: true,
+      });
+      expect(res2.isError).toBe(true);
+      expect(toMarkdown).not.toHaveBeenCalled();
+      expect(get).not.toHaveBeenCalled();
+    });
+
+    test("a url tool given only filepath reports the missing url", async () => {
+      const res = await call(tools.YouTubeToMarkdownTool.name, { filepath: "/x" });
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toMatch(/^Error: (URL is required|Invalid arguments: )/);
+      expect(toMarkdown).not.toHaveBeenCalled();
+    });
+
+    test("an empty url or filepath counts as missing", async () => {
+      const a = await call(tools.WebpageToMarkdownTool.name, { url: "" });
+      expect(a.content[0].text).toBe("Error: URL is required for this tool");
+      const b = await call(tools.PDFToMarkdownTool.name, { filepath: "" });
+      expect(b.content[0].text).toBe("Error: File path is required for this tool");
+      expect(toMarkdown).not.toHaveBeenCalled();
+    });
+
+    test("an unknown tool is reported as such even with invalid arguments", async () => {
+      const res = await call("no-such-tool", { whatever: 1 });
+      expect(res.content[0].text).toBe("Error: Tool not found");
+    });
+
+    test("names inherited from Object.prototype are not tools", async () => {
+      for (const name of ["constructor", "toString", "__proto__"]) {
+        const res = await call(name, {});
+        expect(res.isError).toBe(true);
+        expect(res.content[0].text).toBe("Error: Tool not found");
+      }
     });
   });
 

@@ -174,23 +174,38 @@ test("probe routes skip the Host check but only allow GET and HEAD", async () =>
   }
 });
 
-test("a request target with a foreign authority never changes which Host is enforced", async () => {
+test("a request target that is not origin-form is rejected with 400 before Host, probe, auth and routing checks", async () => {
   const { port } = await fixture();
   const good = "Host: 127.0.0.1", bad = "Host: evil.example";
-  // The authority in the target is ignored: only the path (/mcp) is used, and the Host header is what is checked.
-  for (const target of ["//evil.example/mcp", "http://evil.example/mcp"]) {
-    const denied = await raw(port, [mcpPost([bad, AUTH, JSON_TYPE, ACCEPT], PING, target)]);
-    expect([target, denied.status, code(denied)]).toEqual([target, 403, "REQUEST_REJECTED"]);
-    const spoofed = target.replace("evil.example", "127.0.0.1");
-    const tricked = await raw(port, [mcpPost([bad, AUTH, JSON_TYPE, ACCEPT], PING, spoofed)]);
-    expect([spoofed, tricked.status, code(tricked)]).toEqual([spoofed, 403, "REQUEST_REJECTED"]);
-    // Pinned current behaviour (see report): with an allowed Host header the foreign authority is silently dropped and the request is served as /mcp.
-    const served = await raw(port, [mcpPost([good, AUTH, JSON_TYPE, ACCEPT], PING, target)]);
-    expect([target, served.status]).toEqual([target, 200]);
+  // new URL() would swap in the target's authority and serve its path; a backslash after the leading "/" acts as "//" for http(s) URLs.
+  const targets = ["//evil.example/mcp", "//127.0.0.1/mcp", "http://evil.example/mcp", "http://127.0.0.1/mcp", "HTTP://127.0.0.1/mcp", "https://127.0.0.1/mcp", "/\\evil.example/mcp", "/\\127.0.0.1/mcp", "///mcp"];
+  for (const target of targets) {
+    for (const host of [good, bad]) {
+      for (const auth of [[AUTH], []]) {
+        const response = await raw(port, [mcpPost([host, ...auth, JSON_TYPE, ACCEPT], PING, target)]);
+        expect([target, host, auth.length, response.status, code(response), response.json?.error, response.headers["www-authenticate"]]).toEqual([target, host, auth.length, 400, "REQUEST_REJECTED", "Invalid request target", undefined]);
+      }
+    }
   }
-  // Unauthenticated, the same target still gets the normal 401 challenge.
-  const anonymous = await raw(port, [mcpPost([good, JSON_TYPE], PING, "//evil.example/mcp")]);
-  expect([anonymous.status, anonymous.headers["www-authenticate"], code(anonymous)]).toEqual([401, "Bearer", "AUTH_REQUIRED"]);
+  // Probe paths behind a foreign authority lose the Host-check exemption: they are rejected outright.
+  for (const target of ["//anything/healthz", "//anything/livez", "http://evil.example/readyz", "/\\anything/healthz"]) {
+    const response = await raw(port, [message(`GET ${target} HTTP/1.1`, [bad])]);
+    expect([target, response.status, code(response), response.json?.error]).toEqual([target, 400, "REQUEST_REJECTED", "Invalid request target"]);
+  }
+  // An upload id behind a foreign authority never reaches the store either.
+  const put = await raw(port, [message(`PUT //evil.example/uploads/${crypto.randomUUID()} HTTP/1.1`, [good, AUTH, OCTET], "hello")]);
+  expect([put.status, code(put)]).toEqual([400, "REQUEST_REJECTED"]);
+  // Asterisk-form is not a route: Node routes it as "/*" (Host check, then 404); Bun's parser refuses it with a bare 400.
+  for (const host of [good, bad]) {
+    const asterisk = await raw(port, [message("OPTIONS * HTTP/1.1", [host, AUTH])]);
+    expect([host, [400, host === good ? 404 : 403].includes(asterisk.status)]).toEqual([host, true]);
+  }
+  // Dot segments that collapse to "//" keep the local authority and are just unknown paths.
+  const dotted = await raw(port, [mcpPost([good, AUTH, JSON_TYPE, ACCEPT], PING, "/.//evil.example/mcp")]);
+  expect([dotted.status, code(dotted), dotted.json?.error]).toEqual([404, "REQUEST_REJECTED", "Not found"]);
+  // The ordinary origin-form target is unaffected.
+  const served = await raw(port, [mcpPost([good, AUTH, JSON_TYPE, ACCEPT])]);
+  expect([served.status, served.json?.result]).toEqual([200, {}]);
 });
 
 test("a body streamed with chunked encoding is bounded at 1 MiB without a Content-Length", async () => {
@@ -226,16 +241,18 @@ test("a malformed Content-Length is rejected by the HTTP parser before reaching 
   }
 });
 
-test("POST /mcp requires an application/json media type and tolerates parameters and case", async () => {
+test("POST /mcp requires the lowercase application/json media type and tolerates parameters", async () => {
   const { port } = await fixture();
   const base = ["Host: 127.0.0.1", AUTH, ACCEPT];
   for (const type of ["text/plain", "application/x-www-form-urlencoded", "application/jsonx", "text/json", "application/octet-stream"]) {
     const response = await raw(port, [mcpPost([...base, `Content-Type: ${type}`])]);
     expect([type, response.status, code(response), response.json?.error]).toEqual([type, 415, "REQUEST_REJECTED", "Use application/json"]);
   }
-  // http.ts lower-cases the media type itself, but the MCP SDK transport it delegates to matches "application/json" case-sensitively.
-  const upper = await raw(port, [mcpPost([...base, "Content-Type: Application/JSON"])]);
-  expect([upper.status, code(upper)]).toEqual([415, undefined]);
+  // The MCP SDK transport matches "application/json" case-sensitively, so http.ts does too and answers its own consistent 415.
+  for (const type of ["Application/JSON", "APPLICATION/JSON; charset=utf-8", "application/Json"]) {
+    const response = await raw(port, [mcpPost([...base, `Content-Type: ${type}`])]);
+    expect([type, response.status, code(response), response.json?.error]).toEqual([type, 415, "REQUEST_REJECTED", "Use application/json"]);
+  }
   const missing = await raw(port, [mcpPost(base)]);
   expect([missing.status, code(missing)]).toEqual([415, "REQUEST_REJECTED"]);
   for (const type of ["application/json", "application/json; charset=utf-8", "application/json;charset=UTF-8", "application/json ; charset=utf-8"]) {
@@ -292,7 +309,7 @@ test("non-401 responses never advertise WWW-Authenticate", async () => {
   for (const response of [forbidden, wrongType, ok]) expect(response.headers["www-authenticate"]).toBeUndefined();
 });
 
-test("routing is exact: trailing slash, wrong case and unknown paths are 404, uppercase upload UUIDs reach the store and miss", async () => {
+test("routing is exact: trailing slash, wrong case, unknown paths and uppercase upload UUIDs are 404 before the store", async () => {
   const { port, upload } = await fixture();
   const { upload_id, required_headers } = await upload();
   const host = "Host: 127.0.0.1";
@@ -301,10 +318,33 @@ test("routing is exact: trailing slash, wrong case and unknown paths are 404, up
     expect([target, response.status, code(response), response.json?.error]).toEqual([target, 404, "REQUEST_REJECTED", "Not found"]);
   }
   const headers = [host, AUTH, ...uploadHeaders(required_headers), OCTET];
-  // The route regex is case-insensitive but the store keys are lowercase, so an uppercase id is just an unknown job.
-  const upper = await raw(port, [message(`PUT /uploads/${upload_id.toUpperCase()} HTTP/1.1`, headers, "hello")]);
-  expect([upper.status, code(upper)]).toEqual([404, "JOB_NOT_FOUND"]);
+  // Store keys are lowercase, so the route only matches lowercase UUIDs: other cases are a routing 404, not a store lookup.
+  for (const id of [upload_id.toUpperCase(), upload_id.replace(/[a-f]/, letter => letter.toUpperCase())]) {
+    const upper = await raw(port, [message(`PUT /uploads/${id} HTTP/1.1`, headers, "hello")]);
+    expect([id, upper.status, code(upper), upper.json?.error]).toEqual([id, 404, "REQUEST_REJECTED", "Not found"]);
+  }
   // The reservation is untouched and the canonical lowercase id still works.
   const lower = await raw(port, [message(`PUT /uploads/${upload_id} HTTP/1.1`, headers, "hello")]);
   expect(lower.status).toBe(204);
+});
+
+test("a foreign Origin on /uploads is refused before authentication and leaves the reservation intact", async () => {
+  const { port, upload } = await fixture();
+  const { upload_id, required_headers } = await upload();
+  const headers = ["Host: 127.0.0.1", ...uploadHeaders(required_headers), OCTET];
+  // The Origin must equal the public origin exactly: no trailing slash, explicit default port, other case or merely allowed Host.
+  for (const origin of ["https://attacker.invalid", "null", "http://127.0.0.1/", "http://127.0.0.1:80", "HTTP://127.0.0.1", "https://127.0.0.1", "http://allowed.example"]) {
+    for (const auth of [[AUTH], []]) {
+      const response = await raw(port, [message(`PUT /uploads/${upload_id} HTTP/1.1`, [...headers, ...auth, `Origin: ${origin}`], "hello")]);
+      expect([origin, auth.length, response.status, code(response), response.json?.error, response.headers["www-authenticate"]]).toEqual([origin, auth.length, 403, "REQUEST_REJECTED", "Origin not allowed", undefined]);
+    }
+  }
+  const same = await raw(port, [message(`PUT /uploads/${upload_id} HTTP/1.1`, [...headers, AUTH, "Origin: http://127.0.0.1"], "hello")]);
+  expect(same.status).toBe(204);
+});
+
+test("an oversized request header block is refused by the HTTP parser with 431", async () => {
+  const { port } = await fixture();
+  const response = await raw(port, [mcpPost(["Host: 127.0.0.1", AUTH, JSON_TYPE, ACCEPT, `X-Padding: ${"x".repeat(64 * 1024)}`])]);
+  expect(response.status).toBe(431);
 });

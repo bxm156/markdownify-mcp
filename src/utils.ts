@@ -55,7 +55,10 @@ function realpathOfDeepestExisting(target: string): string {
   const remainder: string[] = [];
   for (;;) {
     try {
-      return path.join(fs.realpathSync(current), ...remainder);
+      // .native (realpath(3) / GetFinalPathNameByHandle) matches the
+      // fs.promises.realpath used on the opened path, so both sides of the
+      // comparison agree on case and Windows 8.3 short names.
+      return path.join(fs.realpathSync.native(current), ...remainder);
     } catch (e: unknown) {
       const parent = path.dirname(current);
       if ((e as NodeJS.ErrnoException)?.code !== "ENOENT" || parent === current) {
@@ -113,6 +116,29 @@ export const _fileAccessTestHooks: {
   afterOpen?: (realPath: string) => void | Promise<void>;
 } = {};
 
+const MIB = 1024 * 1024;
+
+/**
+ * Largest local file the stdio tools read or convert, with or without an
+ * allowlist: toMarkdown copies at most this many bytes for markitdown, and
+ * get-markdown-file returns at most this many. It is the same budget as the
+ * URL download cap, so every input markitdown sees is bounded alike.
+ */
+export const MAX_LOCAL_FILE_BYTES = 50 * MIB;
+
+/** Formats a byte limit for error messages, e.g. "52428800-byte (50 MiB)". */
+function describeLimit(maxBytes: number): string {
+  return maxBytes % MIB === 0
+    ? `${maxBytes}-byte (${maxBytes / MIB} MiB)`
+    : `${maxBytes}-byte`;
+}
+
+function localFileTooLarge(displayPath: string, maxBytes: number): Error {
+  return new Error(
+    `File "${displayPath}" exceeds the ${describeLimit(maxBytes)} limit for local files.`,
+  );
+}
+
 // O_NOFOLLOW (POSIX) makes open fail if the final component is a symlink.
 // O_NONBLOCK keeps open from hanging on a FIFO with no writer, so fstat can
 // reject it; it does not change reads from regular files. Neither exists on
@@ -126,6 +152,46 @@ export type OpenedLocalFile = {
   /** Size in bytes at open time (fstat). */
   size: number;
 };
+
+/**
+ * Reads the bytes behind an opened handle in order, with explicit offsets
+ * (never through a path), and fails as soon as more than `maxBytes` have been
+ * read. The fstat check in openLocalFile rejects files that are already too
+ * large; this catches a file that grows after it.
+ */
+export async function* readOpenedFile(
+  handle: fs.promises.FileHandle,
+  displayPath: string,
+  maxBytes = MAX_LOCAL_FILE_BYTES,
+): AsyncGenerator<Buffer> {
+  let position = 0;
+  for (;;) {
+    const chunk = Buffer.alloc(MIB);
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+    if (bytesRead === 0) return;
+    position += bytesRead;
+    if (position > maxBytes) throw localFileTooLarge(displayPath, maxBytes);
+    yield chunk.subarray(0, bytesRead);
+  }
+}
+
+/**
+ * Cheap pre-filter run before open: refuses anything that is not a regular
+ * file (or a symlink to one), so a FIFO, socket or device node is never
+ * opened at all; opening some devices has side effects. It is only a filter
+ * on the path as it is now. The fstat of the opened handle remains the check
+ * that decides.
+ */
+async function assertLooksLikeRegularFile(
+  target: string,
+  displayPath: string,
+): Promise<void> {
+  let stats = await fs.promises.lstat(target);
+  if (stats.isSymbolicLink()) stats = await fs.promises.stat(target);
+  if (!stats.isFile()) {
+    throw new Error(`Path "${displayPath}" is not a regular file.`);
+  }
+}
 
 /**
  * Returns the real path of the file behind `handle` and proves it is the same
@@ -169,17 +235,23 @@ export async function resolveOpenedFile(
 }
 
 /**
- * Opens a local regular file for reading.
+ * Opens a local regular file of at most `maxBytes` for reading.
+ *
+ * In both modes the path is pre-filtered with lstat (see
+ * assertLooksLikeRegularFile), opened without blocking, and the opened
+ * handle's own fstat must report a regular file within the size limit.
  *
  * Without an allowlist (MD_ALLOWED_PATHS / MD_SHARE_DIR unset) any readable
- * file is permitted, so this only checks that the opened file is a regular
- * file. With an allowlist the decision is tied to the opened file, not to a
- * path that could be swapped afterwards: the path is resolved and checked,
- * opened with O_NOFOLLOW, and the opened file's own location is checked again
- * (see resolveOpenedFile). The caller must read only through the returned
- * handle and must close it.
+ * file is permitted. With an allowlist the decision is tied to the opened
+ * file, not to a path that could be swapped afterwards: the path is resolved
+ * and checked, opened with O_NOFOLLOW, and the opened file's own location is
+ * checked again (see resolveOpenedFile). The caller must read only through
+ * the returned handle (readOpenedFile) and must close it.
  */
-export async function openLocalFile(filePath: string): Promise<OpenedLocalFile> {
+export async function openLocalFile(
+  filePath: string,
+  { maxBytes = MAX_LOCAL_FILE_BYTES }: { maxBytes?: number } = {},
+): Promise<OpenedLocalFile> {
   const allowed = getAllowedPaths();
   let target = filePath;
   if (allowed) {
@@ -188,6 +260,9 @@ export async function openLocalFile(filePath: string): Promise<OpenedLocalFile> 
     // component that was swapped for a symlink after this point.
     target = await fs.promises.realpath(filePath);
     assertRealPathAllowed(target, filePath, allowed);
+  }
+  await assertLooksLikeRegularFile(target, filePath);
+  if (allowed) {
     await _fileAccessTestHooks.afterValidate?.(target);
   }
 
@@ -212,6 +287,9 @@ export async function openLocalFile(filePath: string): Promise<OpenedLocalFile> 
     const stats = await handle.stat({ bigint: true });
     if (!stats.isFile()) {
       throw new Error(`Path "${filePath}" is not a regular file.`);
+    }
+    if (stats.size > BigInt(maxBytes)) {
+      throw localFileTooLarge(filePath, maxBytes);
     }
     if (allowed) {
       const openedReal = await resolveOpenedFile(handle, target, stats);

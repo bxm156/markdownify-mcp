@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { checkRuntime, converterCandidates } from "./health.js";
+import { createConverter } from "./converter.js";
+import { checkRuntime, converterAccessMode, converterCandidates, resolveConverterExecutable } from "./health.js";
 
 const directories: string[] = [], restores: (() => void)[] = [];
 async function tempDir(prefix: string) { const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix)); directories.push(dir); return dir; }
@@ -66,17 +68,86 @@ describe("converter candidate list", () => {
     expect(converterCandidates("bin/markitdown", { PATH: "/usr/bin" }, "linux")).toEqual(["bin/markitdown"]);
   });
 
-  test("win32: each PATH entry is tried with each PATHEXT suffix, in order", () => {
+  test("win32: each PATH entry is tried with each runnable PATHEXT suffix, in order", () => {
     expect(converterCandidates("markitdown", { PATH: "C:\\Python\\Scripts;;D:\\tools", PATHEXT: ".COM;.EXE" }, "win32"))
       .toEqual(["C:\\Python\\Scripts\\markitdown.COM", "C:\\Python\\Scripts\\markitdown.EXE", "D:\\tools\\markitdown.COM", "D:\\tools\\markitdown.EXE"]);
-    // Without PATHEXT the default suffixes apply.
-    expect(converterCandidates("markitdown", { PATH: "C:\\bin" }, "win32")).toEqual(["C:\\bin\\markitdown.EXE", "C:\\bin\\markitdown.CMD", "C:\\bin\\markitdown.BAT"]);
-    // A name that already has an extension is not suffixed.
+    // Without PATHEXT the directly runnable defaults apply, in Windows' order.
+    expect(converterCandidates("markitdown", { PATH: "C:\\bin" }, "win32")).toEqual(["C:\\bin\\markitdown.COM", "C:\\bin\\markitdown.EXE"]);
+    // A name that already has a runnable extension is not suffixed.
     expect(converterCandidates("markitdown.exe", { PATH: "C:\\bin", PATHEXT: ".EXE;.CMD" }, "win32")).toEqual(["C:\\bin\\markitdown.exe"]);
     // Absolute paths and either separator bypass the search.
     for (const exe of ["C:\\venv\\Scripts\\markitdown.exe", ".venv\\Scripts\\markitdown.exe", ".venv/Scripts/markitdown.exe"]) expect(converterCandidates(exe, { PATH: "C:\\bin" }, "win32")).toEqual([exe]);
+    // A path without an extension gets the runnable suffixes, as spawn would try them.
+    expect(converterCandidates("C:\\venv\\Scripts\\markitdown", { PATHEXT: ".CMD;.EXE" }, "win32")).toEqual(["C:\\venv\\Scripts\\markitdown.EXE"]);
     // ";" separates PATH on Windows but not on POSIX, where ":" does.
     expect(converterCandidates("markitdown", { PATH: "a;b" }, "linux")).toEqual(["a;b/markitdown"]);
+  });
+
+  test("win32: an empty PATHEXT entry (trailing or doubled ';') never makes an extensionless file a candidate", () => {
+    expect(converterCandidates("markitdown", { PATH: "C:\\bin", PATHEXT: ".EXE;" }, "win32")).toEqual(["C:\\bin\\markitdown.EXE"]);
+    expect(converterCandidates("markitdown", { PATH: "C:\\bin", PATHEXT: ";;.COM;;" }, "win32")).toEqual(["C:\\bin\\markitdown.COM"]);
+    expect(converterCandidates("markitdown", { PATH: "C:\\bin", PATHEXT: ";" }, "win32")).toEqual([]);
+    expect(converterCandidates("C:\\venv\\markitdown", { PATHEXT: ".EXE;" }, "win32")).toEqual(["C:\\venv\\markitdown.EXE"]);
+  });
+
+  test("win32: .CMD/.BAT and other extensions spawn cannot run without a shell are rejected, .exe/.com in any case accepted", () => {
+    expect(converterCandidates("markitdown", { PATH: "C:\\bin", PATHEXT: ".CMD;.BAT;.Exe;.VBS;.com" }, "win32")).toEqual(["C:\\bin\\markitdown.Exe", "C:\\bin\\markitdown.com"]);
+    for (const exe of ["markitdown.CMD", "markitdown.bat", "markitdown.py", "C:\\bin\\markitdown.cmd", ".venv\\Scripts\\markitdown.BAT"]) expect(converterCandidates(exe, { PATH: "C:\\bin", PATHEXT: ".CMD;.BAT;.EXE" }, "win32")).toEqual([]);
+    for (const exe of ["markitdown.EXE", "markitdown.Com"]) expect(converterCandidates(exe, { PATH: "C:\\bin" }, "win32")).toEqual([`C:\\bin\\${exe}`]);
+    // POSIX has no extension rules: a .cmd name is searched like any other.
+    expect(converterCandidates("markitdown.cmd", { PATH: "/usr/bin" }, "linux")).toEqual(["/usr/bin/markitdown.cmd"]);
+  });
+
+  test("the access mode is X_OK on POSIX and F_OK on win32, which has no execute bit", () => {
+    expect(converterAccessMode("linux")).toBe(constants.X_OK);
+    expect(converterAccessMode("darwin")).toBe(constants.X_OK);
+    expect(converterAccessMode("win32")).toBe(constants.F_OK);
+  });
+});
+
+describe("shared converter resolution", () => {
+  /** A simulated Windows filesystem: `files` are regular files, every other path is missing. Records each access mode. */
+  function windowsFs(files: string[]) {
+    const accesses: [string, number | undefined][] = [];
+    const missing = (file: string) => Object.assign(new Error("ENOENT"), { code: "ENOENT", path: file });
+    const stat = spyOn(fs, "stat").mockImplementation((async (file: any) => { if (!files.includes(String(file))) throw missing(String(file)); return { isFile: () => true }; }) as unknown as typeof fs.stat);
+    const access = spyOn(fs, "access").mockImplementation((async (file: any, mode?: number) => { accesses.push([String(file), mode]); if (!files.includes(String(file))) throw missing(String(file)); }) as typeof fs.access);
+    restores.push(() => { stat.mockRestore(); access.mockRestore(); });
+    return accesses;
+  }
+
+  test("win32: shell-only and extensionless files are skipped and the first .exe is checked with F_OK", async () => {
+    const accesses = windowsFs(["C:\\a\\markitdown", "C:\\a\\markitdown.CMD", "C:\\a\\markitdown.BAT", "C:\\b\\markitdown.EXE", "C:\\c\\markitdown.EXE"]);
+    const env = { PATH: "C:\\a;C:\\b;C:\\c", PATHEXT: ".CMD;.BAT;;.EXE;" };
+    expect(await resolveConverterExecutable("markitdown", env, "win32")).toBe("C:\\b\\markitdown.EXE");
+    expect(accesses).toEqual([["C:\\b\\markitdown.EXE", constants.F_OK]]);
+  });
+
+  test("win32: only .CMD/.BAT or extensionless files present means no converter", async () => {
+    const accesses = windowsFs(["C:\\a\\markitdown", "C:\\a\\markitdown.CMD", "C:\\b\\markitdown.bat"]);
+    expect(await resolveConverterExecutable("markitdown", { PATH: "C:\\a;C:\\b", PATHEXT: ".CMD;.BAT;.EXE;" }, "win32")).toBeUndefined();
+    expect(await resolveConverterExecutable("C:\\a\\markitdown.CMD", {}, "win32")).toBeUndefined();
+    expect(accesses).toEqual([]);
+  });
+
+  test("a stop request ends the search before the next candidate", async () => {
+    windowsFs(["C:\\b\\markitdown.EXE"]);
+    let checks = 0;
+    expect(await resolveConverterExecutable("markitdown", { PATH: "C:\\a;C:\\b" }, "win32", () => ++checks > 1)).toBeUndefined();
+    expect(checks).toBe(2);
+  });
+
+  test.skipIf(process.platform === "win32")("POSIX: health and the converter pick the same file on PATH", async () => {
+    const data = await tempDir("markdownify-path-data-"), cwd = await tempDir("markdownify-path-cwd-"), [empty, nonExecutable, directory] = await decoys();
+    const bin = await tempDir("markdownify-path-bin-"), output = path.join(bin, "out.part");
+    await fs.writeFile(path.join(bin, "markitdown"), "#!/bin/sh\nprintf '# converted\\n'\n", { mode: 0o755 });
+    const previousCwd = process.cwd();
+    process.chdir(cwd); restores.push(() => process.chdir(previousCwd));
+    setEnv({ MARKITDOWN_PATH: undefined, PATH: [empty, nonExecutable, directory, bin, "/usr/bin", "/bin"].join(path.delimiter) });
+    expect(await resolveConverterExecutable("markitdown")).toBe(path.join(bin, "markitdown"));
+    expect((await checkRuntime(data, false)).converter.available).toBe(true);
+    await createConverter({ maxOutputBytes: 1000, projectRoot: cwd })(path.join(cwd, "input.txt"), output, new AbortController().signal);
+    expect(await fs.readFile(output, "utf8")).toBe("# converted\n");
   });
 });
 

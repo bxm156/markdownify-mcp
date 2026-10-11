@@ -1,31 +1,73 @@
-import { z } from "zod";
+import { readFileSync } from "node:fs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { Markdownify } from "./Markdownify.js";
+import {
+  formatArgumentError,
+  getToolArgumentSchema,
+  type FilepathArgs,
+  type GitRepoArgs,
+  type UrlArgs,
+} from "./schemas.js";
 import * as tools from "./tools.js";
 import { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
-const RequestPayloadSchema = z.object({
-  filepath: z.string().optional(),
-  url: z.string().optional(),
-  branch: z.string().optional(),
-  compress: z.boolean().optional(),
-});
 
-/** Short, readable summary of the first schema issue, e.g. "Invalid arguments: url: expected string, received number". */
-function formatArgumentError(error: z.ZodError): string {
-  const issue = error.issues[0];
-  const path = issue.path.join(".");
-  return `Invalid arguments: ${path ? `${path}: ` : ""}${issue.message}`;
+/**
+ * The package version, read from the package.json one level above this file
+ * (the same location from src/ and from the compiled dist/).
+ */
+export function readPackageVersion(): string {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
+    );
+    return typeof pkg.version === "string" ? pkg.version : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
+
+type Result = { path?: string; text: string };
+
+/** Adapts a runner for one argument shape to the schema-validated `unknown` it receives. */
+const run =
+  <A>(fn: (args: A) => Promise<Result>) =>
+  (args: unknown) =>
+    fn(args as A);
+
+const runUrl = run(({ url }: UrlArgs) => Markdownify.toMarkdown({ url }));
+const runFile = run(({ filepath }: FilepathArgs) =>
+  Markdownify.toMarkdown({ filePath: filepath }),
+);
+
+/** Runs a tool with arguments already validated against its schema in schemas.ts. */
+const runners: Record<string, (args: unknown) => Promise<Result>> = {
+  [tools.YouTubeToMarkdownTool.name]: runUrl,
+  [tools.BingSearchResultToMarkdownTool.name]: runUrl,
+  [tools.WebpageToMarkdownTool.name]: runUrl,
+  [tools.PDFToMarkdownTool.name]: runFile,
+  [tools.ImageToMarkdownTool.name]: runFile,
+  [tools.AudioToMarkdownTool.name]: runFile,
+  [tools.DocxToMarkdownTool.name]: runFile,
+  [tools.XlsxToMarkdownTool.name]: runFile,
+  [tools.PptxToMarkdownTool.name]: runFile,
+  [tools.GitRepoToMarkdownTool.name]: run(
+    ({ url, branch, compress }: GitRepoArgs) =>
+      Markdownify.fromRepo({ repoUrl: url, branch, compress }),
+  ),
+  [tools.GetMarkdownFileTool.name]: run(({ filepath }: FilepathArgs) =>
+    Markdownify.get({ filePath: filepath }),
+  ),
+};
 
 export function createServer() {
   const server = new Server(
     {
       name: "mcp-markdownify-server",
-      version: "0.1.0",
+      version: readPackageVersion(),
     },
     {
       capabilities: {
@@ -46,62 +88,17 @@ export function createServer() {
       const { name, arguments: args } = request.params;
 
       try {
-        const parsed = RequestPayloadSchema.safeParse(args ?? {});
+        const schema = getToolArgumentSchema(name);
+        const runner = Object.hasOwn(runners, name) ? runners[name] : undefined;
+        if (!schema || !runner) {
+          throw new Error("Tool not found");
+        }
+        const rawArgs = args ?? {};
+        const parsed = schema.safeParse(rawArgs);
         if (!parsed.success) {
-          throw new Error(formatArgumentError(parsed.error));
+          throw new Error(formatArgumentError(parsed.error, rawArgs));
         }
-        const validatedArgs = parsed.data;
-
-        let result;
-        switch (name) {
-          case tools.YouTubeToMarkdownTool.name:
-          case tools.BingSearchResultToMarkdownTool.name:
-          case tools.WebpageToMarkdownTool.name:
-            if (!validatedArgs.url) {
-              throw new Error("URL is required for this tool");
-            }
-            result = await Markdownify.toMarkdown({
-              url: validatedArgs.url,
-            });
-            break;
-
-          case tools.PDFToMarkdownTool.name:
-          case tools.ImageToMarkdownTool.name:
-          case tools.AudioToMarkdownTool.name:
-          case tools.DocxToMarkdownTool.name:
-          case tools.XlsxToMarkdownTool.name:
-          case tools.PptxToMarkdownTool.name:
-            if (!validatedArgs.filepath) {
-              throw new Error("File path is required for this tool");
-            }
-            result = await Markdownify.toMarkdown({
-              filePath: validatedArgs.filepath,
-            });
-            break;
-
-          case tools.GitRepoToMarkdownTool.name:
-            if (!validatedArgs.url) {
-              throw new Error("URL is required for this tool");
-            }
-            result = await Markdownify.fromRepo({
-              repoUrl: validatedArgs.url,
-              branch: validatedArgs.branch,
-              compress: validatedArgs.compress,
-            });
-            break;
-
-          case tools.GetMarkdownFileTool.name:
-            if (!validatedArgs.filepath) {
-              throw new Error("File path is required for this tool");
-            }
-            result = await Markdownify.get({
-              filePath: validatedArgs.filepath,
-            });
-            break;
-
-          default:
-            throw new Error("Tool not found");
-        }
+        const result = await runner(parsed.data);
 
         return {
           content: [

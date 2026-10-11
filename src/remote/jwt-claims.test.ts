@@ -1,35 +1,22 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
-import { SignJWT, generateKeyPair, exportJWK, exportSPKI, createLocalJWKSet, type CryptoKey, type JWK } from "jose";
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { createServer } from "node:http";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { SignJWT, generateKeyPair, exportJWK, exportSPKI, jwtVerify, type JWK } from "jose";
 import { createJwtAuthenticator } from "./jwt.js";
 import type { Authenticator } from "./auth.js";
 import { loadConfig } from "./config.js";
-import { JobService } from "./jobs.js";
-import { createHttpServer } from "./http.js";
+import { createJwtFixture, mcpInitialize, toolJson as text, toolOk as ok } from "./test-helpers.js";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-const issuer = "https://litellm.test", audience = "markdownify";
 const allTools = "mcp:tools/list mcp:tools/call mcp:tools/get_service_health:call mcp:tools/create_upload:call mcp:tools/lookup_error:call";
-const key = await generateKeyPair("RS256", { extractable: true });
-const publicJwk = { ...await exportJWK(key.publicKey), kid: "first", alg: "RS256", use: "sig" };
-const disposers: Array<() => Promise<unknown>> = [];
-afterEach(async () => { setSystemTime(); while (disposers.length) await disposers.pop()!(); });
+const fx = await createJwtFixture({ clientScope: allTools });
+const { issuer, audience, key, publicJwk, verifier, claims, nowSeconds, sign: signed } = fx;
+afterEach(async () => { setSystemTime(); await fx.close(); });
 
-const verifier = (extra: Partial<Parameters<typeof createJwtAuthenticator>[0]> = {}) => createJwtAuthenticator({ issuer, audience, getKey: createLocalJWKSet({ keys: [publicJwk] }), ...extra });
 // Resolves any kid to the one trusted key, so the explicit kid/claim clauses in jwt.ts are the only thing that can reject a validly signed token.
 const kidBlind = () => createJwtAuthenticator({ issuer, audience, getKey: async () => key.publicKey });
-const nowSeconds = () => Math.floor(Date.now() / 1000);
-function claims(changes: Record<string, unknown> = {}) {
-  const now = nowSeconds();
-  return { iss: issuer, aud: audience, sub: "machine-a", iat: now, exp: now + 300, scope: "mcp:tools/list mcp:tools/call", ...changes };
-}
-async function signed(changes: Record<string, unknown> = {}, header: Record<string, unknown> = { alg: "RS256", kid: "first" }, signingKey: CryptoKey | Uint8Array = key.privateKey) {
-  return new SignJWT(claims(changes)).setProtectedHeader(header as any).sign(signingKey);
-}
 const b64 = (value: unknown) => Buffer.from(typeof value === "string" ? value : JSON.stringify(value)).toString("base64url");
 
 test("aud must be exactly the configured string: arrays are rejected even when they contain it", async () => {
@@ -101,18 +88,40 @@ test("only RS256 is accepted: HS256 keyed with the public key, none, and other R
   // Validly signed, and the key resolver returns the matching key, but the algorithm is not RS256.
   for (const alg of Object.keys(foreign)) expect(await auth.authenticate(await signed({}, { alg, kid: "first" }, foreign[alg].privateKey)), alg).toBeNull();
   expect(await auth.authenticate(await signed({}, { alg: "ES256", kid: "first" }, ec.privateKey))).toBeNull();
-  // Header tricks that try to move key selection into the token: the key always comes from the pinned resolver, so a token signed by the
-  // attacker is rejected whatever jku/x5u/jwk it advertises. Those headers are ignored (not honoured) for a token the trusted key signed.
-  const attacker = await generateKeyPair("RS256", { extractable: true }), attackerJwk = { ...await exportJWK(attacker.publicKey), kid: "first", alg: "RS256" };
-  for (const extra of [{ jku: "https://attacker.test/jwks" }, { x5u: "https://attacker.test/cert" }, { jwk: attackerJwk as JWK }]) {
-    expect(await auth.authenticate(await signed({}, { alg: "RS256", kid: "first", ...extra }, attacker.privateKey)), Object.keys(extra)[0]).toBeNull();
-    expect(await auth.authenticate(await signed({}, { alg: "RS256", kid: "first", ...extra })), Object.keys(extra)[0]).not.toBeNull();
-  }
   // A critical header the verifier does not understand must fail even with a valid signature (jose refuses to sign it, so assemble by hand).
   const input = `${b64({ alg: "RS256", kid: "first", crit: ["x-unknown"], "x-unknown": 1 })}.${b64(claims())}`;
   const signature = Buffer.from(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key.privateKey as CryptoKey, Buffer.from(input))).toString("base64url");
   expect(await auth.authenticate(`${input}.${signature}`)).toBeNull();
   expect(await auth.authenticate(`${b64({ alg: "RS256", kid: "first" })}.${b64(claims())}.${signature}`)).toBeNull();
+});
+test("jku, x5u, x5c and jwk headers are rejected before key resolution, whoever signed the token", async () => {
+  const attacker = await generateKeyPair("RS256", { extractable: true }), attackerJwk = { ...await exportJWK(attacker.publicKey), kid: "first", alg: "RS256" } as JWK;
+  const extras: Array<Record<string, unknown>> = [{ jku: "https://attacker.test/jwks" }, { x5u: "https://attacker.test/cert" }, { x5c: ["MIIB"] }, { jwk: attackerJwk }, { jku: "" }, { x5c: [] }, { jwk: null }, { jku: "https://attacker.test/jwks", x5u: "https://attacker.test/cert", x5c: ["MIIB"], jwk: attackerJwk }];
+  let resolved = 0;
+  const counting = createJwtAuthenticator({ issuer, audience, getKey: async () => { resolved++; return key.publicKey; } });
+  // Control: the same resolver accepts a token without those headers, so the resolver is not what rejects the cases below.
+  expect(await counting.authenticate(await signed())).not.toBeNull(); expect(resolved).toBe(1);
+  for (const [name, auth] of [["pinned JWKS", verifier()], ["resolver that trusts any kid", kidBlind()], ["counting resolver", counting]] as const) {
+    for (const extra of extras) {
+      const label = `${name} ${JSON.stringify(Object.keys(extra))}`;
+      // Signed by the attacker's own key: rejected whatever key source it advertises.
+      expect(await auth.authenticate(await signed({}, { alg: "RS256", kid: "first", ...extra }, attacker.privateKey)), `attacker ${label}`).toBeNull();
+      // Signed by the trusted key: still rejected. The headers are refused outright instead of being ignored.
+      expect(await auth.authenticate(await signed({}, { alg: "RS256", kid: "first", ...extra })), `trusted ${label}`).toBeNull();
+    }
+  }
+  // The key resolver never runs for these tokens, so no key lookup (and no network fetch in production) can be influenced by them.
+  expect(resolved).toBe(1);
+  // Unrelated optional headers remain fine.
+  expect(await verifier().authenticate(await signed({}, { alg: "RS256", kid: "first", typ: "JWT", cty: "x" }))).not.toBeNull();
+});
+test("crit is rejected even for an extension the signer declares and jose itself would accept", async () => {
+  const token = await new SignJWT(claims()).setProtectedHeader({ alg: "RS256", kid: "first", crit: ["x-ext"], "x-ext": 1 }).sign(key.privateKey, { crit: { "x-ext": true } });
+  // Control: a verifier told that the extension is understood accepts the very same token, so only the authenticator's own policy rejects it.
+  await expect(jwtVerify(token, key.publicKey, { crit: { "x-ext": true }, issuer, audience })).resolves.toMatchObject({ protectedHeader: { crit: ["x-ext"], "x-ext": 1 } });
+  await expect(jwtVerify(token, key.publicKey, { issuer, audience })).rejects.toThrow();
+  expect(await verifier().authenticate(token)).toBeNull();
+  expect(await kidBlind().authenticate(token)).toBeNull();
 });
 test("exp, iat and sub must each be well-formed on their own", async () => {
   setSystemTime(new Date("2026-03-01T12:00:00Z"));
@@ -145,25 +154,7 @@ test("authenticator output is frozen and carries only the verified subject, scop
   expect((await verifier({ toolPrefix: "gw_" }).authenticate(await signed()))?.toolPrefix).toBe("gw_");
 });
 
-async function deployment(auth: Authenticator = verifier(), options: Record<string, unknown> = {}, jobs: Record<string, unknown> = {}) {
-  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-claims-"));
-  const service = new JobService({ dataDir, maxUploadBytes: 1000, maxOutputBytes: 1000, maxStorageBytes: 1_000_000, maxJobs: 50, retentionMs: 3_600_000, uploadTtlMs: 3_600_000, conversionTimeoutMs: 1000, concurrency: 1, converter: async (input: string, output: string) => { await fs.writeFile(output, await fs.readFile(input)); }, ...options });
-  await service.init();
-  const httpOptions = { authenticator: auth, publicBaseUrl: "http://127.0.0.1", allowedHosts: ["127.0.0.1"], ...jobs };
-  const server = createHttpServer(service, httpOptions); await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
-  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`; httpOptions.publicBaseUrl = base;
-  disposers.push(async () => { await service.close(); server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); await fs.rm(dataDir, { recursive: true, force: true }); });
-  async function client(subject = "machine-a", scope = allTools) {
-    const c = new Client({ name: "claims", version: "1" });
-    await c.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers: { Host: "127.0.0.1", Authorization: `Bearer ${await signed({ sub: subject, scope })}` } } }));
-    disposers.push(() => c.close()); return c;
-  }
-  const put = (upload: any) => fetch(upload.upload_url, { method: "PUT", headers: { ...upload.required_headers, Host: "127.0.0.1" }, body: "x" });
-  return { service, base, client, put };
-}
-const text = (result: any) => JSON.parse(result.content[0].text);
-const ok = (result: any) => { expect(result.isError).not.toBe(true); return text(result); };
-
+const deployment = (auth: Authenticator = verifier(), jobs: Record<string, unknown> = {}) => fx.deployment(auth, { jobs });
 test("a token with only mcp:tools/list authenticates and lists tools, but every call is denied with AUTH_SCOPE_REQUIRED", async () => {
   const auth = verifier();
   expect(await auth.authenticate(await signed({ scope: "mcp:tools/list" }))).toMatchObject({ scopes: ["mcp:tools/list"] });
@@ -203,33 +194,41 @@ test("a still-valid JWT keeps working until exp after the signer stops issuing, 
 test("a replayed JWT stays valid over HTTP until exp and no longer", async () => {
   const start = new Date("2026-04-01T08:00:00Z"); setSystemTime(start);
   const f = await deployment(), t0 = nowSeconds(), bearer = `Bearer ${await signed({ iat: t0, exp: t0 + 300, scope: allTools })}`;
-  const initialize = () => fetch(`${f.base}/mcp`, { method: "POST", headers: { Host: "127.0.0.1", Authorization: bearer, "Content-Type": "application/json", Accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "replay", version: "1" } } }) });
+  const initialize = () => mcpInitialize(f.base, bearer);
   setSystemTime(new Date(start.getTime() + 299_000)); expect((await initialize()).status).toBe(200);
   setSystemTime(new Date(start.getTime() + 300_000)); const expired = await initialize();
   expect(expired.status).toBe(401); expect(expired.headers.get("www-authenticate")).toBe("Bearer");
 });
 test("revoking the signing key from JWKS takes effect only after the cache lifetime", async () => {
-  let keys: JWK[] = [publicJwk], requests = 0;
-  const server = createServer((_req, res) => { requests++; res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ keys })); });
-  await new Promise<void>(r => server.listen(0, "127.0.0.1", r)); disposers.push(() => new Promise<void>(r => { server.closeAllConnections(); server.close(() => r()); }));
-  const jwksUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}/jwks`;
+  const jwks = await fx.serveJwks(), requests = jwks.requests;
   const start = new Date("2026-04-01T08:00:00Z"); setSystemTime(start);
-  const auth = createJwtAuthenticator({ issuer, audience, jwksUrl, allowLoopback: true });
+  const auth = fx.remoteVerifier(jwks.url);
   const t0 = nowSeconds(), at = (seconds: number) => setSystemTime(new Date(start.getTime() + seconds * 1000));
   const token = await signed({ iat: t0, exp: t0 + 300 });
-  expect(await auth.authenticate(token)).not.toBeNull(); expect(requests).toBe(1);
-  keys = []; // Operator removes the key from the JWKS.
-  at(30); expect(await auth.authenticate(token)).not.toBeNull(); expect(requests).toBe(1); // Still served from the 60s cache.
-  at(61); expect(await auth.authenticate(token)).toBeNull(); expect(requests).toBe(2); // Cache expired: the key is gone, so the token is refused well before its exp.
-  keys = [publicJwk]; at(62); expect(await auth.authenticate(token)).toBeNull(); // Failed refresh is rate limited by the 5s cooldown...
+  expect(await auth.authenticate(token)).not.toBeNull(); expect(requests()).toBe(1);
+  jwks.setKeys([]); // Operator removes the key from the JWKS.
+  at(30); expect(await auth.authenticate(token)).not.toBeNull(); expect(requests()).toBe(1); // Still served from the 60s cache.
+  at(61); expect(await auth.authenticate(token)).toBeNull(); expect(requests()).toBe(2); // Cache expired: the key is gone, so the token is refused well before its exp.
+  jwks.setKeys([fx.publicJwk]); at(62); expect(await auth.authenticate(token)).toBeNull(); // Failed refresh is rate limited by the 5s cooldown...
   at(67); expect(await auth.authenticate(token)).not.toBeNull(); // ...and recovers once the key is published again.
+});
+test("key removal is effective 60s after the last JWKS fetch; the 5s refresh cooldown does not extend it", async () => {
+  const jwks = await fx.serveJwks(), start = new Date("2026-04-01T08:00:00Z"); setSystemTime(start);
+  const auth = fx.remoteVerifier(jwks.url, { maxTtlSeconds: 1000 }), at = (seconds: number) => setSystemTime(new Date(start.getTime() + seconds * 1000));
+  const t0 = nowSeconds(), token = await signed({ iat: t0, exp: t0 + 1000 }), stranger = await signed({ iat: t0, exp: t0 + 300 }, { alg: "RS256", kid: "unknown" });
+  expect(await auth.authenticate(token)).not.toBeNull(); expect(jwks.requests()).toBe(1); // Fetch at t=0.
+  // A token with an unknown kid, after the cooldown, forces a refresh at t=50 and restarts the 60s cache clock.
+  at(50); expect(await auth.authenticate(stranger)).toBeNull(); expect(jwks.requests()).toBe(2);
+  at(51); jwks.setKeys([]); // Operator removes the key at t=51.
+  at(109); expect(await auth.authenticate(token)).not.toBeNull(); expect(jwks.requests()).toBe(2); // Cached keys serve until t=110 ...
+  at(110); expect(await auth.authenticate(token)).toBeNull(); expect(jwks.requests()).toBe(3); // ... then the next verification refetches and refuses the token: 59s after removal.
 });
 test("an upload grant works until its own expiry, outlives the JWT that created it, and fails at expiry", async () => {
   const start = new Date("2026-04-01T08:00:00Z"); setSystemTime(start);
   const f = await deployment(), at = (seconds: number) => setSystemTime(new Date(start.getTime() + seconds * 1000));
   // Token valid for 300s; the agent creates its grants late in that window and the signer then stops issuing.
   const t0 = nowSeconds(), c = new Client({ name: "grant", version: "1" });
-  await c.connect(new StreamableHTTPClientTransport(new URL(`${f.base}/mcp`), { requestInit: { headers: { Host: "127.0.0.1", Authorization: `Bearer ${await signed({ iat: t0, exp: t0 + 300, scope: allTools })}` } } })); disposers.push(() => c.close());
+  await c.connect(new StreamableHTTPClientTransport(new URL(`${f.base}/mcp`), { requestInit: { headers: { Host: "127.0.0.1", Authorization: `Bearer ${await signed({ iat: t0, exp: t0 + 300, scope: allTools })}` } } })); fx.defer(() => c.close());
   at(200);
   const early = ok(await c.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } }));
   const late = ok(await c.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } }));
@@ -249,7 +248,7 @@ test("an upload grant works until its own expiry, outlives the JWT that created 
 test("same-user JWT principals (tenantId === agentId) are bound by the tighter default agent caps, visible through get_service_health", async () => {
   const config = loadConfig({ MD_JWT_ISSUER: issuer, MD_JWT_AUDIENCE: audience, MD_JWT_JWKS_URL: "https://trusted.test/jwks" });
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-compose-"));
-  disposers.push(() => fs.rm(dataDir, { recursive: true, force: true }));
+  fx.defer(() => fs.rm(dataDir, { recursive: true, force: true }));
   const f = await deployment(verifier(), { ...config.jobs, dataDir, converter: async () => {} });
   const a = await f.client("machine-a"), b = await f.client("machine-b");
   const health = ok(await a.callTool({ name: "get_service_health", arguments: {} }));
@@ -272,4 +271,33 @@ test("same-user JWT principals (tenantId === agentId) are bound by the tighter d
   expect(other.own_jobs.awaiting_upload).toBe(0); expect(other.own_reserved_bytes).toBe(0);
   ok(await b.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } }));
   expect(JSON.stringify(other)).not.toContain("machine-a");
+});
+
+test("MD_QUOTA_OVERRIDES_FILE entries keyed by a same-user JWT principal apply through get_service_health, bounded by the tenant defaults", async () => {
+  const MiB = 1024 * 1024, dir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-jwt-quota-"));
+  fx.defer(() => fs.rm(dir, { recursive: true, force: true }));
+  const overrides = path.join(dir, "quota.json");
+  await fs.writeFile(overrides, JSON.stringify({ overrides: [
+    { tenant_id: "machine-a", agent_id: "machine-a", max_jobs: 2 }, // Lowered.
+    { tenant_id: "machine-b", agent_id: "machine-b", max_jobs: 40, max_storage_bytes: 200 * MiB, max_concurrency: 2 }, // Raised above the tenant defaults.
+    { tenant_id: "machine-c", agent_id: "someone-else", max_jobs: 3 }, // Not a same-user key, so it can never match a JWT principal.
+  ] }));
+  const config = loadConfig({ MD_JWT_ISSUER: issuer, MD_JWT_AUDIENCE: audience, MD_JWT_JWKS_URL: "https://trusted.test/jwks", MD_DATA_DIR: path.join(dir, "data"), MD_QUOTA_OVERRIDES_FILE: overrides });
+  expect(config.jobs.quotaOverrides!.size).toBe(3);
+  const f = await deployment(verifier(), { ...config.jobs, converter: async () => {} });
+  const health = async (subject: string) => ok(await (await f.client(subject)).callTool({ name: "get_service_health", arguments: {} }));
+  const lowered = await health("machine-a"), raised = await health("machine-b"), mismatched = await health("machine-c"), unlisted = await health("machine-d");
+  expect(lowered.limits).toMatchObject({ agent_jobs: 2, tenant_jobs: 25, agent_override: true, effective: { jobs: 2, reserved_bytes: 128 * MiB, concurrency: 1 } });
+  // The raised agent caps are still held down by the tenant scope, which is the same single user with default caps.
+  expect(raised.limits).toMatchObject({ agent_jobs: 40, agent_reserved_bytes: 200 * MiB, agent_concurrency: 2, tenant_jobs: 25, tenant_reserved_bytes: 128 * MiB, tenant_concurrency: 1, agent_override: true, effective: { jobs: 25, reserved_bytes: 128 * MiB, concurrency: 1 } });
+  for (const report of [mismatched, unlisted]) expect(report.limits).toMatchObject({ agent_jobs: 10, agent_override: false, effective: { jobs: 10, reserved_bytes: 128 * MiB, concurrency: 1 } });
+  // The lowered cap is enforced for real, and as an agent-scope denial.
+  const a = await f.client("machine-a");
+  for (let i = 0; i < 2; i++) ok(await a.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } }));
+  const denied = await a.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } });
+  expect(denied.isError).toBe(true); expect(text(denied).error_info).toMatchObject({ code: "JOB_LIMIT_EXCEEDED", details: { scope: "agent", limit_jobs: 2 } });
+  expect(ok(await a.callTool({ name: "get_service_health", arguments: {} })).own_jobs.awaiting_upload).toBe(2);
+  // Another user's report neither shows nor shares that usage, and never exposes the other subjects.
+  const after = await health("machine-d");
+  expect(after.own_jobs.awaiting_upload).toBe(0); expect(JSON.stringify(after)).not.toMatch(/machine-[abc]|someone-else/);
 });

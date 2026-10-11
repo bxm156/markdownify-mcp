@@ -20,13 +20,21 @@ import {
   assertPathAllowed,
   assertRealPathAllowed,
   openLocalFile,
+  readOpenedFile,
   resolveOpenedFile,
   redactUrl,
+  MAX_LOCAL_FILE_BYTES,
 } from "./utils";
 import dns from "node:dns";
+import { execFileSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
+
+// Symlink, FIFO and device-node tests need POSIX semantics. On Windows
+// creating a symlink needs a privilege, there is no O_NOFOLLOW, and a
+// directory that holds an open file cannot be renamed.
+const posixOnly = test.skipIf(process.platform === "win32");
 
 describe("expandHome", () => {
   test("expands ~/path to home directory", () => {
@@ -550,13 +558,13 @@ describe("getAllowedPaths / assertPathAllowed", () => {
     expect(() => assertPathAllowed("/etc/passwd")).not.toThrow();
   });
 
-  describe("with symlinks", () => {
+  describe.skipIf(process.platform === "win32")("with symlinks", () => {
     let tmp: string;
     let allowedDir: string;
     let outsideDir: string;
 
     beforeEach(() => {
-      tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-")));
+      tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-")));
       allowedDir = path.join(tmp, "allowed");
       outsideDir = path.join(tmp, "outside");
       fs.mkdirSync(allowedDir);
@@ -612,7 +620,9 @@ describe("opened-file validation", () => {
   let target: string;
 
   beforeEach(() => {
-    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-open-")));
+    // .native matches the realpath the code under test uses (on Windows it
+    // also expands 8.3 short names such as RUNNER~1 in the temp directory).
+    tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-open-")));
     allowedDir = path.join(tmp, "allowed");
     outsideDir = path.join(tmp, "outside");
     fs.mkdirSync(path.join(allowedDir, "sub"), { recursive: true });
@@ -650,6 +660,7 @@ describe("opened-file validation", () => {
 
   for (const useProcFd of [false, true]) {
     const run = useProcFd ? test.skipIf(process.platform !== "linux") : test;
+    const runPosix = useProcFd ? run : posixOnly;
     const label = useProcFd ? "/proc/self/fd" : "dev/ino fallback";
 
     run(`${label}: returns the real path of an unchanged file`, async () => {
@@ -657,7 +668,7 @@ describe("opened-file validation", () => {
       expect(real).toBe(target);
     });
 
-    run(`${label}: an ancestor moved out of the allowed tree after open is caught`, async () => {
+    runPosix(`${label}: an ancestor moved out of the allowed tree after open is caught`, async () => {
       const result = await withOpened(async (h, st) => {
         // Move the opened file's directory outside, and plant an innocent
         // replacement at the old path.
@@ -678,7 +689,16 @@ describe("opened-file validation", () => {
     });
   }
 
-  test("dev/ino fallback: an ancestor swapped for a symlink outside is caught", async () => {
+  test("dev/ino fallback: a path that names a different file is refused", async () => {
+    // Platform-neutral form of a swap: the handle is one file, the path now
+    // names another. Runs on Windows too, where the swap tests are skipped.
+    const other = path.join(outsideDir, "sub", "doc.txt");
+    await expect(
+      withOpened((h, st) => resolveOpenedFile(h, other, st, { useProcFd: false })),
+    ).rejects.toThrow("changed while it was being opened");
+  });
+
+  posixOnly("dev/ino fallback: an ancestor swapped for a symlink outside is caught", async () => {
     const handle = await fs.promises.open(path.join(outsideDir, "sub", "doc.txt"), "r");
     try {
       // The handle points outside; the path now resolves outside too, so the
@@ -716,5 +736,66 @@ describe("opened-file validation", () => {
     const { handle } = await openLocalFile(path.join(outsideDir, "sub", "doc.txt"));
     await handle.close();
     await expect(openLocalFile(outsideDir)).rejects.toThrow("is not a regular file");
+  });
+
+  for (const mode of ["with", "without"] as const) {
+    const setMode = () => {
+      if (mode === "without") delete process.env.MD_ALLOWED_PATHS;
+    };
+
+    test(`openLocalFile ${mode} an allowlist enforces maxBytes on the fstat size`, async () => {
+      setMode();
+      const { handle, size } = await openLocalFile(target, { maxBytes: 6 });
+      await handle.close();
+      expect(size).toBe(6);
+      await expect(openLocalFile(target, { maxBytes: 5 })).rejects.toThrow(
+        `File "${target}" exceeds the 5-byte limit for local files.`,
+      );
+    });
+
+    test(`openLocalFile ${mode} an allowlist refuses a file over MAX_LOCAL_FILE_BYTES`, async () => {
+      setMode();
+      // Sparse: no 50 MiB of data is written.
+      fs.truncateSync(target, MAX_LOCAL_FILE_BYTES + 1);
+      await expect(openLocalFile(target)).rejects.toThrow(
+        "exceeds the 52428800-byte (50 MiB) limit for local files",
+      );
+    });
+
+    posixOnly(`openLocalFile ${mode} an allowlist never opens a FIFO or device node`, async () => {
+      setMode();
+      const fifo = path.join(allowedDir, "pipe.txt");
+      execFileSync("mkfifo", [fifo]);
+      // /dev/null stands in for a device node inside an allowed directory.
+      if (mode === "with") {
+        process.env.MD_ALLOWED_PATHS = [allowedDir, "/dev"].join(path.delimiter);
+      }
+      const devLink = path.join(allowedDir, "null.txt");
+      fs.symlinkSync("/dev/null", devLink);
+      const openSpy = spyOn(fs.promises, "open");
+      try {
+        for (const p of [fifo, "/dev/null"]) {
+          await expect(openLocalFile(p)).rejects.toThrow("is not a regular file");
+        }
+        // A symlink to a device is followed by the pre-filter (with an
+        // allowlist the realpath, /dev/null, is what gets checked).
+        await expect(openLocalFile(devLink)).rejects.toThrow("is not a regular file");
+        expect(openSpy).not.toHaveBeenCalled();
+      } finally {
+        openSpy.mockRestore();
+      }
+    });
+  }
+
+  test("readOpenedFile stops once more than maxBytes have been read", async () => {
+    const read = (maxBytes: number) =>
+      withOpened(async (h) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of readOpenedFile(h, "shown.txt", maxBytes)) chunks.push(chunk);
+        return Buffer.concat(chunks).toString();
+      });
+    expect(await read(6)).toBe("inside");
+    // fstat said 6 bytes; the file then grew. The limit applies to what is read.
+    await expect(read(5)).rejects.toThrow('File "shown.txt" exceeds the 5-byte limit');
   });
 });

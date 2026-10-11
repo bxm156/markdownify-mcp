@@ -13,6 +13,7 @@ import { createJwtAuthenticator } from "./jwt.js";
 import { loadConfig } from "./config.js";
 import { errorResponse, lookupError } from "./errors.js";
 import { quotaKey, type Principal, type QuotaOverride } from "./identity.js";
+import { toolErrorCode, toolJson, toolOk, waitFor } from "./test-helpers.js";
 
 const disposers: Array<() => Promise<unknown>> = [];
 afterEach(async () => { setSystemTime(); while (disposers.length) await disposers.pop()!(); });
@@ -39,10 +40,7 @@ function gatedConverter(owners: Map<string, string>) {
   };
   return { converter, release, peak };
 }
-async function until(check: () => Promise<boolean>) {
-  for (let tries = 0; tries < 400; tries++) { if (await check()) return; await new Promise(resolve => setTimeout(resolve, 5)); }
-  throw new Error("Condition never became true");
-}
+const until = (check: () => Promise<boolean>) => waitFor(check, { timeoutMs: 5000, label: "quota scenario condition" });
 async function queue(instance: JobService, principal: Principal, owners?: Map<string, string>) {
   const created = await instance.createUpload(principal, { filename: "x.txt", size_bytes: 1 });
   owners?.set(created.upload_id, principal.agentId);
@@ -200,18 +198,19 @@ describe("signed subjects see only their own effective quota", () => {
       await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers: { Host: "127.0.0.1", Authorization: `Bearer ${token}` } } }));
       disposers.push(() => client.close()); return client;
     };
-    const text = (result: any) => JSON.parse(result.content[0].text);
+    const text = toolJson;
     const subjects = ["machine-vip", "machine-a", "machine-b"], clients = await Promise.all(subjects.map(connect));
     const calls = await Promise.all(clients.flatMap(client => [0, 1, 2].map(() => client.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } }))));
     const ok = (index: number) => calls.slice(index * 3, index * 3 + 3).filter(result => !result.isError).length;
     expect([ok(0), ok(1), ok(2)]).toEqual([2, 1, 1]);
     const denied = calls.findLast((result, i) => result.isError && i < 3)!;
+    expect(toolErrorCode(denied)).toBe("JOB_LIMIT_EXCEEDED");
     expect(text(denied).error_info).toMatchObject({ code: "JOB_LIMIT_EXCEEDED", details: { scope: "agent", limit_jobs: 2 } });
     expect(text(await clients[0].callTool({ name: "lookup_error", arguments: { code: text(denied).error_info.code } }))).toMatchObject({ code: "JOB_LIMIT_EXCEEDED", retryable: false });
     const store = await connect("machine-store");
-    expect((await store.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } })).isError).toBe(false);
+    toolOk(await store.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } }));
     const full = await store.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } });
-    expect(full.isError).toBe(true);
+    expect(toolErrorCode(full)).toBe("STORAGE_LIMIT_EXCEEDED");
     expect(text(full).error_info).toMatchObject({ code: "STORAGE_LIMIT_EXCEEDED", retryable: false, details: { scope: "agent", limit_bytes: 1500, requested_bytes: 1, reserved_bytes: 1001 } });
     expect(text(await store.callTool({ name: "lookup_error", arguments: { code: "STORAGE_LIMIT_EXCEEDED" } })).next_steps.join(" ")).toContain("input bytes plus the maximum output bytes");
     expect(text(await store.callTool({ name: "get_service_health", arguments: {} })).limits.effective).toMatchObject({ jobs: 3, reserved_bytes: 1500 });
@@ -221,7 +220,7 @@ describe("signed subjects see only their own effective quota", () => {
       expect(report.limits).toMatchObject({ agent_override: index === 0, effective: { jobs: index ? 1 : 2 } });
       for (const other of subjects.filter(subject => subject !== subjects[index])) expect(JSON.stringify(report)).not.toContain(other);
       const probe = await client.callTool({ name: "get_service_health", arguments: { tenant_id: "machine-vip", agent_id: "machine-vip" } });
-      expect(probe.isError).toBe(true); expect(text(probe).error_info.code).toBe("INVALID_ARGUMENTS");
+      expect(toolErrorCode(probe)).toBe("INVALID_ARGUMENTS");
     }
   });
 });

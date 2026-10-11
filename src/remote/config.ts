@@ -81,6 +81,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const quotaOverrides = env.MD_QUOTA_OVERRIDES_FILE === undefined ? undefined : loadQuotaOverrides(env.MD_QUOTA_OVERRIDES_FILE, { maxJobs, maxStorageBytes, concurrency, maxOutputBytes });
   return {
     authenticator, publicBaseUrl, allowedHosts, port, host: env.MD_HOST ?? "127.0.0.1",
+    shutdownTimeoutMs: integer("MD_SHUTDOWN_TIMEOUT_MS", 10_000),
     jobs: {
       dataDir: path.resolve(env.MD_DATA_DIR ?? "./data"),
       maxUploadBytes: integer("MD_MAX_UPLOAD_BYTES", 25 * 1024 * 1024),

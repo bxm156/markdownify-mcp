@@ -4,15 +4,39 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { resolveMarkitdownPath } from "../utils.js";
 import { ServiceError } from "./errors.js";
+import { resolveConverterExecutable } from "./health.js";
 
 export type Converter = (inputPath: string, outputPath: string, signal: AbortSignal) => Promise<void>;
 
-/** No shell is involved; stdout is streamed and bounded, including during conversion. */
+/** Abort reasons for a running conversion. Each carries the error code that the failed job keeps. */
+export const conversionAbort = {
+  /** An explicit cancellation, such as delete_job during a running conversion. */
+  cancelled: () => new ServiceError(409, "Conversion cancelled", "CONVERSION_CANCELLED"),
+  /** A graceful shutdown (SIGTERM, SIGINT or SIGHUP). From the agent's view this is a server restart. */
+  interrupted: () => new ServiceError(503, "Conversion interrupted by server restart", "CONVERSION_INTERRUPTED"),
+  /** The MD_CONVERSION_TIMEOUT_MS deadline. */
+  timedOut: (timeoutMs: number) => new ServiceError(504, "Conversion timed out", "CONVERSION_TIMEOUT", { timeout_ms: timeoutMs }),
+};
+const abortCodes = new Set<string>(["CONVERSION_CANCELLED", "CONVERSION_INTERRUPTED", "CONVERSION_TIMEOUT"]);
+/** The error for an aborted signal: its reason when that is a conversion abort reason, otherwise a cancellation. */
+export function abortError(signal: AbortSignal): ServiceError {
+  const reason: unknown = signal.reason;
+  return reason instanceof ServiceError && abortCodes.has(reason.code) ? reason : conversionAbort.cancelled();
+}
+
+/** No shell is involved, so on win32 only `.exe`/`.com` converters run (see resolveConverterExecutable); stdout is
+ * streamed and bounded, including during conversion. */
 export function createConverter(options: { maxOutputBytes: number; projectRoot?: string; executable?: string }): Converter {
   return async (inputPath, outputPath, signal) => {
-    signal.throwIfAborted();
-    const executable = options.executable ?? resolveMarkitdownPath(options.projectRoot ?? process.cwd());
-    const child = spawn(executable, [inputPath], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    if (signal.aborted) throw abortError(signal);
+    const requested = options.executable ?? resolveMarkitdownPath(options.projectRoot ?? process.cwd());
+    // Spawn the file the health check reports, never a different search result. On POSIX an unresolved name is still
+    // handed to spawn so its error (ENOENT, EACCES) surfaces as before. On win32 spawn would search the working directory
+    // first and could pick a file health never saw, so an unresolved name fails here instead.
+    const executable = await resolveConverterExecutable(requested);
+    if (signal.aborted) throw abortError(signal);
+    if (executable === undefined && process.platform === "win32") throw Object.assign(new Error("Converter executable not found"), { code: "ENOENT" });
+    const child = spawn(executable ?? requested, [inputPath], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let bytes = 0;
     // Drain stderr without retaining document contents or exposing server paths to clients.
     child.stderr.resume();
@@ -29,13 +53,14 @@ export function createConverter(options: { maxOutputBytes: number; projectRoot?:
     const streamed = pipeline(child.stdout, limit, createWriteStream(outputPath, { flags: "wx", mode: 0o600 }));
     try {
       await Promise.all([exited, streamed]);
-      signal.throwIfAborted();
+      if (signal.aborted) throw abortError(signal);
     } catch (error) {
       stop();
       // A nonzero exit can arrive before the output stream has closed. Wait
       // for both before the caller removes its partial output (also on Windows).
       await Promise.allSettled([exited, streamed]);
-      throw error;
+      // A killed child exits nonzero; report why it was killed, not a document failure.
+      throw signal.aborted ? abortError(signal) : error;
     } finally {
       signal.removeEventListener("abort", stop);
     }

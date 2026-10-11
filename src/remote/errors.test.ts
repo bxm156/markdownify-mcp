@@ -59,13 +59,13 @@ async function startTestJob(service: JobService) {
   await service.startConversion(actor, job.upload_id);
   return job.upload_id;
 }
-test("shutdown cancellation stays cancelled when cleanup crosses the conversion deadline", async () => {
+test("a shutdown abort stays CONVERSION_INTERRUPTED when cleanup crosses the conversion deadline", async () => {
   let entered!: () => void, aborted!: () => void, release!: () => void;
   const running = new Promise<void>(resolve => { entered = resolve; });
   const stopped = new Promise<void>(resolve => { aborted = resolve; });
   const cleanup = new Promise<void>(resolve => { release = resolve; });
   // Capture the conversion deadline timer (a distinctive delay) so the test can fire it after the abort
-  // instead of sleeping past it: the late deadline must not turn the cancellation into a timeout.
+  // instead of sleeping past it: the late deadline must not turn the shutdown into a timeout.
   const deadline = 123_457, deadlines: Array<() => void> = [], realSetTimeout = globalThis.setTimeout;
   const timers = spyOn(globalThis, "setTimeout").mockImplementation(((handler: any, ms?: number, ...args: any[]) => {
     if (ms === deadline) deadlines.push(() => handler(...args));
@@ -81,7 +81,7 @@ test("shutdown cancellation stays cancelled when cleanup crosses the conversion 
   const closing = service.close();
   try { await stopped; expect(deadlines).toHaveLength(1); deadlines[0]!(); }
   finally { release(); await closing; timers.mockRestore(); }
-  expect((await service.getStatus(actor, id)).error_info?.code).toBe("CONVERSION_CANCELLED");
+  expect((await service.getStatus(actor, id)).error_info).toMatchObject({ code: "CONVERSION_INTERRUPTED", retryable: true });
 });
 for (const mode of ["document", "missing-executable", "index"] as const) {
   test(`conversion failure classification and safe persisted guidance: ${mode}`, async () => {

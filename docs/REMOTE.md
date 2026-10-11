@@ -11,7 +11,7 @@ This fork adds a native Streamable HTTP MCP server at `/mcp`, a binary upload en
 5. When status is `completed`, call `get_markdown` with `{ "job_id": "...", "offset": 0, "max_chars": 50000 }`. Append `markdown`, then follow `next_offset` until it is `null`. Offsets count Unicode code points, not bytes. The server bounds page size to 100,000 characters and avoids splitting a surrogate pair.
 6. Optionally call `delete_job` with `{ "job_id": "..." }` when done. Otherwise retention cleanup removes temporary content.
 
-States are `awaiting_upload → uploaded → queued → running → completed/failed → expired`. Upload retries require the same original bytes and a token that has not expired. After a successful upload, the scoped upload token is invalidated. On restart, queued conversions resume, interrupted running conversions become failed, and partial uploads are discarded. Re-upload a failed conversion as a new job. Polling does not extend retention.
+States are `awaiting_upload → uploaded → queued → running → completed/failed → expired`. Upload retries require the same original bytes and a token that has not expired. After a successful upload, the scoped upload token is invalidated. On restart, queued conversions resume, running conversions become failed with the retryable `CONVERSION_INTERRUPTED` (a graceful shutdown records it before exiting; after a crash the next start does), and partial uploads are discarded. Re-upload a failed conversion as a new job. Polling does not extend retention.
 
 The allowlist is PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, HTML, and JSON. The remote tools accept generated IDs, not server filesystem paths or arbitrary URLs. Scanned PDFs require a separate OCR capability and complex document layouts may not reproduce faithfully in Markdown.
 
@@ -113,6 +113,7 @@ For PowerShell use `$env:MCP_URL='...'` (and similarly for other variables) inst
 | `MD_UPLOAD_TTL_MS` | 900,000 (15 minutes) | Abandoned upload expiry |
 | `MD_CONVERSION_TIMEOUT_MS` | 120,000 (2 minutes) | Converter process deadline |
 | `MD_CONCURRENCY` | 2 | Maximum active converters |
+| `MD_SHUTDOWN_TIMEOUT_MS` | 10,000 (10 seconds) | Graceful shutdown deadline after SIGTERM, SIGINT or SIGHUP; when it passes the server closes every connection and exits 1. Keep the container `stop_grace_period` (15s in the bundled Compose files) above it |
 | `MD_QUOTA_OVERRIDES_FILE` | unset | Optional operator-managed per-principal agent caps; see [MULTITENANT.md](MULTITENANT.md#operator-quota-overrides) |
 
 Storage reservations are conservative: even a small file reserves the full configured Markdown output limit. Increase storage or lower output limits to accommodate more live jobs. JSON manifests and scratch buffers add overhead; the application budget is not a filesystem quota. Use a dedicated volume with adequate free space. Store it on an encrypted disk if document confidentiality requires it. Do not log upload authorization headers or whole `create_upload` results in agent traces.
