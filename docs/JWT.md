@@ -73,6 +73,25 @@ Blocking or deleting a LiteLLM key or user stops new gateway admissions, so Lite
 - Existing jobs and results are not deleted. They remain until `MD_RETENTION_MS` (default 24 hours) or `delete_job`, and a later key for the same user ID reaches them again.
 - To cut off sooner, lower `MD_JWT_MAX_TTL_SECONDS` and the signer `ttl_seconds`. Rotating the LiteLLM signing key invalidates tokens for all users only once the old key is removed from the JWKS and Markdownify's 60-second JWKS cache refreshes.
 
+### Revocation and expiry bounds
+
+Each bound below is counted from the moment the operator acts, with the defaults in brackets. Markdownify has no revocation list, so none of them can be shortened without changing a setting.
+
+| Action | Stops being accepted | Bound |
+| --- | --- | --- |
+| LiteLLM stops signing for a user (key or user blocked, signer disabled) | Every JWT already issued, when it expires | `MD_JWT_MAX_TTL_SECONDS` after it was signed (300 s), plus up to 5 s if the signer clock is ahead of Markdownify's |
+| Signing key removed from the JWKS | Tokens signed with that key, at the first verification after the cached key set expires | 60 s after the last successful JWKS fetch, so at most 60 s after removal |
+| Upload grant created late in a JWT's life | The grant, at its own expiry | 300 s after creation (a smaller `MD_UPLOAD_TTL_MS` shortens it); it can outlive the JWT that created it by up to 300 s |
+| Jobs and results | Only by `delete_job` or retention | `MD_RETENTION_MS` (24 hours) |
+
+Notes on the numbers:
+
+- **JWT lifetime.** A token is accepted until its `exp`, and `exp - iat` may not exceed `MD_JWT_MAX_TTL_SECONDS`. Once the signer stops issuing, the last token it signed is the last one that can work. The default is 300 s and the maximum is 3600 s.
+- **JWKS removal.** Markdownify caches the key set for 60 s and only refetches when a token is verified, so there is no background refresh and a restart empties the cache. After the cache expires, the next verification fetches the set again and a token whose key is gone is refused. If that fetch fails, tokens are refused too; Markdownify never falls back to an expired cache.
+- **JWKS cooldown.** The 5 s refresh cooldown does not lengthen removal. It limits how often an unknown `kid` can trigger a refetch, so a newly published key can take up to 5 s to be picked up, and a key that was removed and published again is accepted again after the same delay. Allow 60 s for removal and 5 s for publication.
+- **Upload grants.** A grant is issued by `create_upload`, which needs a valid JWT, so it can be created up to the instant that JWT expires. Its 300 s life is fixed and does not depend on `MD_JWT_MAX_TTL_SECONDS`. After the signer stops issuing, an upload can therefore still complete about `MD_JWT_MAX_TTL_SECONDS` plus 300 s later (10 minutes by default). A grant authorizes one upload for one job only and cannot be used for MCP requests.
+- **Removing a key affects every user** whose tokens it signed, and the grants those users created before removal keep working until they expire.
+
 If your gateway cannot run the `mcp_jwt_signer` guardrail, the alternative is registry mode with LiteLLM forwarding or storing each user's Markdownify credential; see [stored per-user credentials](MULTITENANT.md#stored-per-user-credentials-in-litellm) for the setup and trade-offs. The two modes cannot be combined in one deployment.
 
 LiteLLM's on-behalf-of mode (`auth_type: oauth2_token_exchange`) exchanges the caller's identity-provider token for an access token scoped to the MCP server (RFC 8693, or the Entra ID `jwt-bearer` profile) and forwards that provider-issued token instead of signing its own. Markdownify does not support this today: the verifier pins one issuer and JWKS, which would have to be the provider's rather than LiteLLM's, and it requires `mcp:tools/list` or `mcp:tools/call` plus per-tool `mcp:tools/<name>:call` scopes that identity providers do not issue. Supporting it would need a configurable scope mapping and acceptance of provider subjects as owners. It would also change the guarantee from "signed by your LiteLLM" to "issued by your provider for this audience", making the provider's token-exchange policy the effective gateway restriction. Use the signer or forwarded credentials until that is designed. See [LiteLLM OBO auth](https://docs.litellm.ai/docs/mcp_obo_auth).
@@ -93,11 +112,13 @@ Configure HTTPS and preserve Authorization plus X-Upload-Token for `/mcp` and `/
 | --- | --- |
 | MD_JWT_ISSUER | Exact trusted issuer, matching LiteLLM signer |
 | MD_JWT_AUDIENCE | Expected audience, recommended `markdownify` |
-| MD_JWT_JWKS_URL | Pinned HTTPS public-key endpoint; token-supplied key URLs are ignored |
+| MD_JWT_JWKS_URL | Pinned HTTPS public-key endpoint; tokens that supply their own key or key URL are rejected |
 | MD_JWT_MAX_TTL_SECONDS | Maximum token lifetime/age; default 300, allowed 1–3600. Also bounds how long an already-issued token outlives LiteLLM revocation |
 | MD_JWT_TOOL_PREFIX | Optional alias prefix accepted in tool scopes; default `markdownify-` |
 
-Only RS256 is accepted. Issuer, audience, signature, expiration, issued-at, bounded lifetime, subject format and scopes are checked. JWKS requests have a five-second timeout, no redirect following, 256 KiB body cap, 60-second cache and five-second refresh cooldown. Key rotation is supported; cached public keys and issued JWTs are not instantly revoked. Avoid sharing virtual keys or service identities. `MD_JWT_ALLOW_HTTP_LOCALHOST=1` permits loopback-only JWKS HTTP for tests; keep it unset in remote deployments.
+Any variable whose name starts with `MD_JWT_` selects JWT mode, even one set to an empty string or misspelled (for example `MD_JWT_ISSUER_URL`). Markdownify then fails closed: a missing required setting, an invalid value, or `MD_API_KEY` or `MD_AUTH_FILE` in the same environment stops startup instead of falling back to a static credential. A real process environment cannot hold an undefined value; only a programmatic environment object can, and `undefined` entries there count as unset.
+
+Only RS256 is accepted. A token whose protected header carries `jku`, `x5u`, `x5c` or `jwk` is rejected before key lookup, and so is any token with a `crit` header. Issuer, audience, signature, expiration, issued-at, bounded lifetime, subject format and scopes are checked. JWKS requests have a five-second timeout, no redirect following, 256 KiB body cap, 60-second cache and five-second refresh cooldown. Key rotation is supported; cached public keys and issued JWTs are not instantly revoked. Avoid sharing virtual keys or service identities. `MD_JWT_ALLOW_HTTP_LOCALHOST=1` permits loopback-only JWKS HTTP for tests; keep it unset in remote deployments.
 
 ## 4. Configure agents and upload files
 

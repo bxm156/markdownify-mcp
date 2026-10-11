@@ -35,7 +35,9 @@ export function createAuthenticator(registry: unknown): Authenticator {
 }
 
 export function loadAuthenticator(env: NodeJS.ProcessEnv = process.env): Authenticator {
-  if (Object.keys(env).some(name => name.startsWith("MD_JWT_"))) return loadJwtAuthenticator(env);
+  // Any MD_JWT_ variable selects JWT mode, even an empty one, so a half-configured deployment fails closed instead of using a static key.
+  // Keys whose value is undefined (possible only in a programmatic env object, never in process.env) are treated as unset.
+  if (Object.entries(env).some(([name, value]) => name.startsWith("MD_JWT_") && value !== undefined)) return loadJwtAuthenticator(env);
   if (env.MD_AUTH_FILE !== undefined) {
     if (!env.MD_AUTH_FILE || env.MD_API_KEY !== undefined) throw new Error("MD_AUTH_FILE requires a path and cannot be combined with MD_API_KEY");
     let registry: unknown;

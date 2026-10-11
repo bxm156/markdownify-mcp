@@ -1,27 +1,15 @@
 import { afterEach, expect, test } from "bun:test";
-import { SignJWT, generateKeyPair, exportJWK } from "jose";
-import { createServer } from "node:http";
 import { loadAuthenticator } from "./auth.js";
 import { loadConfig } from "./config.js";
 import { loadJwtAuthenticator } from "./jwt.js";
+import { createJwtFixture } from "./test-helpers.js";
 
-const issuer = "https://litellm.test", audience = "markdownify";
-const key = await generateKeyPair("RS256", { extractable: true });
-const jwk = { ...await exportJWK(key.publicKey), kid: "env", alg: "RS256", use: "sig" };
-const disposers: Array<() => Promise<unknown>> = [];
-afterEach(async () => { while (disposers.length) await disposers.pop()!(); });
+const fx = await createJwtFixture({ kid: "env" });
+const { issuer, audience } = fx;
+afterEach(() => fx.close());
 
-async function jwksServer() {
-  let requests = 0;
-  const server = createServer((_req, res) => { requests++; res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ keys: [jwk] })); });
-  await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
-  disposers.push(() => new Promise<void>(r => { server.closeAllConnections(); server.close(() => r()); }));
-  return { url: `http://127.0.0.1:${(server.address() as { port: number }).port}/jwks`, requests: () => requests };
-}
-async function token(scope = "mcp:tools/list mcp:tools/call") {
-  const now = Math.floor(Date.now() / 1000);
-  return new SignJWT({ iss: issuer, aud: audience, sub: "machine-a", iat: now, exp: now + 300, scope }).setProtectedHeader({ alg: "RS256", kid: "env" }).sign(key.privateKey);
-}
+const jwksServer = () => fx.serveJwks();
+const token = (scope = "mcp:tools/list mcp:tools/call") => fx.sign({ scope });
 const base = (extra: Record<string, string | undefined> = {}) => ({ MD_JWT_ISSUER: issuer, MD_JWT_AUDIENCE: audience, MD_JWT_JWKS_URL: "https://trusted.test/jwks", ...extra }) as NodeJS.ProcessEnv;
 
 test("loadJwtAuthenticator success path verifies tokens against the configured JWKS URL with the default tool prefix", async () => {
@@ -63,7 +51,7 @@ test("MD_JWT_MAX_TTL_SECONDS fails closed on empty and non-numeric values and de
   for (const ttl of ["", "abc", " ", "1e3x", "0x10x"]) expect(() => loadJwtAuthenticator(base({ MD_JWT_MAX_TTL_SECONDS: ttl })), JSON.stringify(ttl)).toThrow("max TTL");
   const jwks = await jwksServer(), env = { MD_JWT_JWKS_URL: jwks.url, MD_JWT_ALLOW_HTTP_LOCALHOST: "1" };
   const now = Math.floor(Date.now() / 1000);
-  const withTtl = (ttl: number) => new SignJWT({ iss: issuer, aud: audience, sub: "machine-a", iat: now, exp: now + ttl, scope: "mcp:tools/list" }).setProtectedHeader({ alg: "RS256", kid: "env" }).sign(key.privateKey);
+  const withTtl = (ttl: number) => fx.sign({ iat: now, exp: now + ttl, scope: "mcp:tools/list" });
   const defaults = loadJwtAuthenticator(base(env)), short = loadJwtAuthenticator(base({ ...env, MD_JWT_MAX_TTL_SECONDS: "60" }));
   expect(await defaults.authenticate(await withTtl(300))).not.toBeNull();
   expect(await defaults.authenticate(await withTtl(301))).toBeNull();
@@ -101,8 +89,25 @@ test("loadAuthenticator dispatches to JWT on any MD_JWT_-prefixed variable, neve
     expect(auth.authenticate(apiKey)).toEqual({ tenantId: "default", agentId: "default" });
   }
   expect(loadAuthenticator({ MD_API_KEY: apiKey }).mode).toBeUndefined();
-  // Fail-closed quirk: a key that is present with an undefined value counts as set (process.env cannot hold undefined).
-  expect(() => loadAuthenticator({ MD_JWT_ISSUER: undefined, MD_API_KEY: apiKey })).toThrow("cannot be combined");
+});
+test("MD_JWT_ variables whose value is undefined are unset; any defined value, even empty, still selects JWT mode", () => {
+  const apiKey = "a".repeat(32);
+  // process.env never holds undefined, so this only matters for programmatic env objects: undefined means unset and does not select JWT mode.
+  for (const env of [{ MD_JWT_ISSUER: undefined }, { MD_JWT_ISSUER: undefined, MD_JWT_AUDIENCE: undefined, MD_JWT_JWKS_URL: undefined }, { MD_JWT_UNKNOWN: undefined }]) {
+    const auth = loadAuthenticator({ ...env, MD_API_KEY: apiKey });
+    expect(auth.mode, JSON.stringify(env)).toBeUndefined();
+    expect(auth.authenticate(apiKey)).toEqual({ tenantId: "default", agentId: "default" });
+    expect(loadConfig({ ...env, MD_API_KEY: apiKey }).authenticator.mode, JSON.stringify(env)).toBeUndefined();
+    expect(() => loadAuthenticator(env), JSON.stringify(env)).toThrow("MD_API_KEY");
+  }
+  // One defined variable is enough, wherever it sits among undefined ones, and an empty string is defined: it fails closed.
+  for (const env of [{ MD_JWT_ISSUER: undefined, MD_JWT_UNKNOWN: "1" }, { MD_JWT_ISSUER: undefined, MD_JWT_AUDIENCE: "" }]) {
+    expect(() => loadAuthenticator(env), JSON.stringify(env)).toThrow("JWT auth requires");
+    expect(() => loadAuthenticator({ ...env, MD_API_KEY: apiKey }), JSON.stringify(env)).toThrow("cannot be combined");
+  }
+  expect(() => loadAuthenticator({ MD_JWT_ISSUER: "", MD_API_KEY: apiKey })).toThrow("cannot be combined");
+  // A complete JWT configuration with an extra undefined variable is unaffected.
+  expect(loadAuthenticator(base({ MD_JWT_TOOL_PREFIX: undefined })).mode).toBe("jwt");
 });
 test("loadConfig builds a JWT deployment from MD_JWT_* variables alone and keeps the other defaults", () => {
   const config = loadConfig(base({ MD_JWT_TOOL_PREFIX: "gw_" }));
