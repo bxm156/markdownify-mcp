@@ -181,6 +181,19 @@ describe("data-directory lock", () => {
     expect(await tokenIn(directory)).toMatch(/^[0-9a-f-]{36}$/);
   });
 
+  test("the sweep never tries to remove an old directory named like a lock temporary, and logs nothing for it", async () => {
+    const directory = await dataDir(), names = [leftoverName("tmp"), leftoverName("stale")], old = new Date(Date.now() - 120_000);
+    for (const name of names) { await fs.mkdir(path.join(directory, name)); await fs.writeFile(path.join(directory, name, "inside"), "x"); await fs.utimes(path.join(directory, name), old, old); }
+    // A plain unlink of a directory fails and the sweep ignores errors, so assert on the calls, not only the outcome.
+    const unlink = spyOn(fs, "unlink"), rm = spyOn(fs, "rm");
+    try {
+      const { events } = await acquire(directory, { staleAfterMs: 60_000 });
+      expect(events()).toEqual([]);
+      for (const call of [...unlink.mock.calls, ...rm.mock.calls]) expect(names.some(name => String(call[0]).includes(name))).toBe(false);
+    } finally { unlink.mockRestore(); rm.mockRestore(); }
+    for (const name of names) expect(await exists(path.join(directory, name, "inside"))).toBe(true);
+  });
+
   test("with reclaim disabled the sweep still waits for the default threshold, and nothing to sweep logs nothing", async () => {
     const directory = await dataDir(), young = leftoverName("stale"), old = leftoverName("stale");
     await aged(path.join(directory, young), DEFAULT_LOCK_STALE_AFTER_MS - 10_000); await aged(path.join(directory, old), DEFAULT_LOCK_STALE_AFTER_MS + 10_000);

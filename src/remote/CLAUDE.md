@@ -68,7 +68,7 @@ Built with `bun run build:remote` (tsc to `dist/remote/`), shipped as `Dockerfil
   every `HEARTBEAT_MS`. A lock whose mtime is older than `MD_LOCK_STALE_AFTER_MS` (`config.lockStaleAfterMs`, default
   60 000, 0 = never, else ≥ 15 000) is reclaimed: rename to a unique `.stale` name, verify inode and mtime, `wx`
   create. A heartbeat that finds a foreign token logs `lock_lost` and calls `onLost` (index.ts: shutdown, exit 1; JobService
-  sets `lost`, so `close()` kills converters but writes no manifest). The holder sweeps `.lock.<uuid>.{tmp,stale}`
+  sets `lost`, so `close()` kills converters and nothing touches the volume: every write or removal goes through `assertOwned()`/`rm()` in `jobs.ts`, so a new write path needs the gate, and error-path cleanup uses `rm(..., { bestEffort: true })`; requests that would write get 503 `SERVICE_UNAVAILABLE`). The holder sweeps `.lock.<uuid>.{tmp,stale}`
   older than the threshold on acquire and at most once per threshold from the heartbeat (`lock_leftovers_removed`).
   Errors carry `reclaimHint` and `LOCK_REMOVAL_HINT`. `purge-owner.ts` is an operator CLI (`node dist/remote/purge-owner.js <dir>
   <tenant> <agent> [--apply]`, dry run by default; a dry run proceeds past a stale lock with a one-line note). `--apply` holds the lock. Exit codes: 0 ok, 1 incomplete or
