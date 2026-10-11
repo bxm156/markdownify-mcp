@@ -24,7 +24,7 @@ Agent runtime ── MCP calls ──► /mcp
 Agent runtime ◄─ Markdown pages ── /mcp
 ```
 
-MCP controls the job; the runtime transfers the bytes. Connecting an MCP client does not automatically upload local files. The agent also needs filesystem access and an HTTP upload capability, or it can run the included [streaming helper](examples/upload-and-convert.ts). File paths and base64 are not upload tool arguments.
+MCP controls the job; the runtime transfers the bytes. Connecting an MCP client does not automatically upload local files. The agent also needs filesystem access and an HTTP upload capability, or it can run the included [streaming helper](examples/upload-and-convert.ts), which runs under Bun or Node 22.18+ and ships compiled in the server image. File paths and base64 are not upload tool arguments.
 
 ## Platform support
 
@@ -41,7 +41,7 @@ The steps below remain the standalone per-agent credential-registry alternative.
 
 ### 1. Get the provisioning tools
 
-Install Docker with Compose, Git and Bun 1.4.2. The server image includes Node, Python and MarkItDown; the host does not need a Python installation. Bun runs the credential utility and optional client helper.
+Install Docker with Compose, Git and Bun 1.4.2. The server image includes Node, Python and MarkItDown; the host does not need a Python installation. Bun runs the credential utility; the optional client helper runs under Bun or Node 22.18+.
 
 ```sh
 git clone https://github.com/bxm156/markdownify-mcp.git

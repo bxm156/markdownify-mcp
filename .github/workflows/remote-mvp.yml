@@ -70,6 +70,14 @@ jobs:
           MCP_TOKEN="$MD_API_KEY" CONVERSION_DEADLINE_MS=120000 \
             bun examples/upload-and-convert.ts src/sample-data/test.pdf "$example_output"
           grep -q 'Test PDF content' "$example_output"
+          # The same helper under plain Node (no Bun, no src/), then the compiled copy inside the image.
+          node_output="$RUNNER_TEMP/upload-and-convert-node.md"
+          MCP_TOKEN="$MD_API_KEY" CONVERSION_DEADLINE_MS=120000 \
+            node --experimental-strip-types --no-warnings examples/upload-and-convert.ts src/sample-data/test.pdf "$node_output"
+          grep -q 'Test PDF content' "$node_output"
+          docker run --rm --network container:markdownify-ci -e MCP_TOKEN="$MD_API_KEY" -e CONVERSION_DEADLINE_MS=120000 \
+            -v "$PWD/src/sample-data:/in:ro" markdownify-remote:ci \
+            sh -c 'node examples/upload-and-convert.js /in/test.pdf /tmp/image-example.md && grep -q "Test PDF content" /tmp/image-example.md'
       - name: Prepare disposable agent registry
         run: bun scripts/create-test-agent-registry.ts "$RUNNER_TEMP/markdownify-agents.json" "$GITHUB_ENV"
       - name: Verify container agent isolation
