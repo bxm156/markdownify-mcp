@@ -9,14 +9,30 @@ import { quotaKey, validatePrincipal, type Principal, type QuotaOverride } from 
 import { checkRuntime, HEALTH_TIMEOUT_MS, MAX_TIMER_MS, type RuntimeHealth } from "./health.js";
 import { prepareMarkdownIndex, readMarkdownPage } from "./markdown.js";
 import { acquireLock, releaseLock } from "./lock.js";
+import { AuditRecordError } from "./audit.js";
 
 import { ServiceError, errorInfo, lookupError, legacyCode, type ErrorCode, type ErrorDetails } from "./errors.js";
 export { ServiceError } from "./errors.js";
 export type JobStatus = "awaiting_upload" | "uploaded" | "queued" | "running" | "completed" | "failed" | "expired";
 type Job = { tenant_id: string; agent_id: string; id: string; filename: string; extension: string; size_bytes: number; token_hash?: string; upload_auth_hash?: string; status: JobStatus; created_at: string; expires_at: string; error?: string; error_code?: ErrorCode; error_details?: ErrorDetails };
-export type AuditEvent = { event: string; tenant_id: string; agent_id: string; job_id?: string; status?: string; reason?: string };
+export type AuditEvent = { event: string; tenant_id: string; agent_id: string; job_id?: string; status?: string; reason?: string; repeat_count?: number };
 /** An audit callback, optionally with a probe that checks writability without writing a record (see createAuditLogger). */
 export type AuditSink = ((event: AuditEvent) => void | Promise<void>) & { probe?: () => Promise<void> };
+/**
+ * Audit readiness policy (see recoverAudit). The recovery probe cannot see write-time failures (EIO, quotas), so its
+ * interval starts at AUDIT_PROBE_BASE_MS and doubles after every probe up to AUDIT_PROBE_MAX_MS, and only
+ * AUDIT_PROBE_PASSES consecutive passing probes restore readiness. A successful audit write resets both immediately.
+ */
+export const AUDIT_PROBE_BASE_MS = 2000;
+export const AUDIT_PROBE_MAX_MS = 60_000;
+export const AUDIT_PROBE_PASSES = 2;
+/** After the first recorded read_markdown of a completed result, every Nth further read writes read_markdown_repeat. */
+export const AUDIT_READ_REPEAT_EVERY = 10;
+/** Errno-style code for operator logs; never a message, path or stack. */
+function errnoCode(error: unknown) {
+  const raw = (error as NodeJS.ErrnoException | null)?.code;
+  return typeof raw === "string" && /^[A-Z0-9_]{1,32}$/.test(raw) ? raw : "UNKNOWN";
+}
 export type JobServiceOptions = { dataDir: string; maxUploadBytes: number; maxStorageBytes: number; maxJobs: number; retentionMs: number; uploadTtlMs: number; conversionTimeoutMs: number; maxOutputBytes: number; concurrency: number; converter?: Converter; legacyOwner?: Principal; maxTenantJobs?: number; maxTenantStorageBytes?: number; maxTenantConcurrency?: number; maxAgentJobs?: number; maxAgentStorageBytes?: number; maxAgentConcurrency?: number; healthTimeoutMs?: number; quotaOverrides?: ReadonlyMap<string, QuotaOverride>; audit?: AuditSink };
 const extensions = new Set([".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".md", ".csv", ".html", ".json"]);
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -43,21 +59,31 @@ export class JobService {
   private cleanupPending = new Set<string>();
   private failedLastSweep = new Set<string>();
   /**
-   * Audit availability for readiness: true from the last failed write until the next successful write or recovery probe.
-   * auditSettled counts settled writes so a probe that overlaps a write cannot overwrite the write's newer verdict.
+   * Audit availability for readiness: failing from the last failed write until the next successful write or until
+   * AUDIT_PROBE_PASSES consecutive recovery probes pass. auditSettled counts settled writes so a probe that overlaps a
+   * write cannot overwrite the write's newer verdict. A record the logger rejects (AuditRecordError) changes none of this.
    */
   private auditFailing = false;
   private auditSettled = 0;
   private auditProbe?: { until: number; result: Promise<void> };
+  /** Wait after the next probe settles; doubles per probe up to AUDIT_PROBE_MAX_MS, reset by a successful write. */
+  private auditProbeDelay = AUDIT_PROBE_BASE_MS;
+  /** Consecutive passing probes with no failed write in between. */
+  private auditProbePasses = 0;
+  /** Distinct rejected-record messages already logged; bounded, since messages are fixed strings. */
+  private auditRejections = new Set<string>();
   /**
    * Read-audit coalescing. Polling is expected (SKILL.md), so read_status and read_markdown are recorded only on the
    * first successful audit of each (event, job status) pair per job: a poll loop yields at most one record per state it
    * observes. Keyed on job ID, which has exactly one immutable owner checked by owned() first, so this is per (owner, job).
-   * Bounded: at most 2 events x 7 statuses per job, only for jobs in this.jobs, dropped by forget() on deletion and
-   * tombstone removal. In memory only, so the first read per state after a restart is recorded again.
-   * authorization_denied, quota_denied and every mutation/lifecycle event are never coalesced.
+   * The value counts reads after the first record; for read_markdown of a completed result every
+   * AUDIT_READ_REPEAT_EVERY-th one writes read_markdown_repeat, so heavy re-reading stays visible.
+   * Bounded: at most 2 events x 7 statuses (one counter each) per job, only for jobs in this.jobs, dropped by forget() on
+   * deletion and tombstone removal. In memory and per process, so the first read per state after a restart (or on
+   * another replica) is recorded again and repeat counts restart from zero.
+   * authorization_denied, quota_denied and every mutation/lifecycle event are never coalesced or sampled.
    */
-  private auditedReads = new Map<string, Set<string>>();
+  private auditedReads = new Map<string, Map<string, number>>();
   constructor(private options: JobServiceOptions) {
     for (const [name, value] of Object.entries(options)) {
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`Invalid ${name}`);
@@ -89,34 +115,71 @@ export class JobService {
   private validPrincipal(principal: Principal) {
     try { validatePrincipal(principal); } catch { throw new ServiceError(401, "Invalid principal"); }
   }
-  private async audit(event: string, principal: Principal, id?: string, status?: string, reason?: string) {
+  private async audit(event: string, principal: Principal, id?: string, status?: string, reason?: string, repeatCount?: number) {
     if (!this.options.audit) return;
-    try { await this.options.audit({ event, tenant_id: principal.tenantId, agent_id: principal.agentId, ...(id && /^[0-9a-f-]{36}$/.test(id) ? { job_id: id } : {}), ...(status ? { status } : {}), ...(reason ? { reason } : {}) }); }
-    catch { this.auditSettled++; this.auditFailing = true; throw new ServiceError(503, "Audit unavailable"); }
-    this.auditSettled++; this.auditFailing = false;
+    try { await this.options.audit({ event, tenant_id: principal.tenantId, agent_id: principal.agentId, ...(id && /^[0-9a-f-]{36}$/.test(id) ? { job_id: id } : {}), ...(status ? { status } : {}), ...(reason ? { reason } : {}), ...(repeatCount !== undefined ? { repeat_count: repeatCount } : {}) }); }
+    catch (error) {
+      // A rejected record never reached storage: fail this operation, but the sink's availability is unknown, not failed.
+      if (error instanceof AuditRecordError) this.auditRejected(error);
+      else { this.auditSettled++; this.auditAvailability(false, error); }
+      throw new ServiceError(503, "Audit unavailable");
+    }
+    this.auditSettled++; this.auditProbe = undefined; this.auditProbeDelay = AUDIT_PROBE_BASE_MS; this.auditAvailability(true, "write");
+  }
+  /** Records a write's or probe's verdict; logs one sanitized event per readiness transition, never per failed write. */
+  private auditAvailability(available: boolean, cause: unknown) {
+    this.auditProbePasses = 0;
+    if (this.auditFailing !== available) return;
+    this.auditFailing = !available;
+    console.error(JSON.stringify(available ? { event: "audit_sink_recovered", via: cause } : { event: "audit_sink_unavailable", code: errnoCode(cause) }));
+  }
+  /** Logs each distinct rejection message once (fixed strings from the logger; anything else is replaced). */
+  private auditRejected(error: Error) {
+    const message = /^[A-Za-z0-9 _.,-]{1,100}$/.test(error.message) ? error.message : "Invalid audit record";
+    if (this.auditRejections.has(message) || this.auditRejections.size >= 32) return;
+    this.auditRejections.add(message);
+    console.error(JSON.stringify({ event: "audit_record_rejected", message }));
   }
   /** Coalesced read audit; see auditedReads. Called under the job lock after owned(), so checks and marks cannot race. */
   private async auditRead(event: "read_status" | "read_markdown", principal: Principal, job: Job) {
     const key = `${event}:${job.status}`;
-    if (this.auditedReads.get(job.id)?.has(key)) return;
-    await this.audit(event, principal, job.id, job.status);
-    // Mark only after a successful write, so a read that failed with 503 is recorded on its retry.
-    if (!this.jobs.has(job.id)) return;
-    const seen = this.auditedReads.get(job.id) ?? new Set<string>();
-    seen.add(key); this.auditedReads.set(job.id, seen);
+    const seen = this.auditedReads.get(job.id)?.get(key);
+    if (seen === undefined) {
+      await this.audit(event, principal, job.id, job.status);
+      // Mark only after a successful write, so a read that failed with 503 is recorded on its retry.
+      if (!this.jobs.has(job.id)) return;
+      const reads = this.auditedReads.get(job.id) ?? new Map<string, number>();
+      reads.set(key, 0); this.auditedReads.set(job.id, reads);
+      return;
+    }
+    // Status polling stays coalesced; re-reading a completed result is sampled. The count advances only after a
+    // sampled record is written, so a read whose repeat record failed with 503 writes it on its retry.
+    if (event !== "read_markdown" || job.status !== "completed") return;
+    const count = seen + 1;
+    if (count % AUDIT_READ_REPEAT_EVERY === 0) await this.audit("read_markdown_repeat", principal, job.id, job.status, undefined, count);
+    this.auditedReads.get(job.id)?.set(key, count);
   }
   /**
-   * While the last audit write failed, readiness runs the sink's non-writing probe (shared in flight, at most one per
-   * two seconds, bounded by the health timeout) so a replica drained by its own readiness can recover without traffic.
-   * Without a probe, only the next successful write clears the failure.
+   * While the last audit write failed, readiness runs the sink's non-writing probe (shared in flight, bounded by the
+   * health timeout) so a replica drained by its own readiness can recover without traffic. The probe cannot see
+   * write-time failures, so a sink that passes it but fails real writes would flap: the wait after each probe starts at
+   * AUDIT_PROBE_BASE_MS and doubles up to AUDIT_PROBE_MAX_MS (kept across relapses, reset only by a successful write),
+   * and readiness returns only after AUDIT_PROBE_PASSES consecutive passes. Without a probe, only a successful write
+   * clears the failure.
    */
   private async recoverAudit() {
     const probe = this.options.audit?.probe;
     if (!this.auditFailing || !probe) return;
     if (!this.auditProbe || this.auditProbe.until <= Date.now()) {
       const settled = this.auditSettled;
-      const result = Promise.resolve().then(() => probe.call(this.options.audit)).then(() => { if (this.auditSettled === settled) this.auditFailing = false; }, () => undefined)
-        .finally(() => { if (this.auditProbe?.result === result) this.auditProbe.until = Date.now() + 2000; });
+      const result = Promise.resolve().then(() => probe.call(this.options.audit)).then(
+        () => { if (this.auditSettled === settled && this.auditFailing && ++this.auditProbePasses >= AUDIT_PROBE_PASSES) this.auditAvailability(true, "probe"); },
+        () => { if (this.auditSettled === settled) this.auditProbePasses = 0; })
+        .finally(() => {
+          if (this.auditProbe?.result !== result) return;
+          this.auditProbe.until = Date.now() + this.auditProbeDelay;
+          this.auditProbeDelay = Math.min(this.auditProbeDelay * 2, AUDIT_PROBE_MAX_MS);
+        });
       this.auditProbe = { until: Infinity, result };
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
