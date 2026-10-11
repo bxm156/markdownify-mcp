@@ -9,14 +9,21 @@ import {
   beforeEach,
   afterEach,
 } from "bun:test";
-import { Markdownify, MarkdownResult } from "./Markdownify";
+import {
+  Markdownify,
+  MarkdownResult,
+  _processKillTestHooks,
+  killActiveTools,
+  killProcessTree,
+} from "./Markdownify";
 import { download } from "./download";
 import {
   _fileAccessTestHooks,
   MAX_LOCAL_FILE_BYTES,
   resolveMarkitdownPath,
 } from "./utils";
-import { execFileSync } from "child_process";
+import { execFileSync, spawn } from "child_process";
+import { isRunning, killQuietly, waitUntil } from "./test-helpers";
 import dns from "node:dns";
 import fs from "fs";
 import path from "path";
@@ -572,34 +579,6 @@ describe.skipIf(process.platform === "win32")("external tool stubs", () => {
   });
 
   /**
-   * True while `pid` is a running process. A killed process that its parent
-   * has not reaped yet is a zombie: still listed, but dead (Linux /proc).
-   */
-  function isRunning(pid: number): boolean {
-    try {
-      process.kill(pid, 0);
-    } catch (e: unknown) {
-      if ((e as NodeJS.ErrnoException).code === "ESRCH") return false;
-      throw e;
-    }
-    try {
-      return !/^\d+ \(.*\) Z /.test(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
-    } catch {
-      // No /proc (macOS): kill(pid, 0) succeeded, so it is running. On
-      // Linux the entry vanished between the two checks.
-      return process.platform !== "linux";
-    }
-  }
-
-  async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 3000) {
-    const deadline = Date.now() + timeoutMs;
-    while (!predicate()) {
-      if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-  }
-
-  /**
    * A stub body that starts a grandchild `sleep`, records both PIDs and
    * waits, holding stdout open like a converter's own child processes.
    */
@@ -620,9 +599,7 @@ describe.skipIf(process.platform === "win32")("external tool stubs", () => {
       }
     } finally {
       // Do not leak a 30-second sleep when an assertion fails.
-      for (const pid of pids) {
-        try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
-      }
+      killQuietly(pids);
     }
   }
 
@@ -641,6 +618,77 @@ describe.skipIf(process.platform === "win32")("external tool stubs", () => {
       "markitdown timed out after 500 ms",
     );
   });
+
+  test("killActiveTools kills a running converter and the processes it started", async () => {
+    process.env.MARKITDOWN_PATH = stub("markitdown", spawnsGrandchild());
+    let pids: number[] = [];
+    try {
+      const run = Markdownify.toMarkdown({
+        filePath: path.join(sampleDataDir, "test.pdf"),
+        timeoutMs: 60_000,
+      }).catch((e: Error) => e);
+      await waitUntil(() => fs.existsSync(path.join(dir, "child.pid")), "the stub to start");
+      pids = [recordedPid("child"), recordedPid("grandchild")];
+      expect(killActiveTools()).toBe(1);
+      const error = (await run) as Error;
+      expect(error.message).toStartWith("Processing to Markdown failed: Command failed");
+      expect(error.message).not.toContain("timed out");
+      for (const pid of pids) {
+        await waitUntil(() => !isRunning(pid), `process ${pid} to exit`);
+      }
+      // A settled run is no longer registered.
+      expect(killActiveTools()).toBe(0);
+    } finally {
+      killQuietly(pids);
+    }
+  });
+
+  test("a finished converter is no longer registered as active", async () => {
+    process.env.MARKITDOWN_PATH = stub("markitdown", "echo '# Converted'");
+    await Markdownify.toMarkdown({ filePath: path.join(sampleDataDir, "test.pdf") });
+    expect(killActiveTools()).toBe(0);
+  });
+
+  /** A markitdown stub that records its temp variables and leaves a file in $TMPDIR. */
+  const writesTempFile = (then: string) =>
+    `printf '%s\\n' "$TMPDIR" "$TEMP" "$TMP" "$MDFY_STUB_PROBE" > "${path.join(dir, "markitdown.tmp")}"\n` +
+    `touch "$TMPDIR/marker"\n${then}`;
+
+  for (const [label, body, timeoutMs] of [
+    ["a successful run", "echo '# Converted'", 60_000],
+    ["a run killed at its timeout", "exec sleep 30", 500],
+  ] as const) {
+    test(`markitdown's temp files go to the staging directory and are removed after ${label}`, async () => {
+      process.env.MARKITDOWN_PATH = stub("markitdown", writesTempFile(body));
+      process.env.MDFY_STUB_PROBE = "inherited";
+      try {
+        const outcome = await Markdownify.toMarkdown({
+          filePath: path.join(sampleDataDir, "test.pdf"),
+          timeoutMs,
+        }).then((r) => r.text, (e: Error) => e.message);
+        expect(outcome).toBe(
+          timeoutMs === 500
+            ? "Processing to Markdown failed: markitdown timed out after 500 ms and was stopped (MD_CONVERTER_TIMEOUT_MS sets the limit)."
+            : "# Converted\n",
+        );
+      } finally {
+        delete process.env.MDFY_STUB_PROBE;
+      }
+      const [tmpdir, temp, tmp, probe] = fs
+        .readFileSync(path.join(dir, "markitdown.tmp"), "utf-8")
+        .trimEnd()
+        .split("\n");
+      // The staging directory that holds the input copy, not the suite's TMPDIR.
+      expect(tmpdir).toBe(path.dirname(argsOf("markitdown")[0]));
+      expect(path.dirname(tmpdir)).toBe(os.tmpdir());
+      expect(path.basename(tmpdir)).toStartWith("markdown_output_");
+      expect([temp, tmp]).toEqual([tmpdir, tmpdir]);
+      // The rest of the environment is inherited.
+      expect(probe).toBe("inherited");
+      expect(fs.existsSync(path.join(tmpdir, "marker"))).toBe(false);
+      expect(fs.existsSync(tmpdir)).toBe(false);
+    });
+  }
 
   /** A repomix stub that clones the way repomix does: into $TMPDIR/repomix-*. */
   const fakeClone = (then: string) =>
@@ -680,6 +728,72 @@ describe.skipIf(process.platform === "win32")("external tool stubs", () => {
     }).catch((e: Error) => e);
     expect((error as Error).message).toStartWith("Processing to Markdown failed: Command failed");
     expect((error as Error).message).not.toContain("timed out");
+  });
+});
+
+// The Windows branch of killProcessTree (taskkill /T /F) cannot run on the
+// Linux and macOS hosts, so it is driven through _processKillTestHooks with a
+// fake taskkill and a fake child.
+describe("killProcessTree on win32", () => {
+  afterEach(() => {
+    delete _processKillTestHooks.platform;
+    delete _processKillTestHooks.taskkill;
+  });
+
+  function fakeChild(pid: number | undefined) {
+    const kill = mock((_signal?: NodeJS.Signals | number) => true);
+    return { child: { pid, kill } as any, kill };
+  }
+
+  test("kills the tree with taskkill /T /F and nothing else when it succeeds", () => {
+    const taskkill = mock((_args: string[]) => true);
+    Object.assign(_processKillTestHooks, { platform: "win32", taskkill });
+    const { child, kill } = fakeChild(4242);
+    killProcessTree(child);
+    expect(taskkill.mock.calls).toEqual([[["/T", "/F", "/PID", "4242"]]]);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  test("falls back to killing the direct child when taskkill fails", () => {
+    const taskkill = mock((_args: string[]) => false);
+    Object.assign(_processKillTestHooks, { platform: "win32", taskkill });
+    const { child, kill } = fakeChild(4242);
+    killProcessTree(child);
+    expect(taskkill).toHaveBeenCalledTimes(1);
+    expect(kill.mock.calls).toEqual([["SIGKILL"]]);
+  });
+
+  test("falls back to killing the direct child when taskkill throws", () => {
+    const taskkill = mock((_args: string[]): boolean => {
+      throw Object.assign(new Error("spawnSync taskkill.exe ENOENT"), { code: "ENOENT" });
+    });
+    Object.assign(_processKillTestHooks, { platform: "win32", taskkill });
+    const { child, kill } = fakeChild(4242);
+    killProcessTree(child);
+    expect(kill.mock.calls).toEqual([["SIGKILL"]]);
+  });
+
+  test("a child that never got a pid is only kill()ed", () => {
+    const taskkill = mock((_args: string[]) => true);
+    Object.assign(_processKillTestHooks, { platform: "win32", taskkill });
+    const { child, kill } = fakeChild(undefined);
+    killProcessTree(child);
+    expect(taskkill).not.toHaveBeenCalled();
+    expect(kill.mock.calls).toEqual([["SIGKILL"]]);
+  });
+
+  // The real runner, where no taskkill.exe exists: spawnSync fails, so the
+  // direct child must still be killed.
+  test.skipIf(process.platform === "win32")("a missing taskkill.exe still kills the direct child", async () => {
+    _processKillTestHooks.platform = "win32";
+    const child = spawn("sleep", ["30"], { stdio: "ignore" });
+    const exited = new Promise((resolve) => child.once("exit", (_code, signal) => resolve(signal)));
+    try {
+      killProcessTree(child);
+      expect(await exited).toBe("SIGKILL");
+    } finally {
+      killQuietly(child.pid === undefined ? [] : [child.pid]);
+    }
   });
 });
 
@@ -888,14 +1002,14 @@ describe("Markdownify.toMarkdown staging directory", () => {
 
     const realMarkitdown = Markdownify["_markitdown"];
     const markitdownSpy = spyOn(Markdownify as any, "_markitdown").mockImplementation(
-      async (inputPath: string, projectRoot: string) => {
+      async (inputPath: string, stagingDir: string, projectRoot: string) => {
         stagedPaths.push(inputPath);
         if (stagedPaths.length === names.length) {
           stagedWhileRunning.push(listStaged());
           release();
         }
         await allStaged;
-        return realMarkitdown.call(Markdownify, inputPath, projectRoot);
+        return realMarkitdown.call(Markdownify, inputPath, stagingDir, projectRoot);
       },
     );
 
@@ -1016,13 +1130,13 @@ describe("Markdownify local files", () => {
     staged = [];
     const realMarkitdown = Markdownify["_markitdown"];
     markitdownSpy = spyOn(Markdownify as any, "_markitdown").mockImplementation(
-      async (inputPath: string, projectRoot: string) => {
+      async (inputPath: string, stagingDir: string, projectRoot: string) => {
         staged.push({
           path: inputPath,
           content: fs.readFileSync(inputPath, "latin1"),
         });
         return hasMarkitdown
-          ? realMarkitdown.call(Markdownify, inputPath, projectRoot)
+          ? realMarkitdown.call(Markdownify, inputPath, stagingDir, projectRoot)
           : fs.readFileSync(inputPath, "utf-8");
       },
     );

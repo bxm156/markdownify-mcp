@@ -14,14 +14,17 @@
  * - External tools run through runTool (spawn, no shell), so arguments are
  *   never shell-interpreted. On POSIX each run gets its own process group,
  *   and the whole group (git processes repomix starts included) is killed
- *   with SIGKILL after converterTimeoutMs().
- * - repomix runs with TMPDIR/TEMP/TMP pointing at a private directory that
- *   is removed when the run settles, so a killed clone leaves nothing behind.
+ *   with SIGKILL after converterTimeoutMs(); on Windows `taskkill /T /F`
+ *   kills the tree. Runs still in progress are tracked so the entry point
+ *   can kill them when the server is stopped (killActiveTools).
+ * - markitdown and repomix run with TMPDIR/TEMP/TMP pointing at the call's
+ *   private staging directory, which is removed when the run settles, so
+ *   their temporary files (a killed clone included) leave nothing behind.
  * - git-repo-to-markdown arguments reach repomix only after validateGitRef
  *   (branch) and validateRepoUrl (host allowlist + address pre-check).
  * Must run under Node and Bun.
  */
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, spawnSync, type ChildProcess } from "child_process";
 import path from "path";
 import fs from "fs";
 import os from "os";
@@ -96,21 +99,70 @@ type ToolError = Error & {
   stderr?: string;
 };
 
+/** The part of a ChildProcess that killProcessTree needs. */
+type KillableChild = Pick<ChildProcess, "pid" | "kill">;
+
+/** Runs taskkill with `args` and reports whether it exited 0. */
+type TaskkillRunner = (args: string[]) => boolean;
+
+/** taskkill.exe from the Windows directory, not whatever a PATH search finds first. */
+function taskkillPath(): string {
+  // Windows environment names are case-insensitive, so this also finds SYSTEMROOT.
+  const systemRoot = process.env.SystemRoot;
+  return systemRoot ? path.win32.join(systemRoot, "System32", "taskkill.exe") : "taskkill.exe";
+}
+
+/** The real TaskkillRunner: synchronous (usable from an "exit" handler), no shell, bounded. */
+const runTaskkill: TaskkillRunner = (args) => {
+  const result = spawnSync(taskkillPath(), args, {
+    stdio: "ignore",
+    windowsHide: true,
+    timeout: 10_000,
+  });
+  return result.error === undefined && result.status === 0;
+};
+
 /**
- * SIGKILLs `child` and, on POSIX, every process in its group (it was spawned
- * as a group leader), so grandchildren such as the `git` processes repomix
- * starts die with it. Falls back to killing only the child on Windows or
- * when the group kill fails (for example, the group is already gone).
- * The group id cannot have been reused here: Linux and the BSDs do not hand
- * out a pid while it is still some live process's group id.
+ * Test seams for killProcessTree's Windows branch, which cannot run on the
+ * POSIX CI hosts: `platform` overrides process.platform and `taskkill`
+ * replaces the real taskkill run. Production code never sets them; tests
+ * must delete them afterwards.
  */
-function killProcessTree(child: ChildProcess): void {
-  if (USE_PROCESS_GROUPS && child.pid !== undefined) {
-    try {
-      process.kill(-child.pid, "SIGKILL");
-      return;
-    } catch {
-      // Fall back to the direct child below.
+export const _processKillTestHooks: {
+  platform?: NodeJS.Platform;
+  taskkill?: TaskkillRunner;
+} = {};
+
+/**
+ * SIGKILLs `child` and every process it started, synchronously.
+ *
+ * POSIX: kills the child's process group (it was spawned as a group
+ * leader), so grandchildren such as the `git` processes repomix starts die
+ * with it. The group id cannot have been reused here: Linux and the BSDs do
+ * not hand out a pid while it is still some live process's group id.
+ * Windows: runs `taskkill /T /F /PID <pid>`, which ends the child and its
+ * descendants. In both cases it falls back to killing only the direct child
+ * when the tree kill fails (the group is already gone, taskkill is missing
+ * or exits non-zero).
+ */
+export function killProcessTree(child: KillableChild): void {
+  const platform = _processKillTestHooks.platform ?? process.platform;
+  if (child.pid !== undefined) {
+    if (platform === "win32") {
+      try {
+        if ((_processKillTestHooks.taskkill ?? runTaskkill)(["/T", "/F", "/PID", String(child.pid)])) {
+          return;
+        }
+      } catch {
+        // Fall back to the direct child below.
+      }
+    } else {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+        return;
+      } catch {
+        // Fall back to the direct child below.
+      }
     }
   }
   try {
@@ -118,6 +170,29 @@ function killProcessTree(child: ChildProcess): void {
   } catch {
     // Already exited.
   }
+}
+
+/**
+ * Every runTool child that has not settled yet. runTool adds a child once
+ * it is spawned and removes it when the run settles.
+ */
+const activeTools = new Set<ChildProcess>();
+
+/**
+ * Kills every external tool run still in progress, with its process tree
+ * (killProcessTree), and returns how many there were. Synchronous, so it is
+ * safe in a process "exit" handler. runTool spawns tools in their own
+ * process group, so a SIGINT/SIGTERM/SIGHUP sent to the server (or its
+ * terminal's process group) does not reach them: the entry point (index.ts)
+ * calls this from its signal and exit handlers. Importing this module
+ * installs no handlers. The killed runs still settle (rejecting) if the
+ * process keeps running.
+ */
+export function killActiveTools(): number {
+  const children = [...activeTools];
+  activeTools.clear();
+  for (const child of children) killProcessTree(child);
+  return children.length;
 }
 
 /**
@@ -154,6 +229,7 @@ function runTool(
       reject(e);
       return;
     }
+    if (child.pid !== undefined) activeTools.add(child);
 
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -192,6 +268,7 @@ function runTool(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      activeTools.delete(child);
       const out = Buffer.concat(stdout).toString("utf8");
       const err = Buffer.concat(stderr).toString("utf8");
       if (error) reject(Object.assign(error, { stdout: out, stderr: err }));
@@ -246,6 +323,11 @@ export class Markdownify {
   /**
    * Runs markitdown on `filePath` and returns its stdout.
    *
+   * `tempDir` is the call's private staging directory: markitdown runs with
+   * TMPDIR/TEMP/TMP pointing there (the rest of the environment is
+   * inherited), so any temporary file it or its parsers create is removed
+   * with the staging directory, even when the run is killed.
+   *
    * The 50 MB maxBuffer bounds the Markdown kept in memory; larger output
    * rejects with Node's maxBuffer error. A run longer than `timeoutMs` is
    * killed with SIGKILL, together with any processes it started (see
@@ -256,6 +338,7 @@ export class Markdownify {
    */
   private static async _markitdown(
     filePath: string,
+    tempDir: string,
     projectRoot: string,
     timeoutMs = converterTimeoutMs(),
   ): Promise<string> {
@@ -269,6 +352,7 @@ export class Markdownify {
       ({ stdout } = await runTool(markitdownPath, [filePath], {
         maxBuffer: 50 * 1024 * 1024, // 50 MB
         timeoutMs,
+        env: { ...process.env, TMPDIR: tempDir, TEMP: tempDir, TMP: tempDir },
       }));
     } catch (e: unknown) {
       const err = e as ToolError;
@@ -485,7 +569,7 @@ export class Markdownify {
         const text = await this.withStagingDir(async (stagingDir) => {
           const inputPath = path.join(stagingDir, `input.${extension}`);
           await fs.promises.writeFile(inputPath, content);
-          return this._markitdown(inputPath, projectRoot, timeoutMs);
+          return this._markitdown(inputPath, stagingDir, projectRoot, timeoutMs);
         });
         return { text };
       }
@@ -515,7 +599,7 @@ export class Markdownify {
               expanded,
               stagingDir,
             );
-            return this._markitdown(stagedPath, projectRoot, timeoutMs);
+            return this._markitdown(stagedPath, stagingDir, projectRoot, timeoutMs);
           });
           return { text };
         } finally {
