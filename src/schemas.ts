@@ -1,3 +1,11 @@
+/**
+ * Runtime argument validation for the stdio tools.
+ *
+ * tools.ts declares each tool's JSON Schema for clients; the zod schemas here
+ * are what the server actually enforces, and the two must stay in step. The
+ * messages produced by formatArgumentError are part of the observable tool
+ * output and are matched by tests and clients.
+ */
 import { z } from "zod";
 import * as tools from "./tools.js";
 
@@ -14,6 +22,7 @@ const gitRepoArgs = z.strictObject({
   compress: z.boolean().optional(),
 });
 
+/** Argument schema for every tool in tools.ts, keyed by tool name. */
 export const toolArgumentSchemas = {
   [tools.YouTubeToMarkdownTool.name]: urlArgs,
   [tools.BingSearchResultToMarkdownTool.name]: urlArgs,
@@ -28,8 +37,11 @@ export const toolArgumentSchemas = {
   [tools.GetMarkdownFileTool.name]: filepathArgs,
 } satisfies Record<string, z.ZodObject>;
 
+/** Validated arguments of the URL tools (YouTube, Bing search, webpage). */
 export type UrlArgs = z.infer<typeof urlArgs>;
+/** Validated arguments of the local-file tools and get-markdown-file. */
 export type FilepathArgs = z.infer<typeof filepathArgs>;
+/** Validated arguments of git-repo-to-markdown. */
 export type GitRepoArgs = z.infer<typeof gitRepoArgs>;
 
 /** The argument schema for a tool, or undefined for an unknown tool name. */
@@ -39,6 +51,7 @@ export function getToolArgumentSchema(name: string): z.ZodObject | undefined {
     : undefined;
 }
 
+/** Messages that predate schema validation; clients and tests still match on them. */
 const REQUIRED_MESSAGES: Record<string, string> = {
   url: "URL is required for this tool",
   filepath: "File path is required for this tool",

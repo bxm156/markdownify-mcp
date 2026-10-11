@@ -1,3 +1,14 @@
+/**
+ * Smoke test of a running remote server over Streamable HTTP with one bearer
+ * token: lists the tools, checks lookup_error guidance, uploads
+ * src/sample-data/test.pdf, converts it, pages through the Markdown seven
+ * characters at a time (to exercise pagination), deletes the job and checks
+ * that it is gone.
+ *
+ * Env: MCP_URL (default http://localhost:8000/mcp) and MCP_TOKEN or
+ * MD_API_KEY (required). Run from the repo root. Any failure exits non-zero;
+ * the job is deleted best-effort if a step fails.
+ */
 import assert from "node:assert/strict";
 import { createReadStream } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -33,6 +44,7 @@ try {
   assert.equal(uploadUrl.search, "", "Upload URL must not carry credentials in query parameters");
   const input = createReadStream(fixture);
   try {
+    // Streaming a request body needs duplex: "half", which RequestInit's type lacks.
     const response = await fetch(uploadUrl, { method: "PUT", body: input as unknown as BodyInit, duplex: "half", headers: { ...upload.required_headers, Authorization: `Bearer ${key}` }, redirect: "error", signal: AbortSignal.timeout(30000) } as RequestInit & { duplex: "half" });
     assert.equal(response.status, 204, "Binary upload failed");
   } finally { input.destroy(); }

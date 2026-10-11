@@ -1,3 +1,14 @@
+/**
+ * MCP server definition for the stdio transport: advertises the tools from
+ * tools.ts and dispatches calls to Markdownify.
+ *
+ * Every call's arguments are validated against the tool's strict zod schema
+ * (schemas.ts) before anything runs. Failures never escape as protocol
+ * errors: they come back as a tool result with `isError: true` and the text
+ * "Error: <message>", which clients and tests match on. The caller (index.ts)
+ * chooses and connects the transport; importing this module has no side
+ * effects.
+ */
 import { readFileSync } from "node:fs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
@@ -17,7 +28,8 @@ import { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 
 /**
  * The package version, read from the package.json one level above this file
- * (the same location from src/ and from the compiled dist/).
+ * (the same location from src/ and from the compiled dist/). Falls back to
+ * "unknown" rather than throwing, so a damaged install still starts.
  */
 export function readPackageVersion(): string {
   try {
@@ -30,6 +42,7 @@ export function readPackageVersion(): string {
   }
 }
 
+/** What a runner returns; `path` is set only by get-markdown-file. */
 type Result = { path?: string; text: string };
 
 /** Adapts a runner for one argument shape to the schema-validated `unknown` it receives. */
@@ -63,6 +76,15 @@ const runners: Record<string, (args: unknown) => Promise<Result>> = {
   ),
 };
 
+/**
+ * Creates an unconnected MCP server exposing every tool in tools.ts.
+ *
+ * An unknown tool name yields "Error: Tool not found"; a schema violation
+ * yields the message from formatArgumentError; a conversion failure yields
+ * its own message. A thrown non-Error value is logged to stderr and reported
+ * as "Unknown error occurred". `Object.hasOwn` keeps a name such as
+ * "constructor" from resolving to an inherited property of the runner table.
+ */
 export function createServer() {
   const server = new Server(
     {

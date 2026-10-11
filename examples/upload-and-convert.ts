@@ -1,4 +1,22 @@
-/** Run with Bun: bun examples/upload-and-convert.ts input.docx output.md */
+/**
+ * Run with Bun: bun examples/upload-and-convert.ts input.docx output.md
+ *
+ * Example client for the remote server: uploads a local file, converts it and
+ * writes the Markdown to a new file. Two modes:
+ * - direct: MCP_TOKEN is the bearer token for MCP_URL;
+ * - gateway: LITELLM_API_KEY authenticates to a LiteLLM MCP gateway at
+ *   MCP_URL (e.g. .../markdownify/mcp), and MARKDOWNIFY_BASE_URL is the
+ *   server's own origin for the binary upload, which bypasses the gateway.
+ *   MARKDOWNIFY_AGENT_TOKEN optionally forwards a per-agent token as
+ *   `x-mcp-<MARKDOWNIFY_SERVER_ALIAS>-authorization` (alias default
+ *   "markdownify").
+ * CONVERSION_DEADLINE_MS bounds the whole run (default 300000).
+ *
+ * Safety: plain http is refused except to loopback; the upload URL must be on
+ * the expected origin with no credentials, query or fragment; the output file
+ * must not exist yet; and raw tool output and server error text are never
+ * printed (create_upload returns a scoped credential), only local guidance.
+ */
 import { createReadStream } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import path from "node:path";
@@ -6,6 +24,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { lookupError } from "../src/remote/errors.js";
 
+/** A safe one-line description of a failed call, from the local error catalogue. */
 function failureMessage(payload: any): string {
   // Render only locally known guidance and whitelisted numeric limits. Never
   // echo arbitrary upstream messages, filenames, credentials or raw payloads.
@@ -25,6 +44,7 @@ const agentToken = gatewayKey ? process.env.MARKDOWNIFY_AGENT_TOKEN : token;
 if (!gatewayKey && !token) throw new Error("Set MCP_TOKEN for direct access or LITELLM_API_KEY for gateway access");
 if (gatewayKey && !process.env.MARKDOWNIFY_BASE_URL) throw new Error("Gateway mode requires MARKDOWNIFY_BASE_URL for the direct binary upload origin");
 const uploadOrigin = new URL(process.env.MARKDOWNIFY_BASE_URL ?? endpoint.origin).origin;
+/** Throws unless `url` is https:, or http: to a loopback host. */
 function permitLocalHttp(url: URL): void {
   if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) throw new Error("Use HTTPS for remote endpoints");
 }
@@ -33,6 +53,7 @@ permitLocalHttp(new URL(uploadOrigin));
 const timeoutMs = Number(process.env.CONVERSION_DEADLINE_MS ?? 300000);
 if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000) throw new Error("Invalid CONVERSION_DEADLINE_MS");
 const deadline = Date.now() + timeoutMs;
+/** Milliseconds left before the overall deadline; throws once it has passed. */
 const remaining = () => {
   const ms = deadline - Date.now();
   if (ms <= 0) throw new Error("Conversion deadline exceeded; the server job will expire automatically");
@@ -81,6 +102,7 @@ try {
   } finally { bytes.destroy(); }
   const { job_id } = await call<{ job_id: string }>("start_conversion", { upload_id: upload.upload_id });
   console.log(`Conversion queued: ${job_id}`);
+  // Poll with backoff: 500 ms, growing 1.5x per round up to 5 s.
   let delay = 500;
   for (;;) {
     const status = await call<{ status: string; error_info?: unknown }>("get_conversion_status", { job_id });

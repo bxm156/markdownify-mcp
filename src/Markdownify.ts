@@ -1,3 +1,20 @@
+/**
+ * Conversion back end of the stdio tools: fetches URLs, stages local files
+ * and runs the external `markitdown` (Python) and `repomix` executables.
+ *
+ * Invariants:
+ * - URL fetches connect only to addresses vetted by resolvePublicAddresses,
+ *   re-validated on every redirect hop (SSRF), via download.fetch.
+ * - Every input markitdown sees is bounded by one 50 MiB budget: URL bodies
+ *   by readBodyWithLimit, local files by openLocalFile / readOpenedFile.
+ * - A local file is read only through the handle that was opened and
+ *   checked, never reopened by path; markitdown gets a private copy.
+ * - Temporary files live in a per-call mkdtemp directory that is removed
+ *   when the call settles, whether it succeeds or fails.
+ * - External tools run through execFile (no shell), so arguments are never
+ *   shell-interpreted.
+ * Must run under Node and Bun.
+ */
 import { execFile } from "child_process";
 import { promisify } from "util";
 import path from "path";
@@ -25,16 +42,31 @@ const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/** One deadline for a URL fetch: every redirect hop, DNS lookup, connect and the body read. */
 const FETCH_TIMEOUT_MS = 30_000;
 // URL downloads and local files share one input budget (50 MiB).
 const MAX_DOWNLOAD_BYTES = MAX_LOCAL_FILE_BYTES;
 
+/**
+ * Result of a tool call: the Markdown text and, for get-markdown-file only,
+ * the path as the caller gave it (server.ts reports it as "Output file: ...").
+ */
 export type MarkdownResult = {
   path?: string;
   text: string;
 };
 
+/** Static entry points used by server.ts; the class holds no state. */
 export class Markdownify {
+  /**
+   * Runs markitdown on `filePath` and returns its stdout.
+   *
+   * The 50 MB maxBuffer bounds the Markdown kept in memory; larger output
+   * rejects with Node's maxBuffer error. No timeout is set. A missing
+   * executable becomes an actionable "markitdown executable not found"
+   * error, and output that is still an HTML document (see isUnconvertedHtml)
+   * becomes a "Conversion failed" error instead of being returned as Markdown.
+   */
   private static async _markitdown(
     filePath: string,
     projectRoot: string,
@@ -93,6 +125,18 @@ export class Markdownify {
     }
   }
 
+  /**
+   * Fetches `url`, following up to `maxRedirects` redirects itself.
+   *
+   * Each hop's URL is re-validated and re-resolved by resolvePublicAddresses
+   * and the connection is pinned to those addresses, so neither a redirect
+   * nor a DNS answer that changes between check and connect can reach an
+   * internal address. Bodies of redirect and error responses are cancelled to
+   * release their sockets. Throws "Fetching <redacted URL> failed with HTTP
+   * <status>" for 4xx/5xx and "Too many redirects" past the limit; validation,
+   * connection and timeout errors propagate as raised. A 3xx without a
+   * Location header is returned as the response.
+   */
   private static async safeFetch(
     url: string,
     maxRedirects = 10,
@@ -130,6 +174,12 @@ export class Markdownify {
     throw new Error("Too many redirects");
   }
 
+  /**
+   * Reads the whole response body, refusing more than `maxBytes`: a declared
+   * Content-Length over the limit is rejected before reading, and the stream
+   * is counted as it arrives. Throws "Response body exceeds the <n>-byte
+   * download limit." A response without a body yields an empty buffer.
+   */
   private static async readBodyWithLimit(
     response: Response,
     maxBytes = MAX_DOWNLOAD_BYTES,
@@ -145,7 +195,8 @@ export class Markdownify {
       return Buffer.alloc(0);
     }
     // Stream even when Content-Length is present: it can be absent or wrong,
-    // and fetch transparently decompresses gzip/br bodies.
+    // and download.fetch decodes gzip/deflate/br bodies (dropping the header),
+    // so the decoded size is what counts.
     const reader = response.body.getReader();
     const chunks: Uint8Array[] = [];
     let received = 0;
@@ -204,6 +255,19 @@ export class Markdownify {
     return Buffer.concat(chunks).toString("utf-8");
   }
 
+  /**
+   * Converts a URL or a local file to Markdown with markitdown; `url` wins
+   * when both are given.
+   *
+   * A URL is fetched with safeFetch and readBodyWithLimit and staged as
+   * `input.pdf` or `input.html` (see inferExtensionFromUrl). A local file is
+   * opened and checked by openLocalFile (allowlist, regular file, size cap)
+   * and copied through its handle; the comment in the body explains why.
+   * Every failure is rethrown as an Error whose message starts with
+   * "Error processing to Markdown: " (server.ts then adds "Error: ").
+   * `projectRoot`, the package root by default, is where a bundled `.venv`
+   * markitdown is looked for.
+   */
   static async toMarkdown({
     filePath,
     url,
@@ -272,6 +336,16 @@ export class Markdownify {
     }
   }
 
+  /**
+   * Packs a remote repository into one Markdown document with
+   * `repomix --remote`. repomix and git do the network access themselves, so
+   * only validateRepoUrl's checks apply, not the address pinning used for URL
+   * conversions. `branch` is passed on as `--remote-branch`. The 100 MB
+   * maxBuffer bounds the output kept in memory; no timeout is set. Errors are
+   * not wrapped as in toMarkdown: a missing executable becomes "repomix
+   * executable not found", empty output "repomix produced no output", and
+   * anything else propagates from execFile.
+   */
   static async fromRepo({
     repoUrl,
     branch,
@@ -329,6 +403,13 @@ export class Markdownify {
     return { text: stdout };
   }
 
+  /**
+   * Returns a local Markdown file's contents verbatim (invalid UTF-8 is
+   * replaced, not rejected), with `path` set to the path as given. Only
+   * `.md` and `.markdown` are accepted, case-sensitively ("Required file is
+   * not a Markdown file."); a missing file is reported as "File does not
+   * exist". The read honours MD_ALLOWED_PATHS and MAX_LOCAL_FILE_BYTES.
+   */
   static async get({
     filePath,
   }: {

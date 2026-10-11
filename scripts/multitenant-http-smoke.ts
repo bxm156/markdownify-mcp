@@ -1,3 +1,18 @@
+/**
+ * Multi-tenant isolation smoke test against a running remote server that uses
+ * a credential registry (see create-test-agent-registry.ts).
+ *
+ * With three agents (a and b in tenantA, c in tenantB) it checks that no agent,
+ * same tenant or not, can upload to, convert, inspect, read or delete another
+ * agent's job, and that every such denial looks like JOB_NOT_FOUND (no state
+ * is disclosed); that upload URLs carry no credentials; and that each owner
+ * can upload, convert, reconnect and page through its real PDF result.
+ *
+ * Env: MCP_URL (default http://localhost:8000/mcp) and MD_TEST_AGENT_KEYS
+ * (required JSON {"a","b","c"} tokens). Run from the repo root (reads
+ * src/sample-data/test.pdf). Any failed check exits non-zero; created jobs
+ * are deleted best-effort.
+ */
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -28,6 +43,7 @@ async function denied(agent: Agent, name: string, args: Record<string, unknown>)
 }
 try {
   for (const name of ["a", "b", "c"]) {
+    // `client` is assigned by connect() on the next line.
     const agent: Agent = { name, key: keys[name], client: undefined as unknown as Client, jobs: new Set() };
     agents.push(agent); await connect(agent);
   }
@@ -69,6 +85,7 @@ try {
     let offset = 0, markdown = "";
     for (let pageCount = 0; ; pageCount++) {
       assert(pageCount < 10000, "Pagination limit exceeded");
+      // Tiny pages force many calls and so exercise pagination.
       const page = await call<{ markdown: string; next_offset: number | null }>(agent, "get_markdown", { job_id: id, offset, max_chars: 7 });
       markdown += page.markdown;
       if (page.next_offset === null) break;

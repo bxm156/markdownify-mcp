@@ -1,3 +1,17 @@
+/**
+ * In-process smoke test of the remote JobService against the real markitdown
+ * converter, without the HTTP layer.
+ *
+ * Generates genuine DOCX/XLSX/PPTX files with create-remote-fixtures.py, then
+ * for those and src/sample-data/test.pdf runs upload, conversion, retrieval
+ * and deletion, checking the expected text and that the stored output.md
+ * matches what getMarkdown returns.
+ *
+ * Usage: bun run test:converter (bun scripts/remote-converter-smoke.ts), from
+ * the repo root. Env: PYTHON_PATH, the Python that runs the fixture script
+ * (default: the project's .venv, else `python`). Any failure throws, so the
+ * run exits non-zero; the data directory is removed either way.
+ */
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import os from "node:os";

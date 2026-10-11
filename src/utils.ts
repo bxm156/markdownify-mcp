@@ -1,3 +1,20 @@
+/**
+ * Shared helpers for the stdio server: executable lookup (resolveMarkitdownPath
+ * is also used by the remote server), the local-file access policy and the
+ * URL safety (SSRF) policy.
+ *
+ * Invariants:
+ * - A local file that will be read is opened once, checked through its handle
+ *   (fstat; with an allowlist, also where the opened file really is) and then
+ *   read only through that handle (openLocalFile + readOpenedFile). The
+ *   path-based checks are early, friendly rejections, not the decision.
+ * - A URL may be fetched only from the addresses resolvePublicAddresses
+ *   returns, and callers must call it again for every redirect hop.
+ * - Error messages never echo URL credentials, query strings or signatures
+ *   (redactUrl).
+ * Must run under Node and Bun, on POSIX and Windows; platform-specific open
+ * flags degrade to no-ops where they do not exist.
+ */
 import path from "path";
 import os from "os";
 import fs from "fs";
@@ -7,6 +24,7 @@ import { URL } from "node:url";
 import is_ip_private from "private-ip";
 import { isValidRemoteValue } from "repomix";
 
+/** Expands a leading `~` or `~/` to the home directory; `~user` is left as is. */
 export function expandHome(filepath: string): string {
   if (filepath.startsWith("~/") || filepath === "~") {
     return path.join(os.homedir(), filepath.slice(1));
@@ -14,6 +32,11 @@ export function expandHome(filepath: string): string {
   return filepath;
 }
 
+/**
+ * The markitdown executable to run: MARKITDOWN_PATH if set, else the
+ * project's own `.venv` (created by setup.sh / setup.bat at install), else the
+ * bare name, which execFile looks up on PATH.
+ */
 export function resolveMarkitdownPath(projectRoot: string): string {
   if (process.env.MARKITDOWN_PATH) return process.env.MARKITDOWN_PATH;
   const isWin = process.platform === "win32";
@@ -27,6 +50,10 @@ export function resolveMarkitdownPath(projectRoot: string): string {
   return "markitdown";
 }
 
+/**
+ * The repomix executable to run: REPOMIX_PATH if set, else the package's own
+ * `node_modules/.bin/repomix`, else the bare name, looked up on PATH.
+ */
 export function resolveRepomixPath(projectRoot: string): string {
   if (process.env.REPOMIX_PATH) return process.env.REPOMIX_PATH;
   const local = path.join(projectRoot, "node_modules", ".bin", "repomix");
@@ -34,6 +61,14 @@ export function resolveRepomixPath(projectRoot: string): string {
   return "repomix";
 }
 
+/**
+ * The directory allowlist from MD_ALLOWED_PATHS (or the older MD_SHARE_DIR
+ * when MD_ALLOWED_PATHS is unset; an empty MD_ALLOWED_PATHS counts as set and
+ * so hides MD_SHARE_DIR), split on path.delimiter (":" on POSIX, ";" on
+ * Windows), each entry made absolute with `~` expanded. Returns null when
+ * there is no allowlist, which permits every readable file. Read on every
+ * call, never cached.
+ */
 export function getAllowedPaths(): string[] | null {
   const raw = process.env.MD_ALLOWED_PATHS ?? process.env.MD_SHARE_DIR;
   if (!raw) return null;
@@ -72,7 +107,9 @@ function realpathOfDeepestExisting(target: string): string {
 
 /**
  * Checks an already-resolved real path against the allowlist. `displayPath`
- * is the path the caller asked for, used only in the error message.
+ * is the path the caller asked for, used only in the error message. The
+ * allowlist entries are resolved too, so an allowed directory that is itself
+ * reached through a symlink still matches.
  */
 export function assertRealPathAllowed(
   realPath: string,
@@ -116,6 +153,7 @@ export const _fileAccessTestHooks: {
   afterOpen?: (realPath: string) => void | Promise<void>;
 } = {};
 
+/** Bytes in a mebibyte; also the chunk size of readOpenedFile. */
 const MIB = 1024 * 1024;
 
 /**
@@ -133,6 +171,7 @@ function describeLimit(maxBytes: number): string {
     : `${maxBytes}-byte`;
 }
 
+/** The size-cap error; tests match its "exceeds the ... limit for local files" wording. */
 function localFileTooLarge(displayPath: string, maxBytes: number): Error {
   return new Error(
     `File "${displayPath}" exceeds the ${describeLimit(maxBytes)} limit for local files.`,
@@ -147,6 +186,7 @@ const OPEN_FLAGS_FOLLOW =
   fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0);
 const OPEN_FLAGS_NOFOLLOW = OPEN_FLAGS_FOLLOW | (fs.constants.O_NOFOLLOW ?? 0);
 
+/** A file opened and validated by openLocalFile. The caller must close `handle`. */
 export type OpenedLocalFile = {
   handle: fs.promises.FileHandle;
   /** Size in bytes at open time (fstat). */
@@ -166,6 +206,7 @@ export async function* readOpenedFile(
 ): AsyncGenerator<Buffer> {
   let position = 0;
   for (;;) {
+    // A fresh buffer per chunk: consumers keep the yielded slices.
     const chunk = Buffer.alloc(MIB);
     const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
     if (bytesRead === 0) return;
@@ -219,6 +260,7 @@ export async function resolveOpenedFile(
   if (useProcFd) {
     try {
       const linked = await fs.promises.readlink(`/proc/self/fd/${handle.fd}`);
+      // Anything but a filesystem path (e.g. "pipe:[123]") is not an answer.
       if (path.isAbsolute(linked)) return linked;
     } catch {
       // /proc is not mounted (some sandboxes): fall through.
@@ -247,6 +289,11 @@ export async function resolveOpenedFile(
  * and checked, opened with O_NOFOLLOW, and the opened file's own location is
  * checked again (see resolveOpenedFile). The caller must read only through
  * the returned handle (readOpenedFile) and must close it.
+ *
+ * Policy failures throw messages naming `filePath` ("is outside the allowed
+ * directories", "is not a regular file", "exceeds the ... limit", "changed
+ * while it was being opened"). Filesystem errors such as ENOENT or EACCES
+ * propagate unchanged; Markdownify.get relies on the ENOENT code.
  */
 export async function openLocalFile(
   filePath: string,
@@ -284,6 +331,8 @@ export async function openLocalFile(
   }
 
   try {
+    // bigint: 64-bit inode numbers (and Windows file IDs) lose precision as
+    // numbers, which could make two files look identical in resolveOpenedFile.
     const stats = await handle.stat({ bigint: true });
     if (!stats.isFile()) {
       throw new Error(`Path "${filePath}" is not a regular file.`);
@@ -303,13 +352,21 @@ export async function openLocalFile(
   }
 }
 
+/**
+ * Hostnames refused by name before any DNS lookup, ahead of the address
+ * checks: `localhost` (`*.localhost` is checked separately) and the Google
+ * Cloud metadata server's names.
+ */
 const BLOCKED_HOSTNAMES = new Set([
   "localhost",
   "metadata",
   "metadata.google.internal",
 ]);
 
-/** Expands an IPv6 address into its eight 16-bit groups. */
+/**
+ * Expands an IPv6 address into its eight 16-bit groups. Expects an address
+ * that net.isIPv6 accepts; it does not validate.
+ */
 function ipv6Groups(address: string): number[] {
   let text = address;
   // Rewrite a trailing dotted IPv4 part (::ffff:127.0.0.1) as two hex groups.
@@ -391,7 +448,16 @@ export async function validateUrl(url: string): Promise<void> {
   await resolvePublicAddresses(url);
 }
 
-/** Like validateUrl, but returns the vetted addresses so the caller can pin to them. */
+/**
+ * Like validateUrl, but returns the vetted addresses so the caller can pin to
+ * them. Every resolved address must be public: one private answer rejects the
+ * whole host, so a mixed DNS answer cannot steer the connection inside.
+ *
+ * Throws "Only http: and https: schemes are allowed.", "URLs with embedded
+ * credentials are not allowed." or, for a blocked name, a private address, a
+ * failed lookup or an empty answer, "Fetching <redacted URL> is potentially
+ * dangerous, aborting." If `signal` aborts first, rejects with its reason.
+ */
 export async function resolvePublicAddresses(
   url: string,
   signal?: AbortSignal,
@@ -425,6 +491,7 @@ export async function resolvePublicAddresses(
 
   let addresses: { address: string; family: number }[];
   try {
+    // verbatim: keep the resolver's order; download.ts interleaves families itself.
     addresses = await withAbort(dns.promises.lookup(hostname, { all: true, verbatim: true }), signal);
   } catch {
     signal?.throwIfAborted();
@@ -450,6 +517,13 @@ function withAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
   });
 }
 
+/**
+ * Validates the git-repo-to-markdown `url`: non-empty, accepted by repomix's
+ * own parser (a URL or GitHub `owner/repo`), and http(s) when written as an
+ * explicit `scheme://` URL. It checks the scheme only: the host is neither
+ * resolved nor checked against private ranges, and SCP-style `git@host:path`
+ * (no "://") is passed through to repomix.
+ */
 export function validateRepoUrl(repoUrl: string): void {
   if (!repoUrl || !repoUrl.trim()) {
     throw new Error("Repository URL is required");
@@ -468,11 +542,22 @@ export function validateRepoUrl(repoUrl: string): void {
   }
 }
 
+/**
+ * True when markitdown's output is still an HTML document, meaning the page
+ * could not be converted. The test is case-sensitive: only `<!DOCTYPE` and
+ * `<html` (after leading whitespace) are recognised.
+ */
 export function isUnconvertedHtml(output: string): boolean {
   const trimmed = output.trimStart();
   return trimmed.startsWith("<!DOCTYPE") || trimmed.startsWith("<html");
 }
 
+/**
+ * The staging extension for a fetched URL, from which markitdown picks its
+ * converter: "pdf" when the URL string ends in ".pdf", else "html". Only the
+ * raw string is examined, not the Content-Type, so a query string, fragment
+ * or upper-case ".PDF" gives "html".
+ */
 export function inferExtensionFromUrl(url: string): string {
   if (url.endsWith(".pdf")) {
     return "pdf";
@@ -480,11 +565,16 @@ export function inferExtensionFromUrl(url: string): string {
   return "html";
 }
 
+/** True for a `.md` or `.markdown` extension (case-sensitive). */
 export function isMarkdownFile(filePath: string): boolean {
   const markdownExt = [".md", ".markdown"];
   return markdownExt.includes(path.extname(filePath));
 }
 
+/**
+ * True when `filePath` is `directory` itself or lies inside it. Purely
+ * lexical (no symlinks are resolved), so callers pass real paths.
+ */
 export function isWithinDirectory(filePath: string, directory: string): boolean {
   // path.relative is case-insensitive on win32 and returns an absolute path
   // when the two are on different drives.
