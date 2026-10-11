@@ -28,8 +28,13 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
     try {
+      // Route only origin-form targets ("/path", or "*"). "//host/x", "/\host/x" and absolute-form "http://host/x" would let
+      // new URL() swap in a foreign authority and serve the path (and the probe Host exemption) as if it were local.
+      const target = request.url ?? "";
+      if (target !== "*" && !/^\/(?![/\\])/.test(target)) { reply(response, 400, "Invalid request target"); return; }
       let url: URL;
-      try { url = new URL(request.url ?? "/", publicUrl); } catch { reply(response, 400, "Invalid request target"); return; }
+      try { url = new URL(target, publicUrl); } catch { reply(response, 400, "Invalid request target"); return; }
+      if (url.origin !== publicUrl.origin) { reply(response, 400, "Invalid request target"); return; }
       // Probes skip Host/Origin checks: orchestrators send Host: <podIP>:port and bodies hold only public booleans.
       const probe = ["/livez", "/healthz", "/readyz"].includes(url.pathname);
       if (!probe && (!request.headers.host || !hosts.has(request.headers.host.toLowerCase()))) { reply(response, 403, "Host not allowed"); return; }
@@ -43,7 +48,7 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
         response.writeHead(health?.ready === false ? 503 : 200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
         response.end(request.method === "HEAD" ? undefined : body); return;
       }
-      const upload = /^\/uploads\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(url.pathname);
+      const upload = /^\/uploads\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/.exec(url.pathname);
       if (!upload && url.pathname !== "/mcp") { reply(response, 404, "Not found"); return; }
       const principal = upload && options.authenticator.mode === "jwt"
         ? await service.authenticateUpload(upload[1], token(request))
@@ -75,7 +80,8 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
         response.writeHead(204); response.end(); return;
       }
       if (request.method !== "POST") { response.setHeader("Allow", "POST"); reply(response, 405, "Method not allowed"); return; }
-      if (request.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() !== "application/json") { reply(response, 415, "Use application/json"); return; }
+      // The media type must be exactly lowercase: the SDK transport re-reads the raw header and matches it case-sensitively.
+      if (request.headers["content-type"]?.split(";", 1)[0].trim() !== "application/json") { reply(response, 415, "Use application/json"); return; }
       const length = Number(request.headers["content-length"] ?? 0);
       if (length > MAX_JSON_BYTES) { reply(response, 413, "Request body too large"); return; }
       const chunks: Buffer[] = []; let size = 0;
