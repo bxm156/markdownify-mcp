@@ -44,7 +44,7 @@ Call `lookup_error({"code":"OUTPUT_LIMIT_EXCEEDED"})` for code meanings and reco
 - `JOB_LIMIT_EXCEEDED` / `STORAGE_LIMIT_EXCEEDED`: delete only your own known unneeded jobs when authorized, wait for retention expiry, or ask the operator about the reported scope. A storage reservation includes input plus maximum output; no other agent's usage is exposed.
 - `UPLOAD_SIZE_MISMATCH`: send exactly the declared bytes to a still-valid awaiting-upload reservation, or reserve the corrected file again. After an interruption, check status before retrying PUT.
 - `OUTPUT_LIMIT_EXCEEDED` / `CONVERSION_TIMEOUT`: stop polling, reduce/split the source or ask the operator to change the relevant limit. Submit a new upload for another attempt; `start_conversion` does not restart failed jobs.
-- `CONVERSION_INTERRUPTED`: after service recovery, create a new upload with bounded retries. `CONVERSION_FAILED` does not disclose parser stderr; check the document and report the code/job ID to the operator.
+- `CONVERSION_INTERRUPTED`: the server restarted (gracefully or after a crash) during conversion. After service recovery, create a new upload with bounded retries. `CONVERSION_CANCELLED` means the conversion was cancelled explicitly; stop polling. `CONVERSION_FAILED` does not disclose parser stderr; check the document and report the code/job ID to the operator.
 - `MARKDOWN_NOT_READY`: check status, start an uploaded job if needed, or poll queued/running work with a finite deadline. Concurrency caps queue work; they are not errors requiring new jobs.
 - `AUDIT_UNAVAILABLE`, authentication and unexpected internal failures: stop and involve the operator; preserve IDs and sanitized codes, never credentials or raw document diagnostics.
 

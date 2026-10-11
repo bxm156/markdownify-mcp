@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { Converter, createConverter } from "./converter.js";
+import { Converter, abortError, conversionAbort, createConverter } from "./converter.js";
 import { quotaKey, validatePrincipal, type Principal, type QuotaOverride } from "./identity.js";
 import { checkRuntime, HEALTH_TIMEOUT_MS, MAX_TIMER_MS, type RuntimeHealth } from "./health.js";
 import { prepareMarkdownIndex, readMarkdownPage } from "./markdown.js";
@@ -364,7 +364,6 @@ export class JobService {
   private async run(id: string, controller: AbortController) {
     let job: Job | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
-    let timedOut = false;
     const part = path.join(this.dir(id), "output.part");
     try {
       job = await this.locked(id, async () => {
@@ -372,7 +371,8 @@ export class JobService {
         if (value.status !== "queued") throw new Error("Job is no longer queued");
         const running: Job = { ...value, status: "running" }; await this.save(running); this.jobs.set(id, running); return running;
       });
-      timeout = setTimeout(() => { if (!controller.signal.aborted) { timedOut = true; controller.abort(); } }, this.options.conversionTimeoutMs);
+      // The first abort reason wins, so a deadline that fires after a shutdown or cancellation cannot relabel it.
+      timeout = setTimeout(() => controller.abort(conversionAbort.timedOut(this.options.conversionTimeoutMs)), this.options.conversionTimeoutMs);
       await this.converter(this.input(job), part, controller.signal);
       controller.signal.throwIfAborted();
       if ((await fs.stat(part)).size > this.options.maxOutputBytes) throw new ServiceError(413, "Converted Markdown exceeds output limit", "OUTPUT_LIMIT_EXCEEDED", { limit_bytes: this.options.maxOutputBytes });
@@ -396,8 +396,8 @@ export class JobService {
       }
       if (job) await this.locked(id, async () => {
         await fs.rm(part, { force: true });
-        const info = timedOut ? { ...lookupError("CONVERSION_TIMEOUT"), details: { timeout_ms: this.options.conversionTimeoutMs } }
-          : controller.signal.aborted ? lookupError("CONVERSION_CANCELLED")
+        // An aborted job is classified by the abort reason (timeout, shutdown or cancellation), whatever the converter threw.
+        const info = controller.signal.aborted ? errorInfo(abortError(controller.signal))
           : error instanceof ServiceError && (error.code === "OUTPUT_LIMIT_EXCEEDED" || error.code === "CONVERSION_FAILED") ? errorInfo(error) : lookupError("INTERNAL_ERROR");
         const failed: Job = { ...job!, status: "failed", error: info.message, error_code: info.code, error_details: info.details, expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() };
         await this.save(failed); this.jobs.set(id, failed); await this.internalAudit("conversion_failed", failed);
@@ -409,7 +409,7 @@ export class JobService {
     await this.audit("delete_job", principal, id);
     this.uploading.get(id)?.abort();
     const worker = this.active.get(id);
-    if (worker) { worker.controller.abort(); await worker.promise; }
+    if (worker) { worker.controller.abort(conversionAbort.cancelled()); await worker.promise; }
     return this.locked(id, async () => {
       await this.owned(principal, id);
       await fs.rm(this.dir(id), { recursive: true, force: true }); this.forget(id);
@@ -498,7 +498,8 @@ export class JobService {
     this.closing = true;
     if (this.timer) clearInterval(this.timer);
     for (const upload of this.uploading.values()) upload.abort();
-    for (const worker of this.active.values()) worker.controller.abort();
+    // A graceful shutdown is a restart for the agent: persist the same retryable code as crash recovery in init().
+    for (const worker of this.active.values()) worker.controller.abort(conversionAbort.interrupted());
     await Promise.allSettled([...this.active.values()].map(worker => worker.promise));
     await this.sweep?.catch(() => undefined);
     await Promise.allSettled([...this.locks.values()]);
