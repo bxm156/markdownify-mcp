@@ -11,15 +11,17 @@
  *   checked, never reopened by path; markitdown gets a private copy.
  * - Temporary files live in a per-call mkdtemp directory that is removed
  *   when the call settles, whether it succeeds or fails.
- * - External tools run through execFile (no shell), so arguments are never
- *   shell-interpreted, and each run is killed (SIGKILL) after
- *   converterTimeoutMs().
+ * - External tools run through runTool (spawn, no shell), so arguments are
+ *   never shell-interpreted. On POSIX each run gets its own process group,
+ *   and the whole group (git processes repomix starts included) is killed
+ *   with SIGKILL after converterTimeoutMs().
+ * - repomix runs with TMPDIR/TEMP/TMP pointing at a private directory that
+ *   is removed when the run settles, so a killed clone leaves nothing behind.
  * - git-repo-to-markdown arguments reach repomix only after validateGitRef
  *   (branch) and validateRepoUrl (host allowlist + address pre-check).
  * Must run under Node and Bun.
  */
-import { execFile } from "child_process";
-import { promisify } from "util";
+import { spawn, type ChildProcess } from "child_process";
 import path from "path";
 import fs from "fs";
 import os from "os";
@@ -41,7 +43,6 @@ import {
   MAX_LOCAL_FILE_BYTES,
   type OpenedLocalFile,
 } from "./utils.js";
-const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -72,20 +73,153 @@ export function converterTimeoutMs(): number {
     : CONVERTER_TIMEOUT_MS;
 }
 
-/** execFile options shared by markitdown and repomix runs. */
-function execOptions(maxBuffer: number, timeoutMs: number) {
-  return { maxBuffer, timeout: timeoutMs, killSignal: "SIGKILL" as const };
+/**
+ * Whether external tools get their own process group. Windows has no POSIX
+ * process groups (and `detached` would open a console window there).
+ */
+const USE_PROCESS_GROUPS = process.platform !== "win32";
+
+/** What runTool resolves with: the tool's decoded stdout and stderr. */
+type ToolOutput = { stdout: string; stderr: string };
+
+/**
+ * A runTool failure. Like execFile's errors it carries `code` (the spawn
+ * errno such as "ENOENT", the exit status, or
+ * "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"), `signal`, `stdout` and `stderr`;
+ * `timedOut` is set only when the run was killed for exceeding its limit.
+ */
+type ToolError = Error & {
+  code?: string | number | null;
+  signal?: NodeJS.Signals | null;
+  timedOut?: boolean;
+  stdout?: string;
+  stderr?: string;
+};
+
+/**
+ * SIGKILLs `child` and, on POSIX, every process in its group (it was spawned
+ * as a group leader), so grandchildren such as the `git` processes repomix
+ * starts die with it. Falls back to killing only the child on Windows or
+ * when the group kill fails (for example, the group is already gone).
+ * The group id cannot have been reused here: Linux and the BSDs do not hand
+ * out a pid while it is still some live process's group id.
+ */
+function killProcessTree(child: ChildProcess): void {
+  if (USE_PROCESS_GROUPS && child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      // Fall back to the direct child below.
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // Already exited.
+  }
 }
 
 /**
- * True when execFile killed the child because `timeout` expired. A maxBuffer
- * overflow also kills the child, but carries its own error code.
+ * Runs `file` with `args` (no shell; bare names are looked up on PATH),
+ * stdin from /dev/null, and collects stdout and stderr as UTF-8.
+ *
+ * Resolves on exit status 0 (stderr alone is not an error). Rejects with a
+ * ToolError: the spawn error (e.g. ENOENT), "Command failed: <cmd>\n<stderr>"
+ * for a non-zero exit or a signal, or Node's maxBuffer error once stdout or
+ * stderr exceeds `maxBuffer` bytes. After `timeoutMs` the process tree is
+ * killed (killProcessTree) and the error has `timedOut: true`. On a timeout
+ * or an overflow the pipes are also destroyed, so the promise settles once
+ * the direct child is gone even if something escaped the group.
  */
-function isTimeoutKill(err: NodeJS.ErrnoException & { killed?: boolean }): boolean {
-  return (
-    err?.killed === true &&
-    (err.code as unknown) !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
-  );
+function runTool(
+  file: string,
+  args: string[],
+  {
+    maxBuffer,
+    timeoutMs,
+    env,
+  }: { maxBuffer: number; timeoutMs: number; env?: NodeJS.ProcessEnv },
+): Promise<ToolOutput> {
+  return new Promise((resolve, reject) => {
+    let child: ChildProcess;
+    try {
+      child = spawn(file, args, {
+        detached: USE_PROCESS_GROUPS,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch (e: unknown) {
+      reject(e);
+      return;
+    }
+
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timedOut = false;
+    let overflow: ToolError | undefined;
+    let settled = false;
+
+    const stopTree = () => {
+      killProcessTree(child);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stopTree();
+    }, timeoutMs);
+
+    const collect = (name: "stdout" | "stderr", chunks: Buffer[]) => (chunk: Buffer) => {
+      if (overflow || timedOut) return;
+      const total = (name === "stdout" ? (stdoutBytes += chunk.length) : (stderrBytes += chunk.length));
+      if (total > maxBuffer) {
+        overflow = Object.assign(new RangeError(`${name} maxBuffer length exceeded`), {
+          code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        });
+        stopTree();
+        return;
+      }
+      chunks.push(chunk);
+    };
+    child.stdout?.on("data", collect("stdout", stdout));
+    child.stderr?.on("data", collect("stderr", stderr));
+
+    const finish = (error: ToolError | undefined) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const out = Buffer.concat(stdout).toString("utf8");
+      const err = Buffer.concat(stderr).toString("utf8");
+      if (error) reject(Object.assign(error, { stdout: out, stderr: err }));
+      else resolve({ stdout: out, stderr: err });
+    };
+
+    // A failed spawn (ENOENT, EACCES) emits "error"; "close" may follow.
+    child.on("error", (e: ToolError) => finish(e));
+    child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      if (timedOut) {
+        finish(Object.assign(new Error(`${file} timed out after ${timeoutMs} ms`), {
+          code,
+          signal,
+          timedOut: true,
+        }));
+      } else if (overflow) {
+        finish(overflow);
+      } else if (code === 0) {
+        finish(undefined);
+      } else {
+        const stderrText = Buffer.concat(stderr).toString("utf8");
+        finish(Object.assign(
+          new Error(`Command failed: ${[file, ...args].join(" ")}\n${stderrText}`),
+          { code, signal },
+        ));
+      }
+    });
+  });
 }
 
 /** The markitdown that setup.sh, setup.bat and the Dockerfile install. */
@@ -114,8 +248,8 @@ export class Markdownify {
    *
    * The 50 MB maxBuffer bounds the Markdown kept in memory; larger output
    * rejects with Node's maxBuffer error. A run longer than `timeoutMs` is
-   * killed with SIGKILL and reported as "markitdown timed out" (only the
-   * markitdown process itself is killed). A missing executable becomes an
+   * killed with SIGKILL, together with any processes it started (see
+   * runTool), and reported as "markitdown timed out". A missing executable becomes an
    * actionable "markitdown executable not found" error, and output that is
    * still an HTML document (see isUnconvertedHtml) becomes a "Conversion
    * failed" error instead of being returned as Markdown.
@@ -129,16 +263,15 @@ export class Markdownify {
 
     let stdout: string;
     try {
-      // execFile resolves bare command names against PATH (POSIX execvp / Windows search).
+      // Bare command names are resolved against PATH (POSIX execvp / Windows search).
       // Non-zero exit codes reject; stderr alone does not (markitdown emits non-fatal
       // warnings from onnxruntime/pydub/etc. on a successful run).
-      ({ stdout } = await execFileAsync(
-        markitdownPath,
-        [filePath],
-        execOptions(50 * 1024 * 1024, timeoutMs), // 50 MB
-      ));
+      ({ stdout } = await runTool(markitdownPath, [filePath], {
+        maxBuffer: 50 * 1024 * 1024, // 50 MB
+        timeoutMs,
+      }));
     } catch (e: unknown) {
-      const err = e as NodeJS.ErrnoException;
+      const err = e as ToolError;
       if (err?.code === "ENOENT") {
         throw new Error(
           `markitdown executable not found (looked up "${markitdownPath}"). ` +
@@ -147,7 +280,7 @@ export class Markdownify {
             `${markitdownSetupCommand()}.`,
         );
       }
-      if (isTimeoutKill(err)) {
+      if (err?.timedOut === true) {
         throw new Error(
           `markitdown timed out after ${timeoutMs} ms and was stopped (MD_CONVERTER_TIMEOUT_MS sets the limit).`,
         );
@@ -175,14 +308,14 @@ export class Markdownify {
    */
   private static async withStagingDir<T>(
     fn: (stagingDir: string) => Promise<T>,
+    prefix = "markdown_output_",
   ): Promise<T> {
-    const stagingDir = await fs.promises.mkdtemp(
-      path.join(os.tmpdir(), "markdown_output_"),
-    );
+    const stagingDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));
     try {
       return await fn(stagingDir);
     } finally {
-      await fs.promises.rm(stagingDir, { recursive: true, force: true });
+      // Retries cover a killed tool whose last writes land during removal.
+      await fs.promises.rm(stagingDir, { recursive: true, force: true, maxRetries: 3 });
     }
   }
 
@@ -414,11 +547,13 @@ export class Markdownify {
    * conversions. An empty `branch` means the default branch.
    *
    * The 100 MB maxBuffer bounds the output kept in memory, and a run longer
-   * than `timeoutMs` is killed with SIGKILL ("repomix timed out"); git
-   * processes repomix started may outlive it. Errors are not wrapped as in
-   * toMarkdown: a missing executable becomes "repomix executable not found",
-   * empty output "repomix produced no output", and anything else propagates
-   * from execFile.
+   * than `timeoutMs` is killed with SIGKILL together with the git processes
+   * it started ("repomix timed out"; see runTool). repomix clones into
+   * os.tmpdir(), so it runs with TMPDIR/TEMP/TMP set to a private staging
+   * directory (`markdownify_repomix_*`) that is removed when the run
+   * settles, killed or not. Errors are not wrapped as in toMarkdown: a
+   * missing executable becomes "repomix executable not found", empty output
+   * "repomix produced no output", and anything else propagates from runTool.
    */
   static async fromRepo({
     repoUrl,
@@ -461,20 +596,25 @@ export class Markdownify {
     let stdout: string;
     let stderr: string;
     try {
-      ({ stdout, stderr } = await execFileAsync(
-        repomixPath,
-        args,
-        execOptions(100 * 1024 * 1024, timeoutMs), // 100 MB
+      ({ stdout, stderr } = await this.withStagingDir(
+        (tempDir) =>
+          runTool(repomixPath, args, {
+            maxBuffer: 100 * 1024 * 1024, // 100 MB
+            timeoutMs,
+            // repomix (and git) put the clone under os.tmpdir().
+            env: { ...process.env, TMPDIR: tempDir, TEMP: tempDir, TMP: tempDir },
+          }),
+        "markdownify_repomix_",
       ));
     } catch (e: unknown) {
-      const err = e as NodeJS.ErrnoException;
+      const err = e as ToolError;
       if (err?.code === "ENOENT") {
         throw new Error(
           `repomix executable not found (looked up "${repomixPath}"). ` +
             `Set REPOMIX_PATH or install it on PATH (\`bun add -g repomix\`).`,
         );
       }
-      if (isTimeoutKill(err)) {
+      if (err?.timedOut === true) {
         throw new Error(
           `repomix timed out after ${timeoutMs} ms and was stopped (MD_CONVERTER_TIMEOUT_MS sets the limit).`,
         );

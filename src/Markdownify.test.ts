@@ -571,6 +571,107 @@ describe.skipIf(process.platform === "win32")("external tool stubs", () => {
     expect(result.text).toBe("# Converted\n");
   });
 
+  /**
+   * True while `pid` is a running process. A killed process that its parent
+   * has not reaped yet is a zombie: still listed, but dead (Linux /proc).
+   */
+  function isRunning(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+    } catch (e: unknown) {
+      if ((e as NodeJS.ErrnoException).code === "ESRCH") return false;
+      throw e;
+    }
+    try {
+      return !/^\d+ \(.*\) Z /.test(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
+    } catch {
+      // No /proc (macOS): kill(pid, 0) succeeded, so it is running. On
+      // Linux the entry vanished between the two checks.
+      return process.platform !== "linux";
+    }
+  }
+
+  async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 3000) {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  /**
+   * A stub body that starts a grandchild `sleep`, records both PIDs and
+   * waits, holding stdout open like a converter's own child processes.
+   */
+  const spawnsGrandchild = () =>
+    `sleep 30 &\necho $! > "${path.join(dir, "grandchild.pid")}"\n` +
+    `echo $$ > "${path.join(dir, "child.pid")}"\nwait`;
+  const recordedPid = (name: string) =>
+    Number(fs.readFileSync(path.join(dir, `${name}.pid`), "utf-8").trim());
+
+  /** Runs `run`, which must time out, then checks the stub and its grandchild are dead. */
+  async function expectTreeKilled(run: () => Promise<unknown>, message: string) {
+    let pids: number[] = [];
+    try {
+      await expect(run()).rejects.toThrow(message);
+      pids = [recordedPid("child"), recordedPid("grandchild")];
+      for (const pid of pids) {
+        await waitUntil(() => !isRunning(pid), `process ${pid} to exit`);
+      }
+    } finally {
+      // Do not leak a 30-second sleep when an assertion fails.
+      for (const pid of pids) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+      }
+    }
+  }
+
+  test("a repomix timeout kills the processes repomix started", async () => {
+    process.env.REPOMIX_PATH = stub("repomix", spawnsGrandchild());
+    await expectTreeKilled(
+      () => Markdownify.fromRepo({ repoUrl: "octocat/Hello-World", timeoutMs: 500 }),
+      "repomix timed out after 500 ms",
+    );
+  });
+
+  test("a markitdown timeout kills the processes markitdown started", async () => {
+    process.env.MARKITDOWN_PATH = stub("markitdown", spawnsGrandchild());
+    await expectTreeKilled(
+      () => Markdownify.toMarkdown({ filePath: path.join(sampleDataDir, "test.pdf"), timeoutMs: 500 }),
+      "markitdown timed out after 500 ms",
+    );
+  });
+
+  /** A repomix stub that clones the way repomix does: into $TMPDIR/repomix-*. */
+  const fakeClone = (then: string) =>
+    `printf '%s\\n' "$TMPDIR" "$TEMP" "$TMP" > "${path.join(dir, "repomix.tmp")}"\n` +
+    `mkdir "$TMPDIR/repomix-abc123" && touch "$TMPDIR/repomix-abc123/marker"\n${then}`;
+  const repomixTempDirs = () =>
+    fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("markdownify_repomix_"));
+
+  test("repomix runs with a private temp directory that a timeout still removes", async () => {
+    process.env.REPOMIX_PATH = stub("repomix", fakeClone("exec sleep 30"));
+    await expect(
+      Markdownify.fromRepo({ repoUrl: "octocat/Hello-World", timeoutMs: 500 }),
+    ).rejects.toThrow("repomix timed out after 500 ms");
+    const [tmpdir, temp, tmp] = fs.readFileSync(path.join(dir, "repomix.tmp"), "utf-8").trimEnd().split("\n");
+    expect(path.dirname(tmpdir)).toBe(os.tmpdir());
+    expect(path.basename(tmpdir)).toStartWith("markdownify_repomix_");
+    expect([temp, tmp]).toEqual([tmpdir, tmpdir]);
+    expect(fs.existsSync(tmpdir)).toBe(false);
+    expect(repomixTempDirs()).toEqual([]);
+  });
+
+  test("repomix's private temp directory is removed after a successful run", async () => {
+    process.env.REPOMIX_PATH = stub("repomix", fakeClone("echo packed"));
+    const result = await Markdownify.fromRepo({ repoUrl: "octocat/Hello-World" });
+    expect(result.text).toBe("packed\n");
+    const [tmpdir] = fs.readFileSync(path.join(dir, "repomix.tmp"), "utf-8").split("\n");
+    expect(path.basename(tmpdir)).toStartWith("markdownify_repomix_");
+    expect(fs.existsSync(tmpdir)).toBe(false);
+    expect(repomixTempDirs()).toEqual([]);
+  });
+
   test("a converter failure is not reported as a timeout", async () => {
     process.env.MARKITDOWN_PATH = stub("markitdown", "echo nope >&2; exit 3");
     const error = await Markdownify.toMarkdown({
