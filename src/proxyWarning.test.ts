@@ -41,7 +41,10 @@ describe("warnIfProxyConfigured", () => {
       warnIfProxyConfigured();
       expect(errorSpy).toHaveBeenCalledTimes(1);
       const message = errorSpy.mock.calls[0][0] as string;
-      expect(message).toStartWith(`markdownify-mcp: ${name} is set, `);
+      // Windows environment names are case-insensitive, so a lowercase variable
+      // is visible under its uppercase name too and is reported by that name.
+      const reported = process.platform === "win32" ? name.toUpperCase() : name;
+      expect(message).toStartWith(`markdownify-mcp: ${reported} is set, `);
       expect(message).toContain("do not use a proxy");
       expect(message).not.toContain("\n");
     });

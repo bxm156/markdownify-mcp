@@ -118,6 +118,32 @@ describe("durable single tenant jobs", () => {
     expect(reason).toMatchObject({ code: "CONVERSION_CANCELLED" });
     await expect(fs.stat(path.join(options.dataDir, job.upload_id))).rejects.toMatchObject({ code: "ENOENT" });
   });
+  test("after lock loss, close() stops the converter but leaves the manifests to the new owner", async () => {
+    let reason: unknown, lost = 0;
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-jobs-test-")); directories.push(dataDir);
+    const instance = new JobService({ dataDir, maxUploadBytes: 100, maxStorageBytes: 10_000, maxJobs: 10, retentionMs: 60_000, uploadTtlMs: 60_000, conversionTimeoutMs: 60_000, maxOutputBytes: 1000, concurrency: 1,
+      converter: async (_input, output, signal) => { await fs.writeFile(output, "partial"); await new Promise<void>(resolve => signal.addEventListener("abort", () => { reason = signal.reason; resolve(); }, { once: true })); } });
+    services.push(instance);
+    const lines: string[] = [];
+    await instance.init({ heartbeatMs: 10, log: line => { lines.push(line); }, onLost: () => { lost++; } });
+    const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
+    await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"]));
+    await instance.startConversion(principal, job.upload_id); await jobStatus(instance, job.upload_id, "running");
+    const manifest = path.join(dataDir, job.upload_id, "job.json"), before = await fs.readFile(manifest, "utf8");
+    // Another process reclaims the volume.
+    const foreign = "4242\n00000000-0000-0000-0000-000000000000\n";
+    await fs.writeFile(path.join(dataDir, ".lock"), foreign);
+    await waitFor(() => lost === 1, { label: "lock loss" });
+    expect(lines.map(line => JSON.parse(line))).toEqual([{ event: "lock_lost" }]);
+    // No new work is accepted once the volume is gone.
+    await expect(instance.createUpload(principal, { filename: "b.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 503, code: "SERVICE_UNAVAILABLE" });
+    await instance.close();
+    expect(reason).toMatchObject({ code: "CONVERSION_INTERRUPTED" });
+    expect(await fs.readFile(manifest, "utf8")).toBe(before);
+    expect(JSON.parse(before).status).toBe("running");
+    expect(await exists(path.join(dataDir, job.upload_id, "output.part"))).toBe(true);
+    expect(await fs.readFile(path.join(dataDir, ".lock"), "utf8")).toBe(foreign);
+  });
   test("output cap and timeout become readable failure states", async () => {
     const { instance } = await service({ maxOutputBytes: 2 });
     const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });

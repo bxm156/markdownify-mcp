@@ -96,6 +96,11 @@ export class JobService {
   /** In-progress PUTs by job ID; aborted by delete_job, close() or the reservation deadline. */
   private uploading = new Map<string, AbortController>();
   private closing = false;
+  /**
+   * Set when the data-directory lock is lost (lock.ts fencing): the volume belongs to another process, so this one stops
+   * accepting work and writes no manifest again; close() only stops its converters.
+   */
+  private lost = false;
   private initialized = false;
   /** The shared runtime check; reused until 2 s after it settles (see health). */
   private healthCache?: { until: number; result: Promise<RuntimeHealth> };
@@ -295,6 +300,8 @@ export class JobService {
   }
   /** Atomically replaces job.json: a mode 0o600 temp file renamed over it, removed if anything fails. */
   private async save(job: Job) {
+    // After lock loss another process owns the manifests (lost).
+    if (this.lost) throw new Error("Data directory lock lost");
     const target = path.join(this.dir(job.id), "job.json");
     const temporary = `${target}.${randomUUID()}.tmp`;
     try {
@@ -311,7 +318,7 @@ export class JobService {
   async init(lock: LockOptions = {}) {
     await fs.mkdir(this.options.dataDir, { recursive: true, mode: 0o700 });
     await fs.chmod(this.options.dataDir, 0o700);
-    this.lock = await acquireLock(this.options.dataDir, lock);
+    this.lock = await acquireLock(this.options.dataDir, { ...lock, onLost: () => { this.lost = this.closing = true; lock.onLost?.(); } });
     try { await this.load(); } catch (error) { await releaseLock(this.lock); this.lock = undefined; throw error; }
     this.initialized = true;
     this.timer = setInterval(() => this.tick(), Math.min(this.options.retentionMs, this.options.uploadTtlMs, 60_000));
@@ -589,6 +596,8 @@ export class JobService {
         await this.save(completed); this.jobs.set(id, completed); await this.internalAudit("conversion_completed", completed);
       });
     } catch (error) {
+      // The lock was lost: the volume is another process's now, so leave the manifest and partial output alone.
+      if (this.lost) return;
       if (!job) {
         // A failed running-state commit must not leave a queued job that pump()
         // retries in a tight loop while the filesystem remains unavailable.
@@ -719,13 +728,15 @@ export class JobService {
   /**
    * Stops accepting work and drains: aborts uploads, interrupts running conversions (persisted as CONVERSION_INTERRUPTED),
    * waits for the workers, the current sweep and every pending per-job operation, then releases the data-directory lock.
-   * The instance is not reusable afterwards.
+   * After lock loss (lost) the converters are still killed but nothing is persisted: the volume belongs to another process,
+   * which recovers those jobs from their `running` manifests. The instance is not reusable afterwards.
    */
   async close() {
     this.closing = true;
     if (this.timer) clearInterval(this.timer);
     for (const upload of this.uploading.values()) upload.abort();
     // A graceful shutdown is a restart for the agent: persist the same retryable code as crash recovery in init().
+    // After lock loss run() persists nothing (lost), so this only stops the converters.
     for (const worker of this.active.values()) worker.controller.abort(conversionAbort.interrupted());
     await Promise.allSettled([...this.active.values()].map(worker => worker.promise));
     await this.sweep?.catch(() => undefined);

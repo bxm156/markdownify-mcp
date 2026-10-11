@@ -8,6 +8,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { JobService } from "./jobs.js";
 import { createHttpServer } from "./http.js";
 import { createAuthenticator, hashToken } from "./auth.js";
+import { loadConfig, publicHostForms } from "./config.js";
 
 const SECRET = "edge-service-secret";
 const MIB = 1024 * 1024;
@@ -358,4 +359,25 @@ test("an oversized request header block is refused by the HTTP parser with 431",
   const { port } = await fixture();
   const response = await raw(port, [mcpPost(["Host: 127.0.0.1", AUTH, JSON_TYPE, ACCEPT, `X-Padding: ${"x".repeat(64 * 1024)}`])]);
   expect(response.status).toBe(431);
+});
+
+test("an https public origin accepts its Host with the default port, from loadConfig and from the createHttpServer fallback", async () => {
+  expect(publicHostForms(new URL("https://files.example"))).toEqual(["files.example", "files.example:443"]);
+  expect(publicHostForms(new URL("http://files.example"))).toEqual(["files.example", "files.example:80"]);
+  expect(publicHostForms(new URL("https://files.example:8443"))).toEqual(["files.example:8443"]);
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-http-hosts-"));
+  const service = new JobService({ dataDir, maxUploadBytes: 100, maxStorageBytes: 100_000, maxJobs: 10, retentionMs: 60000, uploadTtlMs: 60000, conversionTimeoutMs: 1000, maxOutputBytes: 1000, concurrency: 1, converter: async () => {} });
+  await service.init();
+  const config = loadConfig({ MD_API_KEY: "host-test-api-key-0123456789-abcdefgh", MD_PUBLIC_BASE_URL: "https://files.example", MD_DATA_DIR: dataDir });
+  const servers = [createHttpServer(service, config), createHttpServer(service, { authenticator: config.authenticator, publicBaseUrl: config.publicBaseUrl })];
+  disposers.push(async () => { await service.close(); for (const server of servers) { server.closeAllConnections(); if (server.listening) await new Promise<void>(resolve => server.close(() => resolve())); } await fs.rm(dataDir, { recursive: true, force: true }); });
+  for (const [index, server] of servers.entries()) {
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as net.AddressInfo;
+    // An accepted Host reaches authentication (401); any other is refused before it (403).
+    for (const [host, status, expected] of [["files.example", 401, "AUTH_REQUIRED"], ["FILES.example:443", 401, "AUTH_REQUIRED"], ["files.example:8443", 403, "REQUEST_REJECTED"], ["files.example:80", 403, "REQUEST_REJECTED"]] as const) {
+      const response = await raw(port, [mcpPost([`Host: ${host}`, JSON_TYPE, ACCEPT])]);
+      expect([index, host, response.status, code(response)]).toEqual([index, host, status, expected]);
+    }
+  }
 });

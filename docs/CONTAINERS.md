@@ -12,7 +12,7 @@ From the repository root:
 docker build -f Dockerfile.remote --build-arg VCS_REF="$(git rev-parse HEAD)" -t markdownify-remote:local .
 ```
 
-The image compiles TypeScript with Bun 1.4.2, installs production JavaScript dependencies in a separate stage, and runs Node 22 with Python 3.12 and MarkItDown 0.1.5. TypeScript and Bun are excluded from the final runtime. OCI labels include the source repository, license, and revision; provide `VCS_REF` when building outside CI.
+The image compiles TypeScript with Bun 1.4.2, installs production JavaScript dependencies in a separate stage, and runs Node 24 with Python 3.12 and MarkItDown 0.1.5. The Node binary comes from the `NODE_IMAGE` build argument (default `node:24-bookworm-slim`; CI also builds with `--build-arg NODE_IMAGE=node:22-bookworm-slim` while Node 22 is supported); keep it on bookworm, the Debian release of the Python runtime stage, because only the binary is copied across. TypeScript and Bun are excluded from the final runtime. OCI labels include the source repository, license, and revision; provide `VCS_REF` when building outside CI.
 
 The container runs as UID/GID 10001. Persist `/data` in one named volume and run one server process per volume. Mount only the hashed agent registry at `/run/markdownify/agents.json`, read-only. Raw token files remain with their respective client runtimes. Secrets are excluded from the build context and never passed as Docker build arguments.
 

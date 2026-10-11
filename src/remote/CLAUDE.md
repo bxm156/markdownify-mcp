@@ -2,7 +2,7 @@
 
 Remote Streamable HTTP MCP service: authenticated uploads, an on-disk job queue, markitdown conversion, paginated
 Markdown. Operator docs: `docs/REMOTE.md`, `docs/MULTITENANT.md`, `docs/JWT.md`, `docs/HEALTH.md`, `docs/ERRORS.md`.
-Built with `bun run build:remote` (tsc to `dist/remote/`), shipped as `Dockerfile.remote` and run by Node 22.
+Built with `bun run build:remote` (tsc to `dist/remote/`), shipped as `Dockerfile.remote` and run by Node 24 (`engines.node >= 22`; CI tests 22 and 24).
 
 ## Architecture
 
@@ -67,9 +67,11 @@ Built with `bun run build:remote` (tsc to `dist/remote/`), shipped as `Dockerfil
 - `lock.ts`: `MD_DATA_DIR/.lock` (`pid`, token, `heartbeat=<ms>`) is created with `wx` and rewritten (temp + rename)
   every `HEARTBEAT_MS`. A lock whose mtime is older than `MD_LOCK_STALE_AFTER_MS` (`config.lockStaleAfterMs`, default
   60 000, 0 = never, else ≥ 15 000) is reclaimed: rename to a unique `.stale` name, verify inode and mtime, `wx`
-  create. A heartbeat that finds a foreign token logs `lock_lost` and calls `onLost` (index.ts: shutdown, exit 1).
+  create. A heartbeat that finds a foreign token logs `lock_lost` and calls `onLost` (index.ts: shutdown, exit 1; JobService
+  sets `lost`, so `close()` kills converters but writes no manifest). The holder sweeps `.lock.<uuid>.{tmp,stale}`
+  older than the threshold on acquire and at most once per threshold from the heartbeat (`lock_leftovers_removed`).
   Errors carry `reclaimHint` and `LOCK_REMOVAL_HINT`. `purge-owner.ts` is an operator CLI (`node dist/remote/purge-owner.js <dir>
-  <tenant> <agent> [--apply]`, dry run by default). `--apply` holds the lock. Exit codes: 0 ok, 1 incomplete or
+  <tenant> <agent> [--apply]`, dry run by default; a dry run proceeds past a stale lock with a one-line note). `--apply` holds the lock. Exit codes: 0 ok, 1 incomplete or
   refused, 2 usage.
 
 ## Error model (`errors.ts`)
@@ -92,7 +94,7 @@ Every event is one `console.error(JSON.stringify({ event, ... }))` call (one arg
 `audit_rotation_failed` {code}, `job_audit_unavailable` {audit_event, job_id}, `job_cleanup_failed` {job_id, status,
 code}, `job_cleanup_sweep_failed` {jobs_failed, failures_total, consecutive_failed_sweeps, last_error_code,
 duration_ms}, `job_cleanup_sweep_aborted` {code}, `shutdown_timeout_warning` {shutdown_timeout_ms, ceiling_ms}, `stale_lock_reclaimed` {age_ms}, `lock_lost` {},
-`lock_heartbeat_failed` {code}. Rule:
+`lock_heartbeat_failed` {code}, `lock_leftovers_removed` {count}. Rule:
 an errno-style `code` from the shared `errnoCode()` in `audit.ts` (`/^[A-Z0-9_]{1,32}$/`, else `UNKNOWN`) and IDs
 only. Never paths, messages, secrets, filenames or audit metadata values. Log once per transition, not once per
 failure. The table lives in `docs/MULTITENANT.md` "Operator stderr events".
@@ -100,7 +102,7 @@ failure. The table lives in `docs/MULTITENANT.md` "Operator stderr events".
 ## Invariants
 
 - Linux only: no `win32` branches beyond the refusal (`WINDOWS_UNSUPPORTED_MESSAGE`, also in `purge-owner.ts`).
-- Production code must run under Node 22 from `dist/`. No Bun-only APIs (`Bun.*`, `bun:*`) outside tests.
+- Production code must run under Node 22 and 24 from `dist/`. No Bun-only APIs (`Bun.*`, `bun:*`) outside tests.
   `test-helpers.ts` and `*.test.ts` are excluded from the build.
 - Writes: temp file plus `rename` (`job.json.<uuid>.tmp`, `*.index.json.<uuid>.tmp`, `input.part`/`output.part`) with
   files at `0o600` and dirs at `0o700`. `wx` for exclusive creates.

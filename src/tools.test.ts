@@ -61,7 +61,8 @@ describe("tools", () => {
     for (const tool of allTools) {
       test(`${tool.name}: required and property keys agree`, () => {
         const schema = toolArgumentSchemas[tool.name];
-        const generated = z.toJSONSchema(schema) as {
+        // The input side: what clients send (schemas may normalise values).
+        const generated = z.toJSONSchema(schema, { io: "input" }) as {
           properties: Record<string, { type: string }>;
           required?: string[];
           additionalProperties?: boolean;
