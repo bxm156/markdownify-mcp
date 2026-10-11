@@ -12,6 +12,9 @@
  *   returns, and callers must call it again for every redirect hop.
  * - Error messages never echo URL credentials, query strings or signatures
  *   (redactUrl).
+ * - Nothing reaches repomix's argv unchecked: the repository URL passes
+ *   validateRepoUrl (host allowlist + address pre-check) and every git ref,
+ *   given or embedded in the URL, passes validateGitRef.
  * Must run under Node and Bun, on POSIX and Windows; platform-specific open
  * flags degrade to no-ops where they do not exist.
  */
@@ -22,7 +25,7 @@ import dns from "node:dns";
 import net from "node:net";
 import { URL } from "node:url";
 import is_ip_private from "private-ip";
-import { isValidRemoteValue } from "repomix";
+import { parseRemoteValue } from "repomix";
 
 /** Expands a leading `~` or `~/` to the home directory; `~user` is left as is. */
 export function expandHome(filepath: string): string {
@@ -62,16 +65,25 @@ export function resolveRepomixPath(projectRoot: string): string {
 }
 
 /**
- * The directory allowlist from MD_ALLOWED_PATHS (or the older MD_SHARE_DIR
- * when MD_ALLOWED_PATHS is unset; an empty MD_ALLOWED_PATHS counts as set and
- * so hides MD_SHARE_DIR), split on path.delimiter (":" on POSIX, ";" on
- * Windows), each entry made absolute with `~` expanded. Returns null when
- * there is no allowlist, which permits every readable file. Read on every
- * call, never cached.
+ * The directory allowlist from MD_ALLOWED_PATHS, or the older MD_SHARE_DIR
+ * when MD_ALLOWED_PATHS is unset, empty, whitespace-only or lists no
+ * directory at all (so `MD_ALLOWED_PATHS=""` never hides a configured
+ * MD_SHARE_DIR). Entries are split on path.delimiter (":" on POSIX, ";" on
+ * Windows), trimmed, and made absolute with `~` expanded. Returns null when
+ * neither variable lists a directory, which permits every readable file.
+ * Read on every call, never cached.
  */
 export function getAllowedPaths(): string[] | null {
-  const raw = process.env.MD_ALLOWED_PATHS ?? process.env.MD_SHARE_DIR;
-  if (!raw) return null;
+  for (const raw of [process.env.MD_ALLOWED_PATHS, process.env.MD_SHARE_DIR]) {
+    const dirs = parseAllowedPaths(raw);
+    if (dirs) return dirs;
+  }
+  return null;
+}
+
+/** Splits one allowlist variable; null when it is unset or lists no directory. */
+function parseAllowedPaths(raw: string | undefined): string[] | null {
+  if (!raw || !raw.trim()) return null;
   const dirs = raw
     .split(path.delimiter)
     .map((p) => p.trim())
@@ -517,58 +529,230 @@ function withAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
   });
 }
 
+/** Longest branch, tag or commit name validateGitRef accepts. */
+export const MAX_GIT_REF_LENGTH = 255;
+
 /**
- * Validates the git-repo-to-markdown `url`: non-empty, accepted by repomix's
- * own parser (a URL or GitHub `owner/repo`), and http(s) when written as an
- * explicit `scheme://` URL. It checks the scheme only: the host is neither
- * resolved nor checked against private ranges, and SCP-style `git@host:path`
- * (no "://") is passed through to repomix.
+ * Why `ref` is not an acceptable git branch, tag or commit name, or null when
+ * it is. The rules follow `git check-ref-format`, plus "must not start with
+ * `-`", which is what keeps the value from being parsed as an option by
+ * `git fetch` (repomix runs `git fetch --depth 1 origin <ref>` without `--`).
  */
-export function validateRepoUrl(repoUrl: string): void {
+export function gitRefProblem(ref: string): string | null {
+  if (typeof ref !== "string" || ref.length === 0) return "must not be empty";
+  if (ref.length > MAX_GIT_REF_LENGTH) {
+    return `must be at most ${MAX_GIT_REF_LENGTH} characters`;
+  }
+  if (ref.startsWith("-")) return 'must not start with "-"';
+  if (ref === "@") return 'must not be "@"';
+  // ASCII control characters, space and DEL.
+  if (/[\x00-\x20\x7f]/.test(ref)) {
+    return "must not contain spaces or control characters";
+  }
+  for (const sequence of ["..", "@{"]) {
+    if (ref.includes(sequence)) return `must not contain "${sequence}"`;
+  }
+  const forbidden = [...ref].find((c) => "\\~^:?*[".includes(c));
+  if (forbidden) return `must not contain "${forbidden}"`;
+  if (ref.endsWith("/")) return 'must not end with "/"';
+  if (ref.endsWith(".")) return 'must not end with "."';
+  for (const component of ref.split("/")) {
+    if (component === "") return 'must not contain "//" or start with "/"';
+    if (component.startsWith(".")) {
+      return 'must not have a path component starting with "."';
+    }
+    if (component.endsWith(".lock")) {
+      return 'must not have a path component ending with ".lock"';
+    }
+  }
+  return null;
+}
+
+/**
+ * Throws unless `ref` is an acceptable branch, tag or commit name (see
+ * gitRefProblem). `label` names the value in the message.
+ */
+export function validateGitRef(ref: string, label = "Branch"): void {
+  const problem = gitRefProblem(ref);
+  if (problem) {
+    throw new Error(`Invalid git ref: ${label} ${problem}.`);
+  }
+}
+
+/** Default MD_GIT_HOSTS: the public forges git-repo-to-markdown may clone from. */
+export const DEFAULT_GIT_HOSTS: readonly string[] = [
+  "github.com",
+  "www.github.com",
+  "gitlab.com",
+  "www.gitlab.com",
+  "bitbucket.org",
+  "www.bitbucket.org",
+];
+
+/** Lower-cases a hostname and strips IPv6 brackets and a trailing dot. */
+function normalizeHost(host: string): string {
+  return host
+    .trim()
+    .toLowerCase()
+    .replace(/^\[(.*)\]$/, "$1")
+    .replace(/\.$/, "");
+}
+
+/**
+ * Hosts git-repo-to-markdown may clone from: MD_GIT_HOSTS (comma-separated,
+ * matched exactly and case-insensitively, so list `www.` forms separately),
+ * else DEFAULT_GIT_HOSTS. An unset, empty or whitespace-only MD_GIT_HOSTS
+ * means the defaults. `*` anywhere in the list returns "*": any http(s) host
+ * is allowed and only the address pre-check applies. Read on every call.
+ */
+export function getAllowedGitHosts(): readonly string[] | "*" {
+  const entries = (process.env.MD_GIT_HOSTS ?? "")
+    .split(",")
+    .map(normalizeHost)
+    .filter(Boolean);
+  if (entries.includes("*")) return "*";
+  return entries.length > 0 ? entries : DEFAULT_GIT_HOSTS;
+}
+
+/** The host of an SCP-style `[user@]host:path` git address, or null. */
+function scpHost(address: string): string | null {
+  const match = address.match(/^(?:[^@/]+@)?(\[[^\]]*\]|[^:/@[\]]+):/);
+  return match ? normalizeHost(match[1]) : null;
+}
+
+/**
+ * Validates the git-repo-to-markdown `url` before repomix sees it. repomix and
+ * git then clone it themselves, so this is a set of pre-checks, not a pin:
+ *
+ * 1. Non-empty and accepted by repomix's own parser (a URL, `git@host:path`
+ *    or GitHub `owner/repo`); an explicit `scheme://` URL must be http(s), so
+ *    `file://`, `ssh://` and `git://` are refused.
+ * 2. A branch embedded in the URL (`.../tree/<ref>`, `.../commit/<sha>`),
+ *    which repomix would pass to `git fetch` when no branch argument is given,
+ *    must pass validateGitRef. repomix may later match a longer ref against
+ *    the server's ref list, but that ref starts with the one checked here.
+ * 3. The host (both as written and as repomix rewrites it for cloning) must
+ *    be in getAllowedGitHosts(). SCP-style `git@host:path` addresses go
+ *    through SSH, whose `~/.ssh/config` can alias a host to anywhere, so they
+ *    are accepted only for hosts listed explicitly, never under `*`.
+ * 4. The host must resolve only to public addresses (resolvePublicAddresses:
+ *    no loopback, private, link-local or metadata addresses; a failed lookup
+ *    is refused).
+ *
+ * What it does not guarantee: repomix resolves the name again when it clones
+ * (DNS can change in between), may download a GitHub archive over HTTPS
+ * instead of cloning, and git and repomix follow HTTP redirects without
+ * re-checking them. The host allowlist is the real boundary; the address
+ * check only stops a listed or `*` host that points inside the network.
+ */
+export async function validateRepoUrl(
+  repoUrl: string,
+  signal?: AbortSignal,
+): Promise<void> {
   if (!repoUrl || !repoUrl.trim()) {
     throw new Error("Repository URL is required");
   }
-  if (!isValidRemoteValue(repoUrl)) {
-    throw new Error(
-      `Invalid repository URL or shorthand: ${repoUrl}. Use a GitHub URL (https://github.com/owner/repo) or shorthand (owner/repo).`,
-    );
+  const invalid = new Error(
+    `Invalid repository URL or shorthand: ${repoUrl}. Use a GitHub URL (https://github.com/owner/repo) or shorthand (owner/repo).`,
+  );
+  let parsed: { repoUrl: string; remoteBranch?: string };
+  try {
+    parsed = parseRemoteValue(repoUrl);
+  } catch {
+    throw invalid;
   }
-  // Block non-http(s) explicit URLs (e.g. file://, ssh:// for SSRF prevention)
-  if (repoUrl.includes("://")) {
-    const parsed = new URL(repoUrl);
-    if (!["http:", "https:"].includes(parsed.protocol)) {
-      throw new Error("Only http: and https: repository URLs are allowed.");
+
+  // Refuse explicit non-http(s) URLs (file://, ssh://, git://): local files,
+  // and transports whose host this check cannot see or vet.
+  const hosts = new Set<string>();
+  for (const candidate of [repoUrl, parsed.repoUrl]) {
+    if (candidate.includes("://")) {
+      let url: URL;
+      try {
+        url = new URL(candidate);
+      } catch {
+        throw invalid;
+      }
+      if (!["http:", "https:"].includes(url.protocol)) {
+        throw new Error("Only http: and https: repository URLs are allowed.");
+      }
+      hosts.add(normalizeHost(url.hostname));
+    }
+  }
+
+  if (parsed.remoteBranch !== undefined) {
+    validateGitRef(parsed.remoteBranch, "The ref in the repository URL");
+  }
+
+  // repomix keeps an SCP-style address (git@host:path) as is; git clones it over SSH.
+  const viaSsh = !parsed.repoUrl.includes("://");
+  if (viaSsh) {
+    const host = scpHost(parsed.repoUrl);
+    if (!host) throw invalid;
+    hosts.add(host);
+  }
+
+  const allowed = getAllowedGitHosts();
+  for (const host of hosts) {
+    if (allowed === "*") {
+      if (viaSsh) {
+        throw new Error(
+          `SSH repository addresses (git@host:path) are allowed only for hosts listed in MD_GIT_HOSTS; "${host}" is not listed (MD_GIT_HOSTS is "*").`,
+        );
+      }
+    } else if (!allowed.includes(host)) {
+      throw new Error(
+        `Repository host "${host}" is not allowed. Allowed hosts: ${allowed.join(", ")}. ` +
+          `Set MD_GIT_HOSTS to a comma-separated list of hosts (or "*" for any public host).`,
+      );
+    }
+  }
+
+  for (const host of hosts) {
+    const literal = net.isIPv6(host) ? `[${host}]` : host;
+    try {
+      await resolvePublicAddresses(`https://${literal}/`, signal);
+    } catch (e: unknown) {
+      signal?.throwIfAborted();
+      throw new Error(
+        `Repository host "${host}" resolves to a loopback, private, link-local or metadata address, or could not be resolved; refusing to clone it.`,
+        { cause: e },
+      );
     }
   }
 }
 
 /**
  * True when markitdown's output is still an HTML document, meaning the page
- * could not be converted. The test is case-sensitive: only `<!DOCTYPE` and
- * `<html` (after leading whitespace) are recognised.
+ * could not be converted: after leading whitespace it starts with
+ * `<!doctype` or `<html`, in any letter case.
  */
 export function isUnconvertedHtml(output: string): boolean {
-  const trimmed = output.trimStart();
-  return trimmed.startsWith("<!DOCTYPE") || trimmed.startsWith("<html");
+  const head = output.trimStart().slice(0, 9).toLowerCase();
+  return head.startsWith("<!doctype") || head.startsWith("<html");
 }
 
 /**
  * The staging extension for a fetched URL, from which markitdown picks its
- * converter: "pdf" when the URL string ends in ".pdf", else "html". Only the
- * raw string is examined, not the Content-Type, so a query string, fragment
- * or upper-case ".PDF" gives "html".
+ * converter: "pdf" when the URL's path ends in ".pdf" (any letter case; the
+ * query string and fragment are ignored), else "html". Only the URL is
+ * examined, not the Content-Type. A string that does not parse as a URL
+ * gives "html".
  */
 export function inferExtensionFromUrl(url: string): string {
-  if (url.endsWith(".pdf")) {
-    return "pdf";
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    return "html";
   }
-  return "html";
+  return pathname.toLowerCase().endsWith(".pdf") ? "pdf" : "html";
 }
 
-/** True for a `.md` or `.markdown` extension (case-sensitive). */
+/** True for a `.md` or `.markdown` extension, in any letter case. */
 export function isMarkdownFile(filePath: string): boolean {
   const markdownExt = [".md", ".markdown"];
-  return markdownExt.includes(path.extname(filePath));
+  return markdownExt.includes(path.extname(filePath).toLowerCase());
 }
 
 /**

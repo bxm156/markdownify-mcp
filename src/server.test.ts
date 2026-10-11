@@ -175,6 +175,45 @@ describe("dispatch", () => {
     });
   });
 
+  for (const branch of ["--upload-pack=touch /tmp/pwned", "-x", "a b", "a..b", "a@{1}", "x".repeat(256)]) {
+    test(`git-repo-to-markdown rejects branch ${JSON.stringify(branch.slice(0, 32))} without calling fromRepo`, async () => {
+      const res = await call(tools.GitRepoToMarkdownTool.name, {
+        url: "owner/repo",
+        branch,
+      });
+      expect(res.isError).toBe(true);
+      expect(res.content).toHaveLength(1);
+      expect(res.content[0].text).toMatch(
+        /^Error: Invalid arguments: branch: not a valid git ref: /,
+      );
+      expect(fromRepo).not.toHaveBeenCalled();
+    });
+  }
+
+  for (const branch of ["refs/heads/ok", "feature/x-1", "v1.2.3", "a1b2c3d"]) {
+    test(`git-repo-to-markdown accepts branch ${JSON.stringify(branch)}`, async () => {
+      const res = await call(tools.GitRepoToMarkdownTool.name, {
+        url: "owner/repo",
+        branch,
+      });
+      expect(res.isError).toBe(false);
+      expect(fromRepo).toHaveBeenCalledWith({
+        repoUrl: "owner/repo",
+        branch,
+        compress: undefined,
+      });
+    });
+  }
+
+  test("git-repo-to-markdown treats an empty branch as the default branch", async () => {
+    const res = await call(tools.GitRepoToMarkdownTool.name, {
+      url: "owner/repo",
+      branch: "",
+    });
+    expect(res.isError).toBe(false);
+    expect(fromRepo).toHaveBeenCalledTimes(1);
+  });
+
   test("git-repo-to-markdown without url is an error", async () => {
     const res = await call(tools.GitRepoToMarkdownTool.name, { branch: "dev" });
     expect(res.isError).toBe(true);

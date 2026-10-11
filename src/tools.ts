@@ -212,12 +212,14 @@ export const PptxToMarkdownTool = ToolSchema.parse({
 
 /**
  * Packs a remote git repository into one Markdown document with repomix. Takes
- * `url` (URL or GitHub `owner/repo`), optional `branch` and `compress`.
+ * `url` (URL or GitHub `owner/repo`), optional `branch` and `compress`. The
+ * host must be in MD_GIT_HOSTS (default github.com, gitlab.com, bitbucket.org)
+ * and `branch` a valid git ref; see validateRepoUrl and validateGitRef.
  */
 export const GitRepoToMarkdownTool = ToolSchema.parse({
   name: "git-repo-to-markdown",
   description:
-    "Convert a git repository into a single markdown document containing the file tree and source code. Supports GitHub URLs and shorthand (e.g. 'owner/repo').",
+    "Convert a git repository into a single markdown document containing the file tree and source code. Supports GitHub URLs and shorthand (e.g. 'owner/repo'). Only hosts allowed by the server (by default github.com, gitlab.com and bitbucket.org) that resolve to public addresses are cloned.",
   inputSchema: {
     type: "object",
     properties: {
@@ -229,7 +231,7 @@ export const GitRepoToMarkdownTool = ToolSchema.parse({
       branch: {
         type: "string",
         description:
-          "Branch, tag, or commit to use (default: repo default branch)",
+          "Branch, tag, or commit to use (default: repo default branch). Must be a valid git ref name, e.g. 'main', 'v1.2.3' or 'feature/x'; values starting with '-' are rejected.",
       },
       compress: {
         type: "boolean",
