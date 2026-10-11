@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createServer, type Server } from "node:http";
 import net from "node:net";
 import type { JobService } from "./jobs.js";
-import { loadConfig, SHUTDOWN_TIMEOUT_WARN_MS } from "./config.js";
+import { loadConfig, SHUTDOWN_TIMEOUT_WARN_MS, WINDOWS_UNSUPPORTED_MESSAGE } from "./config.js";
 import { startRemoteServer, type ProcessHandle, type RemoteConfig, type RemoteServer } from "./index.js";
 
 // Unit tests for startRemoteServer: every process-level side effect (exit, signal registration, logging) and the job
@@ -42,6 +42,24 @@ afterEach(async () => {
 });
 
 describe("startRemoteServer", () => {
+  test("refuses to start on Windows: one stderr line, exit status 1, no job service and no listener", async () => {
+    expect(WINDOWS_UNSUPPORTED_MESSAGE).toBe("The remote server is not supported on Windows. Run the Linux container image (see docs/CONTAINERS.md) instead.");
+    const proc = fakeProcess(), logs: string[] = [];
+    let jobsCreated = 0, serversCreated = 0;
+    const attempt = startRemoteServer({
+      config: makeConfig({ MD_PORT: String(await freePort()) }),
+      createJobs: () => { jobsCreated++; return stubJobs().jobs; },
+      createServer: () => { serversCreated++; return createServer(); },
+      processHandle: proc.handle, log: message => logs.push(message), platform: "win32",
+    });
+    // The injected exit returns, so startup stops by rejecting rather than by ending the process.
+    await expect(attempt).rejects.toThrow(WINDOWS_UNSUPPORTED_MESSAGE);
+    expect(logs).toEqual([WINDOWS_UNSUPPORTED_MESSAGE]);
+    expect(proc.exits).toEqual([1]);
+    expect(jobsCreated).toBe(0); expect(serversCreated).toBe(0);
+    expect(proc.listeners.size).toBe(0);
+  });
+
   test("initialises jobs, listens, logs and applies the request and header timeouts", async () => {
     const port = await freePort();
     const started = await start(makeConfig({ MD_PORT: String(port) }));

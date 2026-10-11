@@ -1,6 +1,6 @@
 # Single-tenant MVP validation
 
-Validated locally on 2026-10-06 on Windows using Bun 1.4.2, Node 24.19.0, Python 3.12, MCP SDK 1.27.1, and MarkItDown 0.1.5. The container targets Node 22.
+Validated locally on 2026-10-06 on Windows using Bun 1.4.2, Node 24.19.0, Python 3.12, MCP SDK 1.27.1, and MarkItDown 0.1.5. The container targets Node 22. (The remote server no longer starts on Windows; it is container-only.)
 
 ## Passed
 

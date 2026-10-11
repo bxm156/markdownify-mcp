@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Server } from "node:http";
 import { fileURLToPath } from "node:url";
-import { loadConfig, SHUTDOWN_TIMEOUT_WARN_MS } from "./config.js";
+import { loadConfig, SHUTDOWN_TIMEOUT_WARN_MS, WINDOWS_UNSUPPORTED_MESSAGE } from "./config.js";
 import { createHttpServer } from "./http.js";
 import { JobService } from "./jobs.js";
 import { createAuditLogger } from "./audit.js";
@@ -21,6 +21,8 @@ export interface RemoteServerOptions {
   createServer?: (jobs: JobService, config: RemoteConfig) => Server;
   processHandle?: ProcessHandle;
   log?: (message: string) => void;
+  /** The host platform; defaults to `process.platform`. Startup is refused on "win32". */
+  platform?: NodeJS.Platform;
 }
 export interface RemoteServer { server: Server; jobs: JobService; shutdown: () => Promise<void> }
 
@@ -29,6 +31,17 @@ export const REQUEST_TIMEOUT_MS = 5 * 60_000;
 export const HEADERS_TIMEOUT_MS = 30_000;
 
 const defaultProcessHandle: ProcessHandle = { once: (signal, listener) => process.once(signal, listener), exit: code => process.exit(code) };
+const defaultLog = (message: string) => { console.error(message); };
+/**
+ * Refuses to run on Windows: logs WINDOWS_UNSUPPORTED_MESSAGE once and exits with status 1, before the data directory is
+ * touched. The throw is reached only when an injected `exit` returns, so nothing after this call runs.
+ */
+export function refuseUnsupportedPlatform(platform: NodeJS.Platform, log: (message: string) => void = defaultLog, processHandle: ProcessHandle = defaultProcessHandle): void {
+  if (platform !== "win32") return;
+  log(WINDOWS_UNSUPPORTED_MESSAGE);
+  processHandle.exit(1);
+  throw new Error(WINDOWS_UNSUPPORTED_MESSAGE);
+}
 async function defaultCreateJobs(config: RemoteConfig) {
   const audit = await createAuditLogger(config.jobs.dataDir);
   return new JobService({ ...config.jobs, audit });
@@ -39,7 +52,8 @@ export async function startRemoteServer(options: RemoteServerOptions): Promise<R
   const createJobs = options.createJobs ?? defaultCreateJobs;
   const createServer = options.createServer ?? ((service: JobService, settings: RemoteConfig) => createHttpServer(service, settings));
   const processHandle = options.processHandle ?? defaultProcessHandle;
-  const log = options.log ?? ((message: string) => { console.error(message); });
+  const log = options.log ?? defaultLog;
+  refuseUnsupportedPlatform(options.platform ?? process.platform, log, processHandle);
   // A deadline longer than the container's stop grace period means SIGKILL arrives first (see SHUTDOWN_TIMEOUT_WARN_MS).
   // Warn once, as a single-line JSON operator event, but still start: other runtimes may allow longer.
   if (config.shutdownTimeoutMs > SHUTDOWN_TIMEOUT_WARN_MS) log(JSON.stringify({ event: "shutdown_timeout_warning", shutdown_timeout_ms: config.shutdownTimeoutMs, ceiling_ms: SHUTDOWN_TIMEOUT_WARN_MS }));
@@ -87,6 +101,8 @@ function isEntryPoint(): boolean {
 }
 
 async function main() {
+  // Before loadConfig, so a Windows host gets this message rather than a configuration error.
+  refuseUnsupportedPlatform(process.platform);
   process.env.PYTHONUTF8 = "1";
   await startRemoteServer({ config: loadConfig() });
 }

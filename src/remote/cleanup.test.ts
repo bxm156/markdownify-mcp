@@ -241,7 +241,7 @@ describe("one process per data volume", () => {
   test("existing locks fail closed and crash leftovers require operator removal", async () => {
     const { instance, options } = await service(), lock = path.join(options.dataDir, ".lock");
     expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(process.pid));
-    if (process.platform !== "win32") expect((await fs.stat(lock)).mode & 0o777).toBe(0o600);
+    expect((await fs.stat(lock)).mode & 0o777).toBe(0o600);
     // The current test process holds the lock, so a second service on the same volume is refused.
     await expect(new JobService(options).init()).rejects.toThrow("Data directory is in use");
     await instance.close(); await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
@@ -361,8 +361,8 @@ describe("retired owner purge tool", () => {
     await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" }); expect(await files(options.dataDir, id)).toContain("input.txt");
   });
 
-  // Root bypasses directory permissions, so this real read-only check only runs as an unprivileged POSIX user.
-  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("a dry run succeeds on a read-only data directory and --apply is refused", async () => {
+  // Root bypasses directory permissions, so this real read-only check only runs as an unprivileged user.
+  test.skipIf(process.getuid?.() === 0)("a dry run succeeds on a read-only data directory and --apply is refused", async () => {
     const { instance, options } = await service();
     const id = await uploaded(instance, alice); await instance.close();
     await fs.chmod(options.dataDir, 0o555);
@@ -430,7 +430,7 @@ describe.skipIf(!node)("compiled entry points under node", () => {
     expect(await fs.readFile(path.join(options.dataDir, corrupt, "job.json"), "utf8")).toBe("{not json");
   }, 30_000);
 
-  test.skipIf(process.platform === "win32")("an interrupted purge --apply exits with the signal status and leaves no lock", async () => {
+  test("an interrupted purge --apply exits with the signal status and leaves no lock", async () => {
     const preloadDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-purge-signal-")); directories.push(preloadDir);
     // Hang removal of one job directory in pure JavaScript (no blocked I/O thread), and report when it is reached.
     const preload = path.join(preloadDir, "hang-rm.mjs");
@@ -482,22 +482,15 @@ describe.skipIf(!node)("compiled entry points under node", () => {
     try { expect(await refused.exited).toBe(1); } finally { if (refused.child.exitCode === null) refused.child.kill("SIGKILL"); }
     expect(refused.stderr()).toContain("Data directory is in use: MD_DATA_DIR/.lock exists"); expect(refused.stderr()).toContain("remove MD_DATA_DIR/.lock and restart");
     await fs.rm(lock, { force: true });
-    for (const signal of process.platform === "win32" ? ["SIGKILL"] as const : ["SIGTERM", "SIGHUP"] as const) {
+    for (const signal of ["SIGTERM", "SIGHUP"] as const) {
       const restarted = start();
       try {
         await ready(restarted);
         expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(restarted.child.pid));
-        if (process.platform === "win32") {
-          // Windows kill() terminates the child without running Node's signal handlers.
-          restarted.child.kill("SIGKILL");
-          await restarted.exited;
-          expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(restarted.child.pid));
-        } else {
-          restarted.child.kill(signal);
-          expect(await restarted.exited).toBe(0);
-          // POSIX graceful shutdown on SIGTERM and SIGHUP releases the lock again.
-          await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
-        }
+        restarted.child.kill(signal);
+        expect(await restarted.exited).toBe(0);
+        // Graceful shutdown on SIGTERM and SIGHUP releases the lock again.
+        await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
       } finally { if (restarted.child.exitCode === null) restarted.child.kill("SIGKILL"); }
     }
   }, 30_000);

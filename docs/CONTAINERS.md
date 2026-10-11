@@ -2,6 +2,8 @@
 
 The remote image runs the native HTTP MCP service and document converter. Supergateway is unnecessary for this entry point. It exposes `/mcp`, `/uploads/*`, `/livez` (alias `/healthz`, used by the image HEALTHCHECK) and `/readyz` on port 8000. The probe routes accept any Host so orchestrator probes work; all other routes still enforce the host allowlist. Each upload and conversion result belongs to one authenticated agent, including agents sharing a tenant.
 
+The remote server supports Linux only and ships only as this Linux image. The process refuses to start on Windows; on a Windows host, run the container with Docker Desktop (see [the quickstart](QUICKSTART.md)).
+
 ## Build and run
 
 From the repository root:

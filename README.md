@@ -26,6 +26,13 @@ Agent runtime ◄─ Markdown pages ── /mcp
 
 MCP controls the job; the runtime transfers the bytes. Connecting an MCP client does not automatically upload local files. The agent also needs filesystem access and an HTTP upload capability, or it can run the included [streaming helper](examples/upload-and-convert.ts). File paths and base64 are not upload tool arguments.
 
+## Platform support
+
+- **Remote HTTP service** (`dist/remote/index.js`, the service this README documents): Linux only, shipped as a container image. On Windows, run the image with Docker Desktop; see the [quickstart](docs/QUICKSTART.md) and [container guide](docs/CONTAINERS.md). Started directly on Windows, the process exits with an error.
+- **Local stdio server** (`dist/index.js`): macOS, Linux and Windows. Set it up with `setup.sh`, or `setup.bat` on Windows, where the converter is `.venv/Scripts/markitdown.exe`. CI runs its tests on macOS and Windows as well as Linux.
+
+Document conversion itself has no Windows or Microsoft Office dependency: MarkItDown reads Office and PDF files with pure-Python parsers (mammoth, openpyxl, python-pptx, pdfminer.six).
+
 ## Install the server
 
 For agents using LiteLLM, the recommended authentication is now [short-lived LiteLLM-signed JWTs](docs/JWT.md), using its open-source outbound signer and a distinct machine user per agent. This requires no Enterprise gateway JWT login. Follow that guide for `compose.jwt.yaml` and gateway client configuration. Binary uploads receive separate one-job credentials valid for at most five minutes. The LiteLLM user ID is the owner; revoking a key or user in LiteLLM stops new admissions, and already-issued tokens and upload grants expire on their own ([details](docs/JWT.md#revocation-is-bounded-not-immediate)).

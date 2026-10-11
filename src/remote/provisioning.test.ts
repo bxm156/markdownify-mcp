@@ -10,7 +10,7 @@ const execute = promisify(execFile);
 const script = path.resolve("scripts/create-agent-credential.ts");
 const directories: string[] = [];
 async function fixture() { const directory = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-provisioning-")); directories.push(directory); return { directory, registry: path.join(directory, "agents.json") }; }
-async function provision(tenant: string, agent: string, registry: string, token: string) { return execute(process.execPath, [script, tenant, agent, registry, token], { timeout: 10_000, windowsHide: true, maxBuffer: 16_000 }); }
+async function provision(tenant: string, agent: string, registry: string, token: string) { return execute(process.execPath, [script, tenant, agent, registry, token], { timeout: 10_000, maxBuffer: 16_000 }); }
 afterEach(async () => { for (const directory of directories.splice(0)) await fs.rm(directory, { recursive: true, force: true }); });
 
 test("fresh credential provisioning supports independent agents and rotation without logging secrets", async () => {

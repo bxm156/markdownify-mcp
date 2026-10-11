@@ -107,7 +107,7 @@ test("real health detects missing converter and unwritable storage without leaki
   const f = await fixture();
   const previous = process.env.MARKITDOWN_PATH;
   try {
-    process.env.MARKITDOWN_PATH = path.join(f.dataDir, "private-missing.exe");
+    process.env.MARKITDOWN_PATH = path.join(f.dataDir, "private-missing");
     const h = await checkRuntime(path.join(f.dataDir, "absent"), false);
     expect(h.converter.available).toBe(false); expect(h.storage.writable).toBe(false);
     expect(JSON.stringify(h)).not.toContain(f.dataDir);
@@ -303,7 +303,7 @@ test("livez stays 200 while readyz is 503 for unwritable storage or a missing co
   } finally { statfs.mockRestore(); }
   const previous = process.env.MARKITDOWN_PATH;
   try {
-    process.env.MARKITDOWN_PATH = path.join(f.dataDir, "private-missing.exe");
+    process.env.MARKITDOWN_PATH = path.join(f.dataDir, "private-missing");
     const g = await fixture(true, { converter: undefined });
     const ready = await fetch(g.base + "/readyz", { headers: { Host: "127.0.0.1" } });
     expect(ready.status).toBe(503);

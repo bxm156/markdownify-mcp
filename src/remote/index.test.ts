@@ -65,7 +65,7 @@ function launch(options: StartOptions): Server {
   for (const [name, value] of Object.entries(process.env)) if (!name.startsWith("MD_") && name !== "MARKITDOWN_PATH") env[name] = value;
   Object.assign(env, { MD_API_KEY: API_KEY, MD_HOST: "127.0.0.1", MD_PORT: String(options.port), MD_PUBLIC_BASE_URL: `http://127.0.0.1:${options.port}`, MD_DATA_DIR: options.dataDir, MARKITDOWN_PATH: options.converter ?? "/bin/true" }, options.env);
   for (const [name, value] of Object.entries(env)) if (value === undefined) delete env[name];
-  const child = spawn(process.execPath, [entry], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  const child = spawn(process.execPath, [entry], { env, stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "", stderr = "";
   child.stdout!.on("data", chunk => { stdout += chunk.toString(); });
   child.stderr!.on("data", chunk => { stderr += chunk.toString(); });
