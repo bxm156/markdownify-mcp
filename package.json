@@ -7,6 +7,9 @@
   "homepage": "https://github.com/zcaceres/markdownify-mcp",
   "bugs": "https://github.com/zcaceres/markdownify-mcp/issues",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "bin": {
     "mcp-markdownify-server": "dist/index.js"
   },
