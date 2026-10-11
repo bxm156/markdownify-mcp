@@ -3,8 +3,12 @@
 Guidance for agents editing CI. GitHub only runs `*.yml`/`*.yaml` here; this
 file is documentation. Pinned everywhere: Bun 1.4.2, Node 22, Python 3.12,
 markitdown 0.1.5 (`markitdown[pdf,docx,xlsx,pptx]==0.1.5`), LiteLLM 1.104.0
-(`litellm[mcp]==1.104.0`). Dockerfiles pin the same Bun, Node, Python and
-markitdown. Change a pin in every workflow and Dockerfile together. All
+(`litellm[mcp]==1.104.0`). `Dockerfile.remote` pins
+Node 22, Python 3.12 and `markitdown[pdf,docx,xlsx,pptx]==0.1.5`. The stdio
+`Dockerfile` pins Bun 1.4.2 and `markitdown[all]==0.1.5` (audio/OCR tools) and uses
+the base image's Debian `python3` (`oven/bun:1.4.2-debian` is trixie, so 3.13) plus
+ffmpeg, deliberately without a second Python toolchain. Change a pin in every
+workflow and Dockerfile together. All
 workflows use `permissions: contents: read` unless stated.
 
 ## remote-mvp.yml ("Remote MVP")
@@ -14,8 +18,8 @@ Triggers: every `push` and `pull_request`. No secrets.
 - Job `remote` (15 min): `bun install --frozen-lockfile --ignore-scripts`;
   `bun run typecheck` (tests, scripts, examples); `bun scripts/check-env-docs.ts`
   (every `MD_*` in `src/remote` is in the `docs/REMOTE.md` table); an `ast`-based guard that
-  fails on any `assert` statement in `scripts/*.py` (`python -O` strips them, use `raise`;
-  `mkdocs_hooks.py` joins once #70 lands);
+  fails on any `assert` statement in `scripts/*.py` and `mkdocs_hooks.py` (`python -O`
+  strips them, use `raise`);
   `bun run build:remote`; `bun test src/remote`; install markitdown; `bun run
   build`; full `bun test` with `MD_TEST_NETWORK=1`; fixture generator test
   (`create_remote_fixtures_test.py`, also under `-O`); `remote-converter-smoke.ts`
@@ -49,7 +53,10 @@ cancelled. Job `test-and-publish`, 25 min.
   smoke, and the LiteLLM `-O` run and negative-path harness. Then it builds
   `Dockerfile.remote` (linux/amd64, `VCS_REF=$GITHUB_SHA`, `load: true`,
   `push: false`) without registry credentials, and tests that image with three
-  disposable agents.
+  disposable agents: the multitenant smoke, then `examples/upload-and-convert.ts` as
+  agent "a" under Bun, under Node (`--experimental-strip-types`) and the compiled
+  `examples/upload-and-convert.js` inside the image (`--network container:<name>`),
+  the same three runs as remote-mvp.yml's single-key step.
 - A "Check publication configuration" step sets `ready=true` only if secrets
   `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` exist, `IMAGE_NAME` is valid
   (`bryanmarty/markdownify-mcp`), and `main` has not advanced past `$GITHUB_SHA`

@@ -29,8 +29,7 @@ jobs:
         run: |
           # Parses each file, so the word "assert" in a comment, docstring or string is not flagged,
           # while `assert x`, `assert(x)` and `if y: assert x` all are.
-          # TODO(#70): add mkdocs_hooks.py once its self-check uses explicit raises instead of assert.
-          python - scripts/*.py <<'PY'
+          python - scripts/*.py mkdocs_hooks.py <<'PY'
           import ast, sys
           found = [f"{path}:{node.lineno}" for path in sys.argv[1:]
                    for node in ast.walk(ast.parse(open(path, encoding="utf-8").read(), path))
