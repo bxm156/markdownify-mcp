@@ -176,6 +176,7 @@ describe("remote entry point", () => {
       ["MD_API_KEY is missing", { MD_API_KEY: undefined }, "MD_API_KEY"],
       ["MD_API_KEY is too short", { MD_API_KEY: secret }, "MD_API_KEY"],
       ["MD_PORT is not a number", { MD_PORT: "not-a-port" }, "MD_PORT"],
+      ["MD_SHUTDOWN_TIMEOUT_MS is not a number", { MD_SHUTDOWN_TIMEOUT_MS: "abc" }, "MD_SHUTDOWN_TIMEOUT_MS"],
     ] as const)("exits 1 naming the variable, without echoing secrets, when %s", async (_label, env, variable) => {
       const dataDir = await tempDir("markdownify-index-");
       const server = start({ port: await freePort(), dataDir, env });
