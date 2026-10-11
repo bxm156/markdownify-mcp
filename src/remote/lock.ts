@@ -16,6 +16,11 @@
  * file (temp + rename) so its mtime stays fresh. A foreign or missing token means another process took over: the holder
  * logs lock_lost, forgets the lock (it never removes a file it does not own) and calls onLost once. The timer is unref'd.
  *
+ * Leftovers: a crash mid-heartbeat or mid-reclaim can leave `.lock.<uuid>.tmp` or `.lock.<uuid>.stale` behind. The holder
+ * removes those whose mtime is older than the sweep age (staleAfterMs, or DEFAULT_LOCK_STALE_AFTER_MS when reclaim is
+ * disabled) after acquiring and then at most once per sweep age from the heartbeat; a younger one may still be in a
+ * contender's hands. It logs one lock_leftovers_removed event per sweep that removed any, and never touches `.lock`.
+ *
  * Release (releaseLock, or the exit hook for anything still held) stops the heartbeat and unlinks the file only while it
  * still carries this acquisition's token. SIGKILL, an OOM kill or a host crash leave the file behind; it is reclaimed once
  * stale, or removed by an operator after stopping every user of the volume (LOCK_REMOVAL_HINT).
@@ -24,6 +29,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, rmSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { errnoCode } from "./audit.js";
 
 /** How often a holder refreshes its lock file. */
 export const HEARTBEAT_MS = 5000;
@@ -47,7 +53,6 @@ export const reclaimHint = (staleAfterMs: number) => staleAfterMs > 0 ? `A lock 
 /** The data directory's lock file already exists (and is not stale), or another contender reclaimed it first. */
 export class LockHeldError extends Error {}
 const lockError = (staleAfterMs: number) => new LockHeldError(`Data directory is in use: MD_DATA_DIR/.lock exists. Run one process per data volume; a running purge-owner --apply also holds this lock. ${reclaimHint(staleAfterMs)} ${LOCK_REMOVAL_HINT}`);
-const errnoCode = (error: unknown) => { const code = (error as NodeJS.ErrnoException | null)?.code; return typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code) ? code : "UNKNOWN"; };
 const tokenOf = (text: string) => { const token = (text.split("\n")[1] ?? "").trim(); return /^[0-9a-f-]{36}$/.test(token) ? token : null; };
 const defaultLog = (line: string) => { console.error(line); };
 
@@ -60,6 +65,11 @@ export function parseLockStaleAfterMs(raw: string | undefined) {
   const value = Number(raw);
   if (!raw.trim() || !Number.isSafeInteger(value) || (value !== 0 && value < MIN_LOCK_STALE_AFTER_MS)) throw new Error(`MD_LOCK_STALE_AFTER_MS must be 0 (never reclaim) or an integer of at least ${MIN_LOCK_STALE_AFTER_MS}`);
   return value;
+}
+/** Milliseconds since the data directory's `.lock` was last modified (fs mtime, as reclaim judges it), or undefined when unlocked. */
+export async function lockAge(dataDir: string, now: () => number = Date.now) {
+  try { return Math.floor(now() - (await fs.lstat(path.join(await fs.realpath(dataDir), ".lock"))).mtimeMs); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 }
 /** The contents of an existing lock, or undefined when the data directory is unlocked. The PID is informational only. */
 export async function readLock(dataDir: string) {
@@ -80,7 +90,7 @@ async function claimStale(target: string, staleAfterMs: number, now: () => numbe
   if (age <= staleAfterMs) throw lockError(staleAfterMs);
   const moved = `${target}.${randomUUID()}.stale`;
   await fs.rename(target, moved).catch(missing);
-  const after = await fs.lstat(moved);
+  const after = await fs.lstat(moved).catch(missing);
   if (after.dev !== before.dev || after.ino !== before.ino || after.mtimeMs !== before.mtimeMs) {
     // Another contender replaced the stale file between our lstat and rename: restore its fresh lock and give up.
     await fs.link(moved, target).catch(() => undefined);
@@ -88,6 +98,22 @@ async function claimStale(target: string, staleAfterMs: number, now: () => numbe
     throw lockError(staleAfterMs);
   }
   return { age, moved };
+}
+/** Names of lock temporaries: a heartbeat's `.lock.<uuid>.tmp` and a reclaim's `.lock.<uuid>.stale`. */
+const LEFTOVER = /^\.lock\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:tmp|stale)$/;
+/**
+ * Best effort: removes lock temporaries in `real` whose mtime is older than `minAgeMs` (regular files only; never `.lock`
+ * or a directory) and returns how many it removed. Errors (an unreadable directory, a file already gone) are ignored.
+ */
+async function sweepLeftovers(real: string, minAgeMs: number, now: () => number) {
+  let removed = 0;
+  const names = await fs.readdir(real).catch(() => [] as string[]);
+  for (const name of names) {
+    if (!LEFTOVER.test(name)) continue;
+    const file = path.join(real, name);
+    try { const stat = await fs.lstat(file); if (stat.isFile() && now() - stat.mtimeMs > minAgeMs) { await fs.unlink(file); removed++; } } catch {}
+  }
+  return removed;
 }
 const stop = (state: Held) => { state.stopped = true; if (state.timer) clearInterval(state.timer); };
 
@@ -109,6 +135,10 @@ export async function acquireLock(dataDir: string, options: LockOptions = {}) {
     log(JSON.stringify({ event: "stale_lock_reclaimed", age_ms: age }));
   }
   const state: Held = { token, stopped: false };
+  // Leftover temporaries: swept now and then at most once per sweepAge from the heartbeat (a readdir of the volume root).
+  const sweepAge = staleAfterMs > 0 ? staleAfterMs : DEFAULT_LOCK_STALE_AFTER_MS;
+  let nextSweep = now() + sweepAge;
+  const sweep = async () => { const count = await sweepLeftovers(real, sweepAge, now); if (count > 0) log(JSON.stringify({ event: "lock_leftovers_removed", count })); };
   let failing = false;
   const failed = (error: unknown) => { if (!failing) { failing = true; log(JSON.stringify({ event: "lock_heartbeat_failed", code: errnoCode(error) })); } };
   const beat = async () => {
@@ -126,6 +156,7 @@ export async function acquireLock(dataDir: string, options: LockOptions = {}) {
     try { await fs.writeFile(temporary, contents(), { mode: 0o600 }); if (!state.stopped) await fs.rename(temporary, target); failing = false; }
     catch (error) { failed(error); }
     finally { await fs.rm(temporary, { force: true }).catch(() => undefined); }
+    if (!failing && !state.stopped && now() >= nextSweep) { nextSweep = now() + sweepAge; await sweep(); }
   };
   state.timer = setInterval(() => { if (!state.beat && !state.stopped) state.beat = beat().finally(() => { state.beat = undefined; }); }, heartbeatMs);
   state.timer.unref();
@@ -133,6 +164,7 @@ export async function acquireLock(dataDir: string, options: LockOptions = {}) {
   // process.exit() (including the shutdown deadline), uncaught exceptions and normal exits release held locks.
   // SIGKILL, OOM kills and host crashes cannot run this; those leftovers are reclaimed once stale (or removed by an operator).
   if (!exitHook) { exitHook = true; process.on("exit", () => { for (const [directory, mine] of held) { stop(mine); try { const file = path.join(directory, ".lock"); if (tokenOf(readFileSync(file, "utf8")) === mine.token) rmSync(file, { force: true }); } catch {} } held.clear(); }); }
+  await sweep();
   return real;
 }
 /**

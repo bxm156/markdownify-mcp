@@ -440,6 +440,13 @@ describe.skipIf(!node)("compiled entry points under node", () => {
     const link = path.join(linkParent, "data"); await fs.symlink(options.dataDir, link, "dir");
     const linked = cli(link, alice.tenantId, alice.agentId);
     expect(linked.status).toBe(0); expect(JSON.parse(linked.stdout).jobs).toMatchObject([{ job_id: mine, result: "listed" }]);
+    // A crash leftover older than MD_LOCK_STALE_AFTER_MS (default 60 s) does not block a dry run: one note on stderr, report on stdout.
+    const lock = path.join(options.dataDir, ".lock"), dead = new Date(Date.now() - 120_000);
+    await fs.writeFile(lock, "4242\n00000000-0000-0000-0000-000000000000\n"); await fs.utimes(lock, dead, dead);
+    const past = cli(options.dataDir, alice.tenantId, alice.agentId);
+    expect(past.status).toBe(0); expect(past.stderr.trim().split("\n")).toEqual([expect.stringMatching(/^Note: MD_DATA_DIR\/\.lock was last refreshed \d+ ms ago/)]);
+    expect(JSON.parse(past.stdout).jobs).toMatchObject([{ job_id: mine, result: "listed" }]);
+    await fs.rm(lock);
     const corrupt = "44444444-4444-4444-4444-444444444444";
     await fs.mkdir(path.join(options.dataDir, corrupt)); await fs.writeFile(path.join(options.dataDir, corrupt, "job.json"), "{not json");
     const unreadable = cli(options.dataDir, alice.tenantId, alice.agentId, "--apply");

@@ -75,12 +75,19 @@ export function loadQuotaOverrides(file: string, global: { maxJobs: number; maxS
 }
 
 /**
+ * The Host header values that name a public origin: URL.host, plus `hostname:<default port>` when the origin has no
+ * explicit port, since URL.host omits a default port but a client may still send it (Host: example.com:443). Used by
+ * loadConfig's default MD_ALLOWED_HOSTS and by createHttpServer when it is given no allowedHosts.
+ */
+export function publicHostForms(publicUrl: URL) {
+  return publicUrl.port ? [publicUrl.host] : [publicUrl.host, `${publicUrl.hostname}:${publicUrl.protocol === "https:" ? 443 : 80}`];
+}
+/**
  * Reads and validates the remote server configuration from `env`.
  *
  * The authentication mode comes from loadAuthenticator (JWT, credential registry or single MD_API_KEY).
  * MD_PUBLIC_BASE_URL must be a bare HTTP(S) origin: it is the base of upload URLs and the only accepted Origin header.
- * MD_ALLOWED_HOSTS defaults to that origin's host (both bare and with its default port when the origin has none, since
- * clients may send either) plus localhost and 127.0.0.1 on MD_PORT. Numeric settings must be positive safe integers.
+ * MD_ALLOWED_HOSTS defaults to publicHostForms(origin) plus localhost and 127.0.0.1 on MD_PORT. Numeric settings must be positive safe integers.
  *
  * Quota model (enforced by JobService): every job that is not expired reserves its input size plus MD_MAX_OUTPUT_BYTES,
  * and admission checks the job count and reserved bytes at three independent scopes: global (MD_MAX_JOBS,
@@ -114,9 +121,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const publicUrl = new URL(env.MD_PUBLIC_BASE_URL ?? `http://localhost:${port}`);
   if (!["http:", "https:"].includes(publicUrl.protocol) || publicUrl.username || publicUrl.password || publicUrl.search || publicUrl.hash || publicUrl.pathname !== "/") throw new Error("MD_PUBLIC_BASE_URL must be an HTTP(S) origin without credentials, query or path");
   const publicBaseUrl = publicUrl.origin;
-  // URL.host omits a default port, but a client may still send it (Host: example.com:443), so both forms are allowed.
-  const publicHosts = publicUrl.port ? [publicUrl.host] : [publicUrl.host, `${publicUrl.hostname}:${publicUrl.protocol === "https:" ? 443 : 80}`];
-  const allowedHosts = env.MD_ALLOWED_HOSTS?.split(",").map(value => value.trim()).filter(Boolean) ?? [...new Set([...publicHosts, `localhost:${port}`, `127.0.0.1:${port}`])];
+  const allowedHosts = env.MD_ALLOWED_HOSTS?.split(",").map(value => value.trim()).filter(Boolean) ?? [...new Set([...publicHostForms(publicUrl), `localhost:${port}`, `127.0.0.1:${port}`])];
   if (!allowedHosts.length || allowedHosts.some(host => /[\s\/\\?#@]/.test(host))) throw new Error("MD_ALLOWED_HOSTS must contain comma-separated Host header values");
   const maxJobs = integer("MD_MAX_JOBS", 100), maxStorageBytes = integer("MD_MAX_STORAGE_BYTES", 256 * 1024 * 1024), concurrency = integer("MD_CONCURRENCY", 2), maxOutputBytes = integer("MD_MAX_OUTPUT_BYTES", 25 * 1024 * 1024);
   // Tenant and agent caps: an explicit value above its global cap is rejected like an override entry; an unset default

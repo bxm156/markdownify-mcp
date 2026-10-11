@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -29,6 +30,12 @@ async function leftover(directory: string, ageMs: number, token = FOREIGN) {
   const then = new Date(Date.now() - ageMs);
   await fs.utimes(lockFile(directory), then, then);
 }
+/** Writes a lock temporary (or any file) whose mtime is `ageMs` in the past. */
+async function aged(file: string, ageMs: number) { await fs.writeFile(file, "x"); const then = new Date(Date.now() - ageMs); await fs.utimes(file, then, then); }
+const leftoverName = (kind: "tmp" | "stale") => `.lock.${crypto.randomUUID()}.${kind}`;
+const exists = (file: string) => fs.lstat(file).then(() => true, () => false);
+/** A rename failure with an errno code, as fs would throw it. */
+const errno = (code: string) => Object.assign(new Error(code), { code });
 const strays = async (directory: string) => (await fs.readdir(directory)).filter(name => name.startsWith(".lock."));
 
 describe("data-directory lock", () => {
@@ -158,6 +165,85 @@ describe("data-directory lock", () => {
     expect(await fs.readFile(lockFile(directory), "utf8")).toBe(foreign);
   });
 
+  test("acquiring sweeps lock temporaries older than the threshold and leaves fresh ones, .lock and job directories alone", async () => {
+    const directory = await dataDir(), at = (name: string) => path.join(directory, name);
+    const [oldTmp, oldStale, freshTmp, freshStale, oldDirectory, job] = [leftoverName("tmp"), leftoverName("stale"), leftoverName("tmp"), leftoverName("stale"), leftoverName("tmp"), "11111111-1111-1111-1111-111111111111"];
+    await aged(at(oldTmp), 120_000); await aged(at(oldStale), 120_000);
+    await aged(at(freshTmp), 1000); await aged(at(freshStale), 1000);
+    // Look-alikes that are not lock temporaries: an old directory with a leftover's name, a non-UUID name, a job directory.
+    await fs.mkdir(at(oldDirectory)); await aged(at(".lock.backup.tmp"), 120_000); await fs.mkdir(at(job)); await aged(at(`${job}/job.json`), 120_000);
+    const old = new Date(Date.now() - 120_000); await fs.utimes(at(oldDirectory), old, old); await fs.utimes(at(job), old, old);
+    const { lines, events } = await acquire(directory, { staleAfterMs: 60_000 });
+    expect(events()).toEqual([{ event: "lock_leftovers_removed", count: 2 }]);
+    expect(lines[0]).not.toContain(directory);
+    expect((await strays(directory)).sort()).toEqual([freshTmp, freshStale, oldDirectory, ".lock.backup.tmp"].sort());
+    expect(await exists(at(`${job}/job.json`))).toBe(true);
+    expect(await tokenIn(directory)).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  test("with reclaim disabled the sweep still waits for the default threshold, and nothing to sweep logs nothing", async () => {
+    const directory = await dataDir(), young = leftoverName("stale"), old = leftoverName("stale");
+    await aged(path.join(directory, young), DEFAULT_LOCK_STALE_AFTER_MS - 10_000); await aged(path.join(directory, old), DEFAULT_LOCK_STALE_AFTER_MS + 10_000);
+    const { events } = await acquire(directory, { staleAfterMs: 0 });
+    expect(events()).toEqual([{ event: "lock_leftovers_removed", count: 1 }]);
+    expect(await strays(directory)).toEqual([young]);
+    const clean = await dataDir();
+    expect((await acquire(clean)).lines).toEqual([]);
+  });
+
+  test("the heartbeat sweeps at most once per threshold", async () => {
+    const directory = await dataDir();
+    let offset = 0, beats = 0;
+    const { events } = await acquire(directory, { staleAfterMs: 60_000, heartbeatMs: 10, now: () => { beats++; return Date.now() + offset; } });
+    const first = path.join(directory, leftoverName("tmp"));
+    await aged(first, 0);
+    // Time passes: the leftover is now older than the threshold and a sweep is due.
+    offset = 120_000;
+    await waitFor(async () => !(await exists(first)), { label: "heartbeat sweep" });
+    expect(events()).toEqual([{ event: "lock_leftovers_removed", count: 1 }]);
+    // Another old leftover waits for the next sweep, one threshold later.
+    const second = path.join(directory, leftoverName("stale"));
+    await aged(second, 600_000);
+    const seen = beats; await waitFor(() => beats >= seen + 10, { label: "several heartbeats" });
+    expect(await exists(second)).toBe(true);
+    offset += 60_000;
+    await waitFor(async () => !(await exists(second)), { label: "next heartbeat sweep" });
+    expect(events()).toEqual([{ event: "lock_leftovers_removed", count: 1 }, { event: "lock_leftovers_removed", count: 1 }]);
+  });
+
+  test("lock_heartbeat_failed is logged once per run of failures and re-armed by a successful heartbeat", async () => {
+    const directory = await dataDir();
+    let failWith: string | undefined = "EIO", failures = 0, successes = 0;
+    const rename = spyOn(fs, "rename").mockImplementation((async (from: any, to: any) => {
+      if (String(to) === lockFile(directory)) { if (failWith) { failures++; throw errno(failWith); } successes++; }
+      return realRename(from, to);
+    }) as typeof fs.rename);
+    try {
+      const { events } = await acquire(directory, { heartbeatMs: 10 });
+      await waitFor(() => failures >= 5, { label: "several failed heartbeats" });
+      expect(events()).toEqual([{ event: "lock_heartbeat_failed", code: "EIO" }]);
+      failWith = undefined;
+      await waitFor(() => successes >= 1, { label: "a successful heartbeat" });
+      expect(events()).toHaveLength(1);
+      failWith = "ENOSPC"; const before = failures;
+      await waitFor(() => failures >= before + 5, { label: "a second run of failures" });
+      expect(events()).toEqual([{ event: "lock_heartbeat_failed", code: "EIO" }, { event: "lock_heartbeat_failed", code: "ENOSPC" }]);
+      // A failed rewrite never leaves its temporary behind.
+      expect(await strays(directory)).toEqual([]);
+    } finally { rename.mockRestore(); }
+  });
+
+  test("a contender whose moved stale lock vanished (swept by a resumed holder) fails cleanly", async () => {
+    const directory = await dataDir();
+    await leftover(directory, 120_000);
+    const rename = spyOn(fs, "rename").mockImplementation((async (from: any, to: any) => {
+      await realRename(from, to);
+      if (String(to).endsWith(".stale")) await realRm(to, { force: true });
+    }) as typeof fs.rename);
+    try { await expect(acquireLock(directory, { staleAfterMs: 60_000, log: () => {} })).rejects.toBeInstanceOf(LockHeldError); }
+    finally { rename.mockRestore(); }
+  });
+
   test("two acquirers racing on a stale lock: exactly one wins and the lock carries its token", async () => {
     for (let round = 0; round < 20; round++) {
       const directory = await dataDir();
@@ -212,7 +298,7 @@ describe("data-directory lock", () => {
   });
 });
 
-describe("purge-owner --apply and the lock", () => {
+describe("purge-owner and the lock", () => {
   const alice = { tenantId: "team", agentId: "alice" };
   async function volume() {
     const directory = await dataDir(), id = "11111111-1111-1111-1111-111111111111";
@@ -260,5 +346,33 @@ describe("purge-owner --apply and the lock", () => {
       expect(lines.map(line => JSON.parse(line).event)).toEqual(["stale_lock_reclaimed", "lock_lost"]);
       expect(await tokenIn(directory)).toBe(FOREIGN);
     } finally { gate.restore(); }
+  });
+
+  test("a dry run proceeds read-only past a stale lock with one note, and leaves the lock exactly as it was", async () => {
+    const { directory } = await volume();
+    await leftover(directory, 120_000);
+    const before = await fs.readFile(lockFile(directory), "utf8"), mtime = (await fs.stat(lockFile(directory))).mtimeMs, lines: string[] = [];
+    const report = await purgeOwnerJobs(directory, alice, false, { staleAfterMs: 60_000, log: line => { lines.push(line); } });
+    expect(report).toMatchObject({ applied: false, jobs: [{ result: "listed" }] });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/^Note: MD_DATA_DIR\/\.lock was last refreshed \d+ ms ago \(older than MD_LOCK_STALE_AFTER_MS=60000\)/);
+    expect(lines[0]).not.toContain(directory);
+    expect(await fs.readFile(lockFile(directory), "utf8")).toBe(before);
+    expect((await fs.stat(lockFile(directory))).mtimeMs).toBe(mtime);
+    expect(await strays(directory)).toEqual([]);
+  });
+
+  test("a dry run still refuses a fresh lock, and any lock when reclaim is disabled", async () => {
+    const { directory } = await volume();
+    for (const [ageMs, staleAfterMs, hint] of [[1000, 60_000, "older than 60000 ms"], [30 * 86_400_000, 0, "Automatic reclaim is disabled"]] as const) {
+      await leftover(directory, ageMs);
+      const lines: string[] = [];
+      const error = await purgeOwnerJobs(directory, alice, false, { staleAfterMs, log: line => { lines.push(line); } }).catch(caught => caught);
+      expect(error).toBeInstanceOf(PurgeRefused);
+      expect(error.message).toContain("A lock file exists (MD_DATA_DIR/.lock). Stop the service if it is running.");
+      expect(error.message).toContain(hint);
+      expect(lines).toEqual([]);
+      expect(await tokenIn(directory)).toBe(FOREIGN);
+    }
   });
 });
