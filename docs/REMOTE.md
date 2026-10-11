@@ -115,6 +115,7 @@ For PowerShell use `$env:MCP_URL='...'` (and similarly for other variables) inst
 | `MD_CONVERSION_TIMEOUT_MS` | 120,000 (2 minutes) | Converter process deadline |
 | `MD_CONCURRENCY` | 2 | Maximum active converters |
 | `MD_SHUTDOWN_TIMEOUT_MS` | 10,000 (10 seconds) | Graceful shutdown deadline after SIGTERM, SIGINT or SIGHUP; when it passes the server closes every connection and exits 1. Keep the container `stop_grace_period` (15s in the bundled Compose files) above it. A value above 15,000 still starts, but logs one `{"event":"shutdown_timeout_warning","shutdown_timeout_ms":N,"ceiling_ms":15000}` line on stderr at startup |
+| `MD_LOCK_STALE_AFTER_MS` | 60,000 (60 seconds) | Age (time since the data-volume `.lock` was last modified; a live holder refreshes it every 5 seconds) after which startup and `purge-owner --apply` reclaim a lock left by a SIGKILL, OOM kill or host crash, logging one `{"event":"stale_lock_reclaimed","age_ms":N}` line on stderr. `0` never reclaims (an operator must remove the lock); otherwise at least 15,000. See [the data volume lock](MULTITENANT.md#the-data-volume-lock) |
 | `MD_QUOTA_OVERRIDES_FILE` | unset | Optional operator-managed per-principal agent caps; see [MULTITENANT.md](MULTITENANT.md#operator-quota-overrides) |
 | `MD_MAX_TENANT_JOBS` | 25 | Live job limit per tenant; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
 | `MD_MAX_TENANT_STORAGE_BYTES` | 134,217,728 (128 MiB) | Reservation budget per tenant; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |

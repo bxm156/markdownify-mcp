@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { loadAuthenticator } from "./auth.js";
 import { quotaKey, validatePrincipal, type QuotaOverride } from "./identity.js";
+import { parseLockStaleAfterMs } from "./lock.js";
 
 /** Override-file field names, mapped to the QuotaOverride keys they set. */
 const overrideFields = { max_jobs: "maxJobs", max_storage_bytes: "maxStorageBytes", max_concurrency: "maxConcurrency" } as const;
@@ -132,6 +133,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   return {
     authenticator, publicBaseUrl, allowedHosts, port, host: env.MD_HOST ?? "127.0.0.1",
     shutdownTimeoutMs: integer("MD_SHUTDOWN_TIMEOUT_MS", 10_000),
+    // Age after which a data-directory lock that is no longer refreshed is reclaimed at startup (lock.ts); 0 never reclaims.
+    lockStaleAfterMs: parseLockStaleAfterMs(env.MD_LOCK_STALE_AFTER_MS),
     jobs: {
       dataDir: path.resolve(env.MD_DATA_DIR ?? "./data"),
       maxUploadBytes: integer("MD_MAX_UPLOAD_BYTES", 25 * 1024 * 1024),

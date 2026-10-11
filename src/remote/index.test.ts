@@ -235,6 +235,49 @@ describe("remote entry point", () => {
     expect((await terminated(second)).code).toBe(0);
   }), TEST_TIMEOUT);
 
+  test.concurrent("a SIGKILLed server's lock is reclaimed once stale, so a restart recovers without manual removal, and the old holder would be fenced", withScope(async scope => {
+    const scratch = await scope.tempDir("markdownify-index-scratch-"), dataDir = await scope.tempDir("markdownify-index-"), lock = path.join(dataDir, ".lock");
+    const { script, pidFile } = await scope.hangingConverter(scratch);
+    const env = { MD_LOCK_STALE_AFTER_MS: "15000" };
+    const first = scope.start({ port: await freePort(), dataDir, converter: script, env });
+    await ready(first);
+    const id = await startRunningJob(first, pidFile);
+    first.child.kill("SIGKILL");
+    expect((await terminated(first)).signal).toBe("SIGKILL");
+    // With reclaim disabled the old behaviour holds: exit 1 and the manual-removal hint.
+    const disabled = scope.start({ port: await freePort(), dataDir, converter: script, env: { MD_LOCK_STALE_AFTER_MS: "0" } });
+    expect((await terminated(disabled)).code).toBe(1);
+    expect(disabled.output().stderr).toContain("Automatic reclaim is disabled (MD_LOCK_STALE_AFTER_MS=0)");
+    expect(disabled.output().stderr).toContain("remove MD_DATA_DIR/.lock");
+    // A leftover younger than the threshold is refused too, and the hint says when it will be reclaimed.
+    const early = scope.start({ port: await freePort(), dataDir, converter: script, env });
+    expect((await terminated(early)).code).toBe(1);
+    expect(early.output().stderr).toContain("older than 15000 ms (MD_LOCK_STALE_AFTER_MS) unless MD_LOCK_STALE_AFTER_MS=0");
+    // Age the crashed holder's lock past the threshold instead of waiting for it.
+    const then = new Date(Date.now() - 60_000); await fs.utimes(lock, then, then);
+
+    const second = scope.start({ port: await freePort(), dataDir, converter: script, env });
+    await ready(second);
+    const reclaimed = second.output().stderr.split("\n").filter(line => line.includes("stale_lock_reclaimed"));
+    expect(reclaimed).toHaveLength(1);
+    expect(JSON.parse(reclaimed[0]!)).toEqual({ event: "stale_lock_reclaimed", age_ms: expect.any(Number) });
+    expect(JSON.parse(reclaimed[0]!).age_ms).toBeGreaterThanOrEqual(60_000);
+    expect(await readJob(second, id)).toMatchObject({ status: "failed", error_code: "CONVERSION_INTERRUPTED" });
+    const { client, call } = await connect(second);
+    try {
+      const status = await call<{ status: string; error_info: { code: string; retryable: boolean } }>("get_conversion_status", { job_id: id });
+      expect(status).toMatchObject({ status: "failed", error_info: { code: "CONVERSION_INTERRUPTED", retryable: true } });
+    } finally { await client.close(); }
+    // Fencing: once another process owns the lock, the next heartbeat (within 5 s) stops this server with exit 1 and
+    // leaves the other process's lock in place.
+    const foreign = "4242\n00000000-0000-0000-0000-000000000000\n";
+    await fs.writeFile(lock, foreign);
+    expect(await terminated(second, 15_000)).toEqual({ code: 1, signal: null });
+    expect(second.output().stderr).toContain('{"event":"lock_lost"}');
+    expect(await fs.readFile(lock, "utf8")).toBe(foreign);
+    expect(second.output().stderr).not.toContain(API_KEY);
+  }), 40_000);
+
   test.concurrent("a SIGKILLed server leaves a running job that the next start recovers as CONVERSION_INTERRUPTED", withScope(async scope => {
     const scratch = await scope.tempDir("markdownify-index-scratch-"), dataDir = await scope.tempDir("markdownify-index-");
     const { script, pidFile } = await scope.hangingConverter(scratch);
