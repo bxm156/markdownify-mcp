@@ -8,18 +8,33 @@ jobs:
   remote:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Node 24 is the image default; Node 22 stays covered until engines.node moves past it.
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       # Pin the Node the smoke scripts and Node-subprocess tests spawn; the runner default drifts.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
+      # Node-only tests skip when node is missing; fail loudly if this leg runs another major.
+      - name: Check the Node major on PATH
+        shell: bash
+        run: |
+          actual="$(node --version)"
+          echo "node $actual"
+          case "$actual" in
+            "v${{ matrix.node }}."*) ;;
+            *) echo "::error::Expected Node ${{ matrix.node }}.x on PATH, got $actual"; exit 1 ;;
+          esac
       - run: bun install --frozen-lockfile --ignore-scripts
       - name: Type-check tests, scripts and examples
         run: bun run typecheck
@@ -54,6 +69,12 @@ jobs:
       - run: bun scripts/remote-converter-smoke.ts
       - name: Verify compiled Node JWT authentication and scoped uploads
         run: bun scripts/jwt-http-smoke.ts
+      # The smoke inherits NODE_OPTIONS into the compiled server it spawns, so any
+      # deprecated Node API the server reaches on this major throws and fails the run.
+      - name: Verify the compiled server reaches no deprecated Node API
+        run: bun scripts/jwt-http-smoke.ts
+        env:
+          NODE_OPTIONS: --throw-deprecation
       - name: Verify LiteLLM 1.104 anonymous health session
         run: |
           python -m pip install 'litellm[mcp]==1.104.0'
@@ -61,7 +82,25 @@ jobs:
           python -O scripts/litellm-health-smoke.py
       - name: Verify LiteLLM health smoke rejects 403, 500, timeout and unexpected success
         run: python -O scripts/litellm_health_smoke_test.py
-      - run: docker build -f Dockerfile.remote -t markdownify-remote:ci .
+      - name: Build the remote image on this leg's Node
+        run: docker build -f Dockerfile.remote --build-arg NODE_IMAGE=node:${{ matrix.node }}-bookworm-slim -t markdownify-remote:ci .
+      - name: Check the image's Node version and shared libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(docker run --rm --entrypoint node markdownify-remote:ci -p process.version)"
+          echo "image node $version"
+          case "$version" in
+            "v${{ matrix.node }}."*) ;;
+            *) echo "::error::Image runs Node $version, expected ${{ matrix.node }}.x"; exit 1 ;;
+          esac
+          # node is copied from the node image into the python runtime image: every library must resolve there.
+          libs="$(docker run --rm --entrypoint ldd markdownify-remote:ci /usr/local/bin/node)"
+          echo "$libs"
+          if grep -q 'not found' <<<"$libs"; then
+            echo "::error::node in the runtime image has unresolved shared libraries"
+            exit 1
+          fi
       - name: Verify container HTTP upload workflow
         shell: bash
         run: |
@@ -109,7 +148,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Check shell script syntax
         shell: bash
         run: for f in scripts/*.sh setup.sh; do bash -n "$f"; done

@@ -16,22 +16,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       # Pin the Node the smoke scripts and Node-subprocess tests spawn; the runner default drifts.
-      - uses: actions/setup-node@v4
+      # The published image runs Node 24 (Dockerfile.remote's NODE_IMAGE default), so test on that one.
+      - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
       # Parity with remote-mvp.yml. Before the image is pushed, this job repeats the source checks that are
       # cheap or that exercise what ships: typecheck, MD_* docs check, assert guard, bash -n and shellcheck,
-      # remote and full tests (MD_TEST_NETWORK=1), the converter, JWT and LiteLLM anonymous-health smokes,
-      # the fixture generator test, the stdio smoke's response-waiting test, compose file validation, and the
-      # candidate image with three isolated agents plus the upload-and-convert example.
+      # remote and full tests (MD_TEST_NETWORK=1), the converter, JWT (also with --throw-deprecation) and LiteLLM
+      # anonymous-health smokes, the fixture generator test, the stdio smoke's response-waiting test, compose file
+      # validation, the candidate image's Node version and shared libraries, and the candidate image with three
+      # isolated agents plus the upload-and-convert example.
       # It relies on remote-mvp.yml (which runs on the same commit) for the heavier or less relevant checks:
       # scripts/docker-smoke-test.sh (a second image build of the stdio Dockerfile, which is not published),
       # the single-key container smoke, and the LiteLLM -O run and negative-path harness (extra pip install and
@@ -49,6 +51,7 @@ jobs:
           MD_TEST_NETWORK=1 bun test
           bun scripts/remote-converter-smoke.ts
           bun scripts/jwt-http-smoke.ts
+          NODE_OPTIONS=--throw-deprecation bun scripts/jwt-http-smoke.ts
           python -m pip install 'litellm[mcp]==1.104.0'
           python scripts/litellm-health-smoke.py
       - name: Reject assert statements in Python scripts (python -O strips them)
@@ -103,6 +106,22 @@ jobs:
           push: false
           tags: markdownify-remote:publish-candidate
           build-args: VCS_REF=${{ github.sha }}
+      - name: Check the candidate's Node version and shared libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(docker run --rm --entrypoint node markdownify-remote:publish-candidate -p process.version)"
+          echo "image node $version"
+          case "$version" in
+            v24.*) ;;
+            *) echo "::error::Candidate runs Node $version, expected 24.x"; exit 1 ;;
+          esac
+          libs="$(docker run --rm --entrypoint ldd markdownify-remote:publish-candidate /usr/local/bin/node)"
+          echo "$libs"
+          if grep -q 'not found' <<<"$libs"; then
+            echo "::error::node in the candidate image has unresolved shared libraries"
+            exit 1
+          fi
       - name: Prepare disposable agent credentials
         run: bun scripts/create-test-agent-registry.ts "$RUNNER_TEMP/markdownify-agents.json" "$GITHUB_ENV"
       - name: Test candidate container with three isolated agents

@@ -75,7 +75,10 @@ function isVerificationError(code: string): boolean {
     code === "HOSTNAME_MISMATCH" ||
     code === "INVALID_CA" ||
     code === "INVALID_PURPOSE" ||
-    code === "PATH_LENGTH_EXCEEDED"
+    code === "PATH_LENGTH_EXCEEDED" ||
+    // Node's code for a certificate check it has no name for, e.g. "EE certificate key too weak" when a
+    // server's key is below OpenSSL security level 2 (Node 24 and later: RSA under 2048 bits).
+    code === "UNSPECIFIED"
   );
 }
 

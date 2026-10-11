@@ -2,7 +2,7 @@
 
 Remote Streamable HTTP MCP service: authenticated uploads, an on-disk job queue, markitdown conversion, paginated
 Markdown. Operator docs: `docs/REMOTE.md`, `docs/MULTITENANT.md`, `docs/JWT.md`, `docs/HEALTH.md`, `docs/ERRORS.md`.
-Built with `bun run build:remote` (tsc to `dist/remote/`), shipped as `Dockerfile.remote` and run by Node 22.
+Built with `bun run build:remote` (tsc to `dist/remote/`), shipped as `Dockerfile.remote` and run by Node 24 (`engines.node >= 22`; CI tests 22 and 24).
 
 ## Architecture
 
@@ -100,7 +100,7 @@ failure. The table lives in `docs/MULTITENANT.md` "Operator stderr events".
 ## Invariants
 
 - Linux only: no `win32` branches beyond the refusal (`WINDOWS_UNSUPPORTED_MESSAGE`, also in `purge-owner.ts`).
-- Production code must run under Node 22 from `dist/`. No Bun-only APIs (`Bun.*`, `bun:*`) outside tests.
+- Production code must run under Node 22 and 24 from `dist/`. No Bun-only APIs (`Bun.*`, `bun:*`) outside tests.
   `test-helpers.ts` and `*.test.ts` are excluded from the build.
 - Writes: temp file plus `rename` (`job.json.<uuid>.tmp`, `*.index.json.<uuid>.tmp`, `input.part`/`output.part`) with
   files at `0o600` and dirs at `0o700`. `wx` for exclusive creates.

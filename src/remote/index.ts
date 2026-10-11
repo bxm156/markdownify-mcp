@@ -121,7 +121,8 @@ export async function startRemoteServer(options: RemoteServerOptions): Promise<R
 
 /**
  * True only when this module is the program being run, so importing it (for example from a test) never starts a server.
- * Bun and Node 24+ provide `import.meta.main`; older Node compares the resolved script path with this module's file.
+ * Bun and Node 22.18+ / 24.2+ provide `import.meta.main`; older Node (including 24.0 and 24.1) compares the resolved
+ * script path with this module's file.
  */
 function isEntryPoint(): boolean {
   const flag = (import.meta as { main?: boolean }).main;
