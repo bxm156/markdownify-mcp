@@ -42,4 +42,6 @@ jobs:
           bun -e "if (!Bun.which('markitdown')) { console.error('markitdown is not on PATH'); process.exit(1); }"
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run typecheck
-      - run: bun test src/utils.test.ts src/Markdownify.test.ts src/download.test.ts src/server.test.ts src/tools.test.ts
+      # tsc plus the platform-neutral chmod step (a no-op on Windows).
+      - run: bun run build
+      - run: bun test src/utils.test.ts src/Markdownify.test.ts src/download.test.ts src/server.test.ts src/tools.test.ts src/index.test.ts src/proxyWarning.test.ts

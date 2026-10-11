@@ -23,13 +23,22 @@ jobs:
       - run: bun install --frozen-lockfile --ignore-scripts
       - name: Type-check tests, scripts and examples
         run: bun run typecheck
-      - name: Reject bare assert in Python scripts (python -O strips them)
-        shell: bash
+      - name: Check that every MD_* variable in src/remote is in docs/REMOTE.md
+        run: bun scripts/check-env-docs.ts
+      - name: Reject assert statements in Python scripts (python -O strips them)
         run: |
-          if grep -nE '^\s*assert ' scripts/*.py; then
-            echo '::error::Use an explicit raise instead of assert in scripts/*.py' >&2
-            exit 1
-          fi
+          # Parses each file, so the word "assert" in a comment, docstring or string is not flagged,
+          # while `assert x`, `assert(x)` and `if y: assert x` all are.
+          # TODO(#70): add mkdocs_hooks.py once its self-check uses explicit raises instead of assert.
+          python - scripts/*.py <<'PY'
+          import ast, sys
+          found = [f"{path}:{node.lineno}" for path in sys.argv[1:]
+                   for node in ast.walk(ast.parse(open(path, encoding="utf-8").read(), path))
+                   if isinstance(node, ast.Assert)]
+          for place in found:
+              print(f"::error file={place.split(':')[0]},line={place.split(':')[1]}::Use an explicit raise instead of assert (python -O strips it)")
+          sys.exit(1 if found else 0)
+          PY
       - run: bun run build:remote
       - run: bun test src/remote
       - run: python -m pip install 'markitdown[pdf,docx,xlsx,pptx]==0.1.5'

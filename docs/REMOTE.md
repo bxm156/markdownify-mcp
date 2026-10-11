@@ -42,7 +42,7 @@ Generate a key without storing it in the image:
 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-`MARKITDOWN_PATH` can point to an installed executable when it is not on PATH or in the project `.venv`. A bare name (the default, `markitdown`) is searched on PATH; empty PATH entries are skipped, so the working directory is never searched, and when PATH is unset the search list is `/usr/local/bin:/usr/bin:/bin`. If nothing is found the conversion fails and `/readyz` reports not ready; the server never falls back to a different lookup. The `/livez` endpoint (alias `/healthz`) is a liveness probe and `/readyz` checks storage and converter presence; neither proves a document can be converted; run the fixture smoke test below for converter validation.
+`MARKITDOWN_PATH` can point to an installed executable when it is not on PATH or in the project `.venv`. A bare name (the default, `markitdown`) is searched on PATH; empty PATH entries are skipped, so the working directory is never searched, and when PATH is unset the search list is `/usr/local/bin:/usr/bin:/bin`. If nothing is found the conversion fails and `/readyz` reports not ready; the server never falls back to a different lookup. The `/livez` endpoint (alias `/healthz`) is a liveness probe that returns 200 whenever the process is serving. `/readyz` returns 200 only after initialization, while the server is accepting work, with writable storage and free space, a converter executable that was found, and a working audit sink; otherwise it returns 503 (details in [HEALTH.md](HEALTH.md)). Neither proves a document can be converted; run the fixture smoke test below for converter validation.
 
 ## Docker deployment
 
@@ -116,6 +116,21 @@ For PowerShell use `$env:MCP_URL='...'` (and similarly for other variables) inst
 | `MD_CONCURRENCY` | 2 | Maximum active converters |
 | `MD_SHUTDOWN_TIMEOUT_MS` | 10,000 (10 seconds) | Graceful shutdown deadline after SIGTERM, SIGINT or SIGHUP; when it passes the server closes every connection and exits 1. Keep the container `stop_grace_period` (15s in the bundled Compose files) above it. A value above 15,000 still starts, but logs one `{"event":"shutdown_timeout_warning","shutdown_timeout_ms":N,"ceiling_ms":15000}` line on stderr at startup |
 | `MD_QUOTA_OVERRIDES_FILE` | unset | Optional operator-managed per-principal agent caps; see [MULTITENANT.md](MULTITENANT.md#operator-quota-overrides) |
+| `MD_MAX_TENANT_JOBS` | 25 | Live job limit per tenant; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_MAX_TENANT_STORAGE_BYTES` | 134,217,728 (128 MiB) | Reservation budget per tenant; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_MAX_TENANT_CONCURRENCY` | 1 | Maximum active converters per tenant; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_MAX_AGENT_JOBS` | 10 | Live job limit per agent (replaced by a matching `MD_QUOTA_OVERRIDES_FILE` entry); see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_MAX_AGENT_STORAGE_BYTES` | 134,217,728 (128 MiB) | Reservation budget per agent; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_MAX_AGENT_CONCURRENCY` | 1 | Maximum active converters per agent; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_LEGACY_OWNER` | unset | Operator-only recovery option: the owner adopted by job manifests written before jobs had owners. A JSON object with exactly the keys `tenantId` and `agentId`, each 1 to 64 characters from `A-Za-z0-9_-`, for example `{"tenantId":"default","agentId":"default"}`. Anything else stops startup; without it, such manifests are refused. See [MULTITENANT.md](MULTITENANT.md#operations) |
+| `MD_JWT_ISSUER` | Required in JWT mode | Exact trusted token issuer; see [JWT.md](JWT.md). Any `MD_JWT_*` variable selects JWT mode, which cannot be combined with `MD_API_KEY` or `MD_AUTH_FILE` |
+| `MD_JWT_AUDIENCE` | Required in JWT mode | Expected token audience; see [JWT.md](JWT.md) |
+| `MD_JWT_JWKS_URL` | Required in JWT mode | Pinned HTTPS public-key endpoint; see [JWT.md](JWT.md) |
+| `MD_JWT_MAX_TTL_SECONDS` | 300 | Maximum token lifetime (`exp - iat`), 1 to 3600; see [JWT.md](JWT.md) |
+| `MD_JWT_TOOL_PREFIX` | `markdownify-` | Optional gateway alias prefix accepted in tool scopes; see [JWT.md](JWT.md) |
+| `MD_JWT_ALLOW_HTTP_LOCALHOST` | unset | Set to `1` only in tests to allow a loopback HTTP JWKS URL; see [JWT.md](JWT.md) |
+
+`bun scripts/check-env-docs.ts` fails if a `MD_*` variable read under `src/remote` is missing from this table; CI runs it, so add a row when you add a variable.
 
 Storage reservations are conservative: even a small file reserves the full configured Markdown output limit. Increase storage or lower output limits to accommodate more live jobs. JSON manifests and scratch buffers add overhead; the application budget is not a filesystem quota. Use a dedicated volume with adequate free space. Store it on an encrypted disk if document confidentiality requires it. Do not log upload authorization headers or whole `create_upload` results in agent traces.
 
@@ -131,4 +146,4 @@ bun scripts/remote-converter-smoke.ts
 bun scripts/remote-http-smoke.ts
 ```
 
-The remote tests exercise authentication, upload/job lifecycle, limits, expiry, restart behavior, and Markdown pagination with controlled converter fixtures. The converter smoke script exercises actual MarkItDown against the repository's real PDF and newly generated OOXML DOCX, XLSX and PPTX files (the upstream Office samples are plain-text placeholders). The HTTP smoke script exercises MCP initialization/tool discovery, streaming PDF upload, conversion, paginated retrieval, and deletion. The dedicated `Remote MVP` GitHub workflow runs these checks on Linux, builds the image, starts a test container with a generated masked key, and verifies its HTTP workflow. Confirm the workflow succeeds before operating the public service. Live LiteLLM interoperability requires a separate deployment check; no deployment credentials are embedded in the repository.
+The remote tests exercise authentication, upload/job lifecycle, limits, expiry, restart behavior, and Markdown pagination with controlled converter fixtures. The converter smoke script (it runs the fixture generator with `PYTHON_PATH` if set, else `.venv/bin/python`, else `python` on PATH) exercises actual MarkItDown against the repository's real PDF and newly generated OOXML DOCX, XLSX and PPTX files (the upstream Office samples are plain-text placeholders). The HTTP smoke script exercises MCP initialization/tool discovery, streaming PDF upload, conversion, paginated retrieval, and deletion. The dedicated `Remote MVP` GitHub workflow runs these checks on Linux, builds the image, starts a test container with a generated masked key, and verifies its HTTP workflow. Confirm the workflow succeeds before operating the public service. Live LiteLLM interoperability requires a separate deployment check; no deployment credentials are embedded in the repository.

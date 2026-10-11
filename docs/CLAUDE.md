@@ -60,8 +60,8 @@ When the code below changes, update the matching doc in the same PR:
 | --- | --- |
 | `ERRORS.md` | the error catalog (every code, its recovery and `lookup_error`) |
 | `MULTITENANT.md` | "Audited events" table, lifecycle events and the stderr JSON events (`audit_sink_unavailable`, `audit_sink_recovered`, `audit_record_rejected`, `audit_rotation_failed`) |
-| `HEALTH.md` | `/livez`, `/readyz` and `get_service_health` readiness fields (`checks.*`, `limits.effective`) |
-| `REMOTE.md` | the env table: every `MD_*` variable, its default and meaning |
+| `HEALTH.md` | `/livez`, `/readyz` and `get_service_health` readiness fields (`checks.*`, `limits.effective`); `REMOTE.md` repeats the `/readyz` summary, keep both in step |
+| `REMOTE.md` | the env table: every `MD_*` variable read under `src/remote`, its default and meaning (`bun scripts/check-env-docs.ts` fails CI on a missing one) |
 | `JWT.md` | revocation and expiry bounds (JWT TTL, 5 s `iat` skew, 60 s JWKS cache, 5 s refresh cooldown, 300 s upload grant, retention) |
 | `CONTAINERS.md` | `Dockerfile.remote`, pinned versions, `docker-publish.yml` tags and secrets, compose files |
 
@@ -78,7 +78,9 @@ counts: the suites grow, and CI logs hold the current numbers.
 
 `docs.yml` only runs on the paths in its `paths:` filter (docs, `mkdocs.yml`,
 the hook, README/SKILL/PLAN, LICENSE, `examples/**`, `compose*.yaml`,
-`.env*.example`, and two workflow files). A code-only change that alters
-documented behaviour will not run the strict build, so also touch the affected
-doc (or run the build locally) and keep the filter in sync with any new repo
-file the docs link to.
+`.env*.example`, `Dockerfile.remote`, `scripts/**`, `src/remote/**`, and the
+`docker-publish.yml`, `docs.yml` and `remote-mvp.yml` workflows). The build takes
+under a minute, so remote code, scripts and CI changes run it too. Other
+code-only changes (the stdio server in `src/`) do not, so for those also touch
+the affected doc (or run the build locally) and keep the filter in sync with any
+new repo file the docs link to.
