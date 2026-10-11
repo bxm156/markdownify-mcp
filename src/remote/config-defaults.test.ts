@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { loadConfig, SHUTDOWN_TIMEOUT_WARN_MS } from "./config.js";
+import { DEFAULT_LOCK_STALE_AFTER_MS, HEARTBEAT_MS } from "./lock.js";
 
 const MiB = 1024 * 1024;
 const env = { MD_API_KEY: "a".repeat(32) };
@@ -11,6 +12,7 @@ test("every numeric default is pinned, including storage, concurrency and timing
   expect(config.port).toBe(8000);
   expect(config.host).toBe("127.0.0.1");
   expect(config.shutdownTimeoutMs).toBe(10_000);
+  expect(config.lockStaleAfterMs).toBe(60_000);
   expect(config.publicBaseUrl).toBe("http://localhost:8000");
   expect(config.allowedHosts).toEqual(["localhost:8000", "localhost:8000", "127.0.0.1:8000"]);
   expect(config.jobs).toEqual({
@@ -77,4 +79,15 @@ test("every numeric setting rejects empty, zero, negative, fractional and non-nu
   for (const name of ["MD_PORT", "MD_SHUTDOWN_TIMEOUT_MS", "MD_MAX_UPLOAD_BYTES", "MD_MAX_STORAGE_BYTES", "MD_MAX_JOBS", "MD_RETENTION_MS", "MD_UPLOAD_TTL_MS", "MD_CONVERSION_TIMEOUT_MS", "MD_MAX_OUTPUT_BYTES", "MD_CONCURRENCY", "MD_MAX_TENANT_JOBS", "MD_MAX_TENANT_STORAGE_BYTES", "MD_MAX_TENANT_CONCURRENCY", "MD_MAX_AGENT_JOBS", "MD_MAX_AGENT_STORAGE_BYTES", "MD_MAX_AGENT_CONCURRENCY"]) {
     for (const value of ["", "0", "-1", "1.5", "abc", "NaN", "Infinity"]) expect(() => loadConfig({ ...env, [name]: value }), `${name}=${JSON.stringify(value)}`).toThrow(name);
   }
+});
+test("MD_LOCK_STALE_AFTER_MS defaults to 60 s, accepts 0 (never reclaim) or at least three heartbeats, and changes nothing else", () => {
+  expect(DEFAULT_LOCK_STALE_AFTER_MS).toBe(60_000);
+  const defaults = loadConfig(env);
+  for (const [raw, value] of [["0", 0], [String(3 * HEARTBEAT_MS), 15_000], ["120000", 120_000]] as const) {
+    const changed = loadConfig({ ...env, MD_LOCK_STALE_AFTER_MS: raw });
+    expect(changed.lockStaleAfterMs).toBe(value);
+    expect({ ...changed, lockStaleAfterMs: defaults.lockStaleAfterMs, authenticator: undefined }).toEqual({ ...defaults, authenticator: undefined });
+  }
+  // Below three heartbeats a live holder could be taken for a dead one.
+  for (const raw of ["", " ", "-1", "1", "14999", "1.5", "abc", "NaN", "Infinity"]) expect(() => loadConfig({ ...env, MD_LOCK_STALE_AFTER_MS: raw }), JSON.stringify(raw)).toThrow("MD_LOCK_STALE_AFTER_MS must be 0 (never reclaim) or an integer of at least 15000");
 });

@@ -43,7 +43,7 @@ import { Converter, abortError, conversionAbort, createConverter } from "./conve
 import { quotaKey, validatePrincipal, type Principal, type QuotaOverride } from "./identity.js";
 import { checkRuntime, HEALTH_TIMEOUT_MS, MAX_TIMER_MS, type RuntimeHealth } from "./health.js";
 import { prepareMarkdownIndex, readMarkdownPage } from "./markdown.js";
-import { acquireLock, releaseLock } from "./lock.js";
+import { acquireLock, releaseLock, type LockOptions } from "./lock.js";
 import { AuditRecordError } from "./audit.js";
 
 import { ServiceError, errorInfo, lookupError, legacyCode, type ErrorCode, type ErrorDetails } from "./errors.js";
@@ -310,12 +310,13 @@ export class JobService {
   /**
    * Creates or tightens the data directory (0o700), takes its lock, loads and recovers the manifests, then starts the
    * periodic sweep and the scheduler. The sweep interval is the shortest of the retention period, the upload TTL and one
-   * minute. If loading fails the lock is released and the error rethrown.
+   * minute. If loading fails the lock is released and the error rethrown. `lock` configures stale-lock reclaim, the
+   * heartbeat and what happens when another process takes the lock over (acquireLock; defaults apply when omitted).
    */
-  async init() {
+  async init(lock: LockOptions = {}) {
     await fs.mkdir(this.options.dataDir, { recursive: true, mode: 0o700 });
     await fs.chmod(this.options.dataDir, 0o700);
-    this.lock = await acquireLock(this.options.dataDir);
+    this.lock = await acquireLock(this.options.dataDir, lock);
     try { await this.load(); } catch (error) { await releaseLock(this.lock); this.lock = undefined; throw error; }
     this.initialized = true;
     this.timer = setInterval(() => this.tick(), Math.min(this.options.retentionMs, this.options.uploadTtlMs, 60_000));

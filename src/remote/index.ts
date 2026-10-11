@@ -79,6 +79,9 @@ async function defaultCreateJobs(config: RemoteConfig) {
  * persists running conversions as CONVERSION_INTERRUPTED, waits for workers, the sweep and pending job operations, then
  * releases the lock); drop the remaining keep-alive and in-flight connections; wait for the server to close; disarm the
  * deadline. A clean shutdown never calls exit: the process ends once nothing else holds the event loop.
+ *
+ * Lock loss: init() passes `config.lockStaleAfterMs` and an onLost callback to the data-directory lock. If another
+ * process reclaims the lock (lock.ts fencing), the same shutdown runs and then exits with status 1.
  */
 export async function startRemoteServer(options: RemoteServerOptions): Promise<RemoteServer> {
   const { config } = options;
@@ -91,7 +94,9 @@ export async function startRemoteServer(options: RemoteServerOptions): Promise<R
   // Warn once, as a single-line JSON operator event, but still start: other runtimes may allow longer.
   if (config.shutdownTimeoutMs > SHUTDOWN_TIMEOUT_WARN_MS) log(JSON.stringify({ event: "shutdown_timeout_warning", shutdown_timeout_ms: config.shutdownTimeoutMs, ceiling_ms: SHUTDOWN_TIMEOUT_WARN_MS }));
   const jobs = await createJobs(config);
-  await jobs.init();
+  // Fencing (lock.ts): if another process takes the volume lock over, shut down and exit 1 (wired below, once shutdown exists).
+  let lockLost = false, onLockLost = () => { lockLost = true; };
+  await jobs.init({ staleAfterMs: config.lockStaleAfterMs, log, onLost: () => onLockLost() });
   const server = createServer(jobs, config);
   server.requestTimeout = REQUEST_TIMEOUT_MS;
   server.headersTimeout = HEADERS_TIMEOUT_MS;
@@ -102,10 +107,8 @@ export async function startRemoteServer(options: RemoteServerOptions): Promise<R
     });
   } catch (error) { await jobs.close(); throw error; }
   log(`Markdownify remote listening on ${config.host}:${config.port}`);
-  let shuttingDown = false;
-  const shutdown = async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+  let stopping: Promise<void> | undefined;
+  const stop = async () => {
     const deadline = setTimeout(() => { server.closeAllConnections(); processHandle.exit(1); }, config.shutdownTimeoutMs);
     deadline.unref();
     const stopped = new Promise<void>(resolve => server.close(() => resolve()));
@@ -114,6 +117,11 @@ export async function startRemoteServer(options: RemoteServerOptions): Promise<R
     await stopped;
     clearTimeout(deadline);
   };
+  const shutdown = async () => { if (stopping) return; stopping = stop(); await stopping; };
+  // The lock now belongs to another process: drain as on SIGTERM (jobs.close() interrupts running conversions), then exit 1.
+  // Nothing is released: lock.ts has already forgotten the lock, so neither releaseLock nor the exit hook touches the file.
+  onLockLost = () => { shutdown().catch(() => undefined); void stopping!.then(() => processHandle.exit(1), () => processHandle.exit(1)); };
+  if (lockLost) onLockLost();
   processHandle.once("SIGINT", () => { void shutdown(); });
   processHandle.once("SIGTERM", () => { void shutdown(); });
   // A closed terminal or supervisor hang-up would otherwise terminate without releasing the volume lock.

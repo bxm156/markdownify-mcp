@@ -59,8 +59,11 @@ Built with `bun run build:remote` (tsc to `dist/remote/`), shipped as `Dockerfil
   name is searched on `PATH` (`DEFAULT_PATH` when PATH is unset, empty entries skipped), and the file must be
   regular and `X_OK`. `checkRuntime` is single-flight, bounded by `HEALTH_TIMEOUT_MS`, and probes storage with
   `statfs` plus a `.health-<uuid>` file.
-- `lock.ts`: `MD_DATA_DIR/.lock` (pid plus token) is created with `wx`. It is never reclaimed automatically, and
-  errors carry `LOCK_REMOVAL_HINT`. `purge-owner.ts` is an operator CLI (`node dist/remote/purge-owner.js <dir>
+- `lock.ts`: `MD_DATA_DIR/.lock` (`pid`, token, `heartbeat=<ms>`) is created with `wx` and rewritten (temp + rename)
+  every `HEARTBEAT_MS`. A lock whose mtime is older than `MD_LOCK_STALE_AFTER_MS` (`config.lockStaleAfterMs`, default
+  60 000, 0 = never, else ≥ 15 000) is reclaimed: rename to a unique `.stale` name, verify inode and mtime, `wx`
+  create. A heartbeat that finds a foreign token logs `lock_lost` and calls `onLost` (index.ts: shutdown, exit 1).
+  Errors carry `reclaimHint` and `LOCK_REMOVAL_HINT`. `purge-owner.ts` is an operator CLI (`node dist/remote/purge-owner.js <dir>
   <tenant> <agent> [--apply]`, dry run by default). `--apply` holds the lock. Exit codes: 0 ok, 1 incomplete or
   refused, 2 usage.
 
@@ -81,7 +84,8 @@ Built with `bun run build:remote` (tsc to `dist/remote/`), shipped as `Dockerfil
 
 Single-line JSON (`console.error(JSON.stringify(...))`): `audit_sink_unavailable` {code}, `audit_sink_recovered`
 {via: write|probe}, `audit_record_rejected` {message: fixed string}, `audit_rotation_failed` {code},
-`shutdown_timeout_warning` {shutdown_timeout_ms, ceiling_ms}. Cleanup logs a prefix plus an object, not JSON:
+`shutdown_timeout_warning` {shutdown_timeout_ms, ceiling_ms}, `stale_lock_reclaimed` {age_ms}, `lock_lost` {},
+`lock_heartbeat_failed` {code}. Cleanup logs a prefix plus an object, not JSON:
 `Job cleanup failed {event: "job_cleanup_failed", job_id, status, code}` and `Job cleanup sweep incomplete
 {event: "job_cleanup_sweep_failed", ...}`. Plain lines: `Job audit unavailable <event> <id>`, `Job cleanup sweep
 failed`. Rule: an errno-style `code` (`/^[A-Z0-9_]{1,32}$/`, else `UNKNOWN`) and IDs only. Never paths, messages,

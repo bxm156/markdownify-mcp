@@ -200,7 +200,7 @@ Readiness reports the audit sink. After a failed audit write, from a caller's op
 
 A record the audit logger rejects before touching storage (for example `Invalid audit metadata`, which indicates a bug, not a disk problem) still refuses the operation with `AUDIT_UNAVAILABLE`, but does not mark the sink unavailable or affect readiness. Each distinct rejection message is logged once.
 
-Readiness transitions, rejected records and rotation failures are logged to stderr as single-line JSON for operator alerting. They carry no paths, error messages or metadata values:
+Readiness transitions, rejected records, rotation failures and data-volume lock events are logged to stderr as single-line JSON for operator alerting. They carry no paths, error messages or metadata values:
 
 | Event | When | Fields |
 | --- | --- | --- |
@@ -208,6 +208,9 @@ Readiness transitions, rejected records and rotation failures are logged to stde
 | `audit_sink_recovered` | The sink became available again | `via`: `write` (a write succeeded) or `probe` (two consecutive probes passed) |
 | `audit_record_rejected` | The logger rejected a record before writing; once per distinct message per process | `message`: a fixed string such as `Invalid audit metadata` |
 | `audit_rotation_failed` | A step of log rotation failed, so the triggering record was refused; once until a rotation succeeds | `code`: errno-style code such as `EBUSY`, `EACCES`, or `UNKNOWN` |
+| `stale_lock_reclaimed` | Startup (or `purge-owner --apply`) replaced a `.lock` left by a holder that stopped refreshing it (see [the lock](#the-data-volume-lock)); once per reclaim | `age_ms`: how long the lock file had not been modified |
+| `lock_lost` | A heartbeat found that `.lock` no longer carries this process's token (another process reclaimed it, or it was removed). The server then shuts down as on SIGTERM and exits 1; `purge-owner --apply` stops and exits 1. Neither removes the file | none |
+| `lock_heartbeat_failed` | A heartbeat could not read or rewrite `.lock`; once until a heartbeat succeeds. If it keeps failing for `MD_LOCK_STALE_AFTER_MS`, another process may reclaim the lock | `code`: errno-style code such as `EIO`, `EROFS`, or `UNKNOWN` |
 
 This milestone supplies application-level file isolation for distinct credentials, bounded resources, and restart-safe ownership. The converter subprocess is not a security sandbox against malicious document parser exploits. Use trusted document sources or additional parser isolation for hostile uploads. Multiple service replicas, distributed storage/queues, and a credential-management UI remain separate work.
 
@@ -238,9 +241,18 @@ The data volume contains:
 | `<job-id>/output.md`, `<job-id>/output.md.index.json` | Converted Markdown and its pagination index |
 | `<job-id>/input.part`, `output.part`, `job.json.<uuid>.tmp` | Crash partials; removed at startup |
 | `audit.jsonl`, `audit.jsonl.1`–`.3` | Metadata-only audit history shared by all agents |
-| `.lock` | PID (informational only) plus a random per-acquisition token of the running service, or of a running `purge-owner --apply`; removed when that process exits, but left behind by SIGKILL, an OOM kill or a host crash, and never removed by a process whose lock was replaced by another one |
+| `.lock` | PID (informational only), a random per-acquisition token and the last heartbeat time of the running service, or of a running `purge-owner --apply`; refreshed every 5 seconds and removed when that process exits. Left behind by SIGKILL, an OOM kill or a host crash until it is reclaimed as stale; never removed by a process whose lock was replaced by another one |
+| `.lock.<uuid>.tmp`, `.lock.<uuid>.stale` | Transient files of a heartbeat rewrite or a stale-lock reclaim |
 
-Stop the service before changing the volume. One process owns each data volume and loads every manifest only at startup, so edits under a running service race its in-memory state. The service creates `.lock` exclusively and refuses startup whenever that file exists, with `Data directory is in use: MD_DATA_DIR/.lock exists`. Graceful shutdown on SIGTERM, SIGINT or SIGHUP removes it, and so does every other process exit the runtime can observe: the forced exit when shutdown exceeds its deadline (`MD_SHUTDOWN_TIMEOUT_MS`, default 10 seconds), an uncaught exception, or a startup failure. A SIGKILL (`docker kill`, or `docker stop` exceeding `stop_grace_period`), an OOM kill or a host crash leaves it behind, and every restart then fails with that message. With `restart: unless-stopped` the container then keeps restarting and failing, so stop it explicitly before removing the lock. A process only ever removes a lock whose contents (its PID plus a random per-start token) it wrote itself, so a hung old process cannot remove a newer service's lock. Automatic PID-based reclamation is unsafe because PIDs are reused and differ between container namespaces, so remove a leftover lock manually:
+### The data volume lock
+
+Stop the service before changing the volume. One process owns each data volume and loads every manifest only at startup, so edits under a running service race its in-memory state. The service creates `.lock` exclusively, and startup fails with `Data directory is in use: MD_DATA_DIR/.lock exists` while another live process holds it. Graceful shutdown on SIGTERM, SIGINT or SIGHUP removes it, and so does every other process exit the runtime can observe: the forced exit when shutdown exceeds its deadline (`MD_SHUTDOWN_TIMEOUT_MS`, default 10 seconds), an uncaught exception, or a startup failure. A process only ever removes a lock that still carries its own random per-start token, so a hung old process cannot remove a newer service's lock.
+
+A SIGKILL (`docker kill`, or `docker stop` exceeding `stop_grace_period`), an OOM kill or a host crash cannot remove the file. PIDs are reused and differ between container namespaces, so ownership is never judged by PID. Instead the holder refreshes the lock every 5 seconds (a heartbeat: it rewrites the file through a temporary file and a rename, which also updates its modification time), and startup treats a lock whose file has not been modified for longer than `MD_LOCK_STALE_AFTER_MS` (default 60,000 ms, at least 15,000) as left by a dead process. It reclaims it, logs one `{"event":"stale_lock_reclaimed","age_ms":N}` line and starts normally. The age comes from the file's modification time on the volume, never from the heartbeat value written inside it, so a previous host with a skewed clock cannot make a dead lock look fresh. Until the threshold passes, startup fails and the error says when the lock will be reclaimed; with `restart: unless-stopped` the container therefore restarts a few times and then recovers on its own, with the job that was running recovered as `CONVERSION_INTERRUPTED`.
+
+Reclaim is safe against two processes starting at once: a contender first renames the stale file to a unique name, which only one process can do with that file, and checks that it moved the very file it judged stale (same inode and modification time) before creating its own lock exclusively. A contender that lost the race restores the winner's lock and fails like any other refused start. Every heartbeat also re-reads the file (fencing): if the token is no longer its own, for example because a paused process was presumed dead and its lock reclaimed, the process logs `{"event":"lock_lost"}`, shuts down as on SIGTERM (running conversions are interrupted) and exits 1 without removing anything. Reclaim relies on the modification time advancing on the shared volume, so keep the default on local and Docker volumes; on a network filesystem whose clock is unreliable, or anywhere two hosts might mount the same volume, set `MD_LOCK_STALE_AFTER_MS=0`.
+
+`MD_LOCK_STALE_AFTER_MS=0` disables reclaim and restores the manual procedure: every restart after a crash fails until an operator removes the lock. With `restart: unless-stopped` the container keeps restarting and failing, so stop it explicitly before removing the lock:
 
 ```sh
 docker compose -f compose.multitenant.yaml stop markdownify   # also stops a crash-restart loop
@@ -249,7 +261,11 @@ docker compose -f compose.multitenant.yaml run --rm --no-deps --entrypoint rm ma
 docker compose -f compose.multitenant.yaml start markdownify
 ```
 
-For a native process, stop it (and any supervisor that restarts it), confirm that it is not running, and run `rm -f "$MD_DATA_DIR/.lock"`. The purge tool refuses to run while any lock exists, and refuses a path that contains neither job manifests nor `audit.jsonl`. It follows a symlinked data directory and never reads document contents. It is a dry run unless `--apply` is given. A dry run reads manifests and file sizes only and writes nothing, so it also works on a read-only snapshot or mount. `--apply` needs write access and holds the lock for the whole run, so the service cannot start and load half-deleted directories during a purge. A completed purge, or one interrupted with SIGINT, SIGTERM or SIGHUP, leaves no lock; only SIGKILL (or an OOM kill or host crash) leaves one behind, to be removed as above:
+For a native process, stop it (and any supervisor that restarts it), confirm that it is not running, and run `rm -f "$MD_DATA_DIR/.lock"`.
+
+### Purging an owner's jobs
+
+A purge dry run refuses to run while any lock exists, and refuses a path that contains neither job manifests nor `audit.jsonl`. It follows a symlinked data directory and never reads document contents. It is a dry run unless `--apply` is given. A dry run reads manifests and file sizes only and writes nothing, so it also works on a read-only snapshot or mount. `--apply` needs write access and holds the lock for the whole run, heartbeating like the service, so the service cannot start and load half-deleted directories during a purge. It reads `MD_LOCK_STALE_AFTER_MS` too (the Compose commands below inherit it from the env file), so it reclaims a stale crash leftover the same way; if it loses the lock mid-run it stops before the next deletion, prints `Purge aborted: another process took over MD_DATA_DIR/.lock ...` and exits 1. A completed purge, or one interrupted with SIGINT, SIGTERM or SIGHUP, leaves no lock; only SIGKILL (or an OOM kill or host crash) leaves one behind, reclaimed or removed as above:
 
 ```sh
 docker compose -f compose.multitenant.yaml stop markdownify
