@@ -23,7 +23,7 @@ python-pptx), run as a subprocess. `resolveMarkitdownPath` (`src/utils.ts`, shar
 - **Bun 1.4.2** for install, build, test and scripts. Never npm, pnpm or yarn; do not add other lockfiles.
 - **Node 22** is the production runtime of the remote server (`engines.node >= 22`, `@types/node ^22`,
   image `node:22`). Some tests and smokes spawn `node` from PATH, so have Node 22 installed.
-- **Python + markitdown 0.1.5** in `.venv` (CI and images use Python 3.12; `.python-version` says 3.11, which also works).
+- **Python 3.12 + markitdown 0.1.5** in `.venv` (`.python-version`, CI and the images all say 3.12; `pyproject.toml` pins the converter).
   Create it with `uv sync` (pyproject.toml + uv.lock) or `./setup.sh` (`setup.bat` on Windows); details in TESTING.md.
 - **TypeScript** strict, ESM (`"type": "module"`), `module`/`moduleResolution` Node16: relative imports
   need the `.js` suffix. `tsconfig.json` builds `src/` only; `tsconfig.check.json` also type-checks tests,

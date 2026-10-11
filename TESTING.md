@@ -34,14 +34,13 @@ re-creates `.venv` with the system `python3` and an unpinned `markitdown[all]>=0
 Create `.venv` (any one of):
 
 ```sh
-uv sync                                    # pyproject.toml + uv.lock, Python from .python-version (3.11)
-./setup.sh                                 # python3 -m venv .venv; pip install "markitdown[all]>=0.1.5" (unpinned: got 0.1.8)
+uv sync                                    # pyproject.toml + uv.lock (markitdown[all]==0.1.5), Python from .python-version (3.12)
+./setup.sh                                 # python3 -m venv .venv; pip install "markitdown[all]==0.1.5"
 python3 -m venv .venv && .venv/bin/pip install 'markitdown[pdf,docx,xlsx,pptx]==0.1.5'   # exactly what CI pins
 ```
 
-Note: `uv.lock` is currently out of date with `pyproject.toml` (`uv sync --locked` fails), so a plain `uv sync`
-rewrites `uv.lock`; do not commit that change unless it is the point of your PR. Windows: `setup.bat`, converter at
-`.venv\Scripts\markitdown.exe`.
+`uv.lock` matches `pyproject.toml` (`uv lock --check` passes); if you change the Python dependencies, run `uv lock`
+and commit the lock with them. Windows: `setup.bat`, converter at `.venv\Scripts\markitdown.exe`.
 
 ## Test layout
 
