@@ -212,6 +212,12 @@ describe("dispatch", () => {
     });
     expect(res.isError).toBe(false);
     expect(fromRepo).toHaveBeenCalledTimes(1);
+    // Normalised by the schema: the empty string never reaches fromRepo.
+    expect(fromRepo).toHaveBeenCalledWith({
+      repoUrl: "owner/repo",
+      branch: undefined,
+      compress: undefined,
+    });
   });
 
   test("git-repo-to-markdown without url is an error", async () => {

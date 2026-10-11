@@ -21,15 +21,21 @@ const filepathArgs = z.strictObject({ filepath: z.string().min(1) });
  * A git branch, tag or commit (see gitRefProblem in utils.ts). Checked here
  * so a value such as `--upload-pack=<cmd>` is refused as invalid arguments
  * before anything runs; Markdownify.fromRepo checks it again. An empty
- * string is kept as "no branch" (the repository's default), as before.
+ * string is still accepted and means "no branch" (the repository's
+ * default): it is normalised to undefined, so "" never reaches fromRepo.
+ * Because of that transform, compare this schema with tools.ts as JSON
+ * Schema of the input (`io: "input"`).
  */
-const gitRef = z.string().superRefine((value, ctx) => {
-  if (value === "") return;
-  const problem = gitRefProblem(value);
-  if (problem) {
-    ctx.addIssue({ code: "custom", message: `not a valid git ref: ${problem}` });
-  }
-});
+const gitRef = z
+  .string()
+  .superRefine((value, ctx) => {
+    if (value === "") return;
+    const problem = gitRefProblem(value);
+    if (problem) {
+      ctx.addIssue({ code: "custom", message: `not a valid git ref: ${problem}` });
+    }
+  })
+  .transform((value) => (value === "" ? undefined : value));
 const gitRepoArgs = z.strictObject({
   url: z.string().min(1),
   branch: gitRef.optional(),
