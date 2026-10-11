@@ -1,0 +1,13 @@
+# examples/
+
+`upload-and-convert.ts` is the reference client for the remote server: connect over MCP Streamable HTTP, discover tools (direct or LiteLLM-prefixed), `create_upload`, stream the file with `PUT` to the returned scoped URL, `start_conversion`, poll `get_conversion_status` with backoff, then read `get_markdown` page by page (`next_offset`) into a new output file. It never overwrites output and never logs upload credentials.
+
+Run (Bun, from the repo root, server already running):
+`MCP_TOKEN=<token> bun examples/upload-and-convert.ts src/sample-data/test.pdf out.md`
+Env: `MCP_URL` (default `http://localhost:8000/mcp`), `MCP_TOKEN` (direct), or gateway mode with `LITELLM_API_KEY` + `MARKDOWNIFY_BASE_URL` (+ optional `MARKDOWNIFY_AGENT_TOKEN`, `MARKDOWNIFY_SERVER_ALIAS`), `CONVERSION_DEADLINE_MS` (default 300000). Plain HTTP only for loopback.
+
+CI: remote-mvp.yml runs it against the single-tenant container (`MD_API_KEY`) and the multitenant container (agent `a` from `MD_TEST_AGENT_KEYS`); docker-publish.yml runs it against the multitenant candidate; jwt-http-smoke.ts runs it in gateway mode. The Docker image `Dockerfile.remote` also copies it to `/app/examples/`. `bun run typecheck` type-checks it.
+
+Rule: keep it dependency-free beyond `@modelcontextprotocol/sdk` and Node built-ins, and runnable under both bun and node. Do not add packages or Bun-only APIs. Keep the CI-asserted output ("Test PDF content" from the sample PDF) and the usage line stable.
+
+Known gap: it currently imports `../src/remote/errors.js` (for `lookupError`). That works under bun in a checkout, but fails under plain `node` (ERR_MODULE_NOT_FOUND) and inside the image, which has no `src/` and no bun. Do not add further imports from `src/`; prefer removing this one.
