@@ -1,0 +1,15 @@
+# Normalise line endings: every text file is stored and checked out with LF.
+# Several source files were committed with CRLF or mixed endings, which made
+# diffs noisy and forced contributors to preserve per-file endings by hand.
+* text=auto eol=lf
+
+# Windows batch files must keep CRLF to run under cmd.exe.
+*.bat text eol=crlf
+
+# Binary fixtures and assets.
+*.jpg binary
+*.png binary
+*.pdf binary
+*.docx binary
+*.pptx binary
+*.xlsx binary
