@@ -182,7 +182,7 @@ describe("durable single tenant jobs", () => {
     const normalConverter = createConverter({ executable: process.execPath, maxOutputBytes: 1000 });
     await expect(normalConverter(nonzero, failedOutput, new AbortController().signal)).rejects.toThrow("conversion failed");
     // Deletion immediately after rejection must succeed, with no late flush
-    // recreating a partial artifact and no Windows open-handle failure.
+    // recreating a partial artifact.
     await fs.rm(failedOutput);
     await new Promise(resolve => setTimeout(resolve, 10));
     await expect(fs.stat(failedOutput)).rejects.toMatchObject({ code: "ENOENT" });

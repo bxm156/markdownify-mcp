@@ -17,15 +17,14 @@ The allowlist is PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, HTML, and JSON. The remote
 
 ## Local setup
 
+The remote server supports Linux only and ships as a Linux container image. The process refuses to start on Windows; run the container instead, for example with Docker Desktop (see [CONTAINERS.md](CONTAINERS.md)).
+
 Use Bun for this repository's package management. The portable remote build produces JavaScript runnable with Node 22 or later.
 
 ```sh
 bun install --frozen-lockfile --ignore-scripts
 python -m venv .venv
-# Unix:
 .venv/bin/pip install 'markitdown[pdf,docx,xlsx,pptx]==0.1.5'
-# Windows instead:
-# .venv\Scripts\python -m pip install "markitdown[pdf,docx,xlsx,pptx]==0.1.5"
 bun run build:remote
 ```
 
@@ -35,13 +34,15 @@ Copy `.env.remote.example` to `.env.remote`, set `MD_API_KEY` to a random secret
 node --env-file=.env.remote dist/remote/index.js
 ```
 
+Always start the server with the full `dist/remote/index.js` path, as above, as `bun run start:remote` does and as the image's `CMD` does. The module only starts a server when it is the program being run. Node releases that provide `import.meta.main` (22.18 and later 22.x, 24.2 and later) and Bun detect that directly; older Node, including Node 24.0 and 24.1, compares the started script path with the module's own file. There, `node dist/remote/index` (no `.js`) or `node dist/remote` loads the module but never starts the server, and the process exits with status 0 and no output.
+
 Generate a key without storing it in the image:
 
 ```sh
 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-`MARKITDOWN_PATH` can point to an installed executable when it is not on PATH or in the project `.venv`. The `/livez` endpoint (alias `/healthz`) is a liveness probe and `/readyz` checks storage and converter presence; neither proves a document can be converted; run the fixture smoke test below for converter validation.
+`MARKITDOWN_PATH` can point to an installed executable when it is not on PATH or in the project `.venv`. A bare name (the default, `markitdown`) is searched on PATH; empty PATH entries are skipped, so the working directory is never searched, and when PATH is unset the search list is `/usr/local/bin:/usr/bin:/bin`. If nothing is found the conversion fails and `/readyz` reports not ready; the server never falls back to a different lookup. The `/livez` endpoint (alias `/healthz`) is a liveness probe that returns 200 whenever the process is serving. `/readyz` returns 200 only after initialization, while the server is accepting work, with writable storage and free space, a converter executable that was found, and a working audit sink; otherwise it returns 503 (details in [HEALTH.md](HEALTH.md)). Neither proves a document can be converted; run the fixture smoke test below for converter validation.
 
 ## Docker deployment
 
@@ -103,18 +104,38 @@ For PowerShell use `$env:MCP_URL='...'` (and similarly for other variables) inst
 | `MD_AUTH_FILE` | Required for isolated agents | Trusted hashed credential registry; see [MULTITENANT.md](MULTITENANT.md) |
 | `MD_PUBLIC_BASE_URL` | `http://localhost:8000` | Direct upload origin |
 | `MD_HOST` / `MD_PORT` | `127.0.0.1` / `8000` | Listener; Compose overrides host to `0.0.0.0` |
-| `MD_ALLOWED_HOSTS` | Public host and local probe hosts | Explicit Host allowlist override |
+| `MD_ALLOWED_HOSTS` | Public host (with and without its default port, for example `example.com` and `example.com:443`) plus `localhost` and `127.0.0.1` on `MD_PORT` | Explicit Host allowlist override; replaces the whole default list |
 | `MD_DATA_DIR` | `./data` | Persistent temporary job directory |
 | `MD_MAX_UPLOAD_BYTES` | 26,214,400 (25 MiB) | Single input limit |
 | `MD_MAX_OUTPUT_BYTES` | 26,214,400 (25 MiB) | Markdown output limit |
-| `MD_MAX_STORAGE_BYTES` | 268,435,456 (256 MiB) | Reservation budget for input plus maximum output per live job |
+| `MD_MAX_STORAGE_BYTES` | 268,435,456 (256 MiB) | Reservation budget for input plus maximum output per live job; must be at least `1 + MD_MAX_OUTPUT_BYTES` |
 | `MD_MAX_JOBS` | 100 | Live job limit; storage reservation usually binds first |
 | `MD_RETENTION_MS` | 86,400,000 (24 hours) | Completed/failed result retention |
 | `MD_UPLOAD_TTL_MS` | 900,000 (15 minutes) | Abandoned upload expiry |
 | `MD_CONVERSION_TIMEOUT_MS` | 120,000 (2 minutes) | Converter process deadline |
 | `MD_CONCURRENCY` | 2 | Maximum active converters |
-| `MD_SHUTDOWN_TIMEOUT_MS` | 10,000 (10 seconds) | Graceful shutdown deadline after SIGTERM, SIGINT or SIGHUP; when it passes the server closes every connection and exits 1. Keep the container `stop_grace_period` (15s in the bundled Compose files) above it |
+| `MD_SHUTDOWN_TIMEOUT_MS` | 10,000 (10 seconds) | Graceful shutdown deadline after SIGTERM, SIGINT or SIGHUP; when it passes the server closes every connection and exits 1. Keep the container `stop_grace_period` (15s in the bundled Compose files) above it. A value above 15,000 still starts, but logs one `{"event":"shutdown_timeout_warning","shutdown_timeout_ms":N,"ceiling_ms":15000}` line on stderr at startup |
+| `MD_LOCK_STALE_AFTER_MS` | 60,000 (60 seconds) | Age (time since the data-volume `.lock` was last modified; a live holder refreshes it every 5 seconds) after which startup and `purge-owner --apply` reclaim a lock left by a SIGKILL, OOM kill or host crash, logging one `{"event":"stale_lock_reclaimed","age_ms":N}` line on stderr. `0` never reclaims (an operator must remove the lock); otherwise at least 15,000. See [the data volume lock](MULTITENANT.md#the-data-volume-lock) |
 | `MD_QUOTA_OVERRIDES_FILE` | unset | Optional operator-managed per-principal agent caps; see [MULTITENANT.md](MULTITENANT.md#operator-quota-overrides) |
+| `MD_MAX_TENANT_JOBS` | 25 | Live job limit per tenant; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_MAX_TENANT_STORAGE_BYTES` | 134,217,728 (128 MiB) | Reservation budget per tenant; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_MAX_TENANT_CONCURRENCY` | 1 | Maximum active converters per tenant; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_MAX_AGENT_JOBS` | 10 | Live job limit per agent (replaced by a matching `MD_QUOTA_OVERRIDES_FILE` entry); see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_MAX_AGENT_STORAGE_BYTES` | 134,217,728 (128 MiB) | Reservation budget per agent; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_MAX_AGENT_CONCURRENCY` | 1 | Maximum active converters per agent; see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling) |
+| `MD_LEGACY_OWNER` | unset | Operator-only recovery option: the owner adopted by job manifests written before jobs had owners. A JSON object with exactly the keys `tenantId` and `agentId`, each 1 to 64 characters from `A-Za-z0-9_-`, for example `{"tenantId":"default","agentId":"default"}`. Anything else stops startup; without it, such manifests are refused. See [MULTITENANT.md](MULTITENANT.md#operations) |
+| `MD_JWT_ISSUER` | Required in JWT mode | Exact trusted token issuer; see [JWT.md](JWT.md). Any `MD_JWT_*` variable selects JWT mode, which cannot be combined with `MD_API_KEY` or `MD_AUTH_FILE` |
+| `MD_JWT_AUDIENCE` | Required in JWT mode | Expected token audience; see [JWT.md](JWT.md) |
+| `MD_JWT_JWKS_URL` | Required in JWT mode | Pinned HTTPS public-key endpoint; see [JWT.md](JWT.md) |
+| `MD_JWT_MAX_TTL_SECONDS` | 300 | Maximum token lifetime (`exp - iat`), 1 to 3600; see [JWT.md](JWT.md) |
+| `MD_JWT_TOOL_PREFIX` | `markdownify-` | Optional gateway alias prefix accepted in tool scopes; see [JWT.md](JWT.md) |
+| `MD_JWT_ALLOW_HTTP_LOCALHOST` | unset | Set to `1` only in tests to allow a loopback HTTP JWKS URL; see [JWT.md](JWT.md) |
+
+`bun scripts/check-env-docs.ts` fails if a `MD_*` variable read under `src/remote` is missing from this table; CI runs it, so add a row when you add a variable.
+
+The tenant and agent caps (`MD_MAX_TENANT_*`, `MD_MAX_AGENT_*`, see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling)) are checked against these at startup: an explicit value above its global cap, or any storage budget below `1 + MD_MAX_OUTPUT_BYTES`, stops startup with a message naming the variable, and an unset tenant or agent default is lowered to its global cap.
+
+The HTTP listener has two fixed deadlines, set in `src/remote/http.ts` (`REQUEST_TIMEOUT_MS`, `HEADERS_TIMEOUT_MS`) and not configurable: a client must send the complete request headers within 30 seconds and the whole request, headers and body, within 5 minutes; past either, Node answers 408 and closes the connection. The 5-minute request deadline bounds the slowest upload PUT, so a client must sustain about `MD_MAX_UPLOAD_BYTES / 300` bytes per second (roughly 85 KiB/s at the 25 MiB default). Keep reverse-proxy timeouts at or above these values. Idle keep-alive connections close after 5 seconds.
 
 Storage reservations are conservative: even a small file reserves the full configured Markdown output limit. Increase storage or lower output limits to accommodate more live jobs. JSON manifests and scratch buffers add overhead; the application budget is not a filesystem quota. Use a dedicated volume with adequate free space. Store it on an encrypted disk if document confidentiality requires it. Do not log upload authorization headers or whole `create_upload` results in agent traces.
 
@@ -130,4 +151,4 @@ bun scripts/remote-converter-smoke.ts
 bun scripts/remote-http-smoke.ts
 ```
 
-The remote tests exercise authentication, upload/job lifecycle, limits, expiry, restart behavior, and Markdown pagination with controlled converter fixtures. The converter smoke script exercises actual MarkItDown against the repository's real PDF and newly generated OOXML DOCX, XLSX and PPTX files (the upstream Office samples are plain-text placeholders). The HTTP smoke script exercises MCP initialization/tool discovery, streaming PDF upload, conversion, paginated retrieval, and deletion. The dedicated `Remote MVP` GitHub workflow runs these checks on Linux, builds the image, starts a test container with a generated masked key, and verifies its HTTP workflow. Confirm the workflow succeeds before operating the public service. Live LiteLLM interoperability requires a separate deployment check; no deployment credentials are embedded in the repository.
+The remote tests exercise authentication, upload/job lifecycle, limits, expiry, restart behavior, and Markdown pagination with controlled converter fixtures. The converter smoke script (it runs the fixture generator with `PYTHON_PATH` if set, else `.venv/bin/python`, else `python` on PATH) exercises actual MarkItDown against the repository's real PDF and newly generated OOXML DOCX, XLSX and PPTX files (the upstream Office samples are plain-text placeholders). The HTTP smoke script exercises MCP initialization/tool discovery, streaming PDF upload, conversion, paginated retrieval, and deletion. The dedicated `Remote MVP` GitHub workflow runs these checks on Linux, builds the image, starts a test container with a generated masked key, and verifies its HTTP workflow. Confirm the workflow succeeds before operating the public service. Live LiteLLM interoperability requires a separate deployment check; no deployment credentials are embedded in the repository.

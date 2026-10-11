@@ -16,16 +16,29 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # Pin the Node the smoke scripts and Node-subprocess tests spawn; the runner default drifts.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - run: bun install --frozen-lockfile --ignore-scripts
       - name: Type-check tests, scripts and examples
         run: bun run typecheck
-      - name: Reject bare assert in Python scripts (python -O strips them)
-        shell: bash
+      - name: Check that every MD_* variable in src/remote is in docs/REMOTE.md
+        run: bun scripts/check-env-docs.ts
+      - name: Reject assert statements in Python scripts (python -O strips them)
         run: |
-          if grep -nE '^\s*assert ' scripts/*.py; then
-            echo '::error::Use an explicit raise instead of assert in scripts/*.py' >&2
-            exit 1
-          fi
+          # Parses each file, so the word "assert" in a comment, docstring or string is not flagged,
+          # while `assert x`, `assert(x)` and `if y: assert x` all are.
+          # TODO(#70): add mkdocs_hooks.py once its self-check uses explicit raises instead of assert.
+          python - scripts/*.py <<'PY'
+          import ast, sys
+          found = [f"{path}:{node.lineno}" for path in sys.argv[1:]
+                   for node in ast.walk(ast.parse(open(path, encoding="utf-8").read(), path))
+                   if isinstance(node, ast.Assert)]
+          for place in found:
+              print(f"::error file={place.split(':')[0]},line={place.split(':')[1]}::Use an explicit raise instead of assert (python -O strips it)")
+          sys.exit(1 if found else 0)
+          PY
       - run: bun run build:remote
       - run: bun test src/remote
       - run: python -m pip install 'markitdown[pdf,docx,xlsx,pptx]==0.1.5'
@@ -66,6 +79,14 @@ jobs:
           MCP_TOKEN="$MD_API_KEY" CONVERSION_DEADLINE_MS=120000 \
             bun examples/upload-and-convert.ts src/sample-data/test.pdf "$example_output"
           grep -q 'Test PDF content' "$example_output"
+          # The same helper under plain Node (no Bun, no src/), then the compiled copy inside the image.
+          node_output="$RUNNER_TEMP/upload-and-convert-node.md"
+          MCP_TOKEN="$MD_API_KEY" CONVERSION_DEADLINE_MS=120000 \
+            node --experimental-strip-types --no-warnings examples/upload-and-convert.ts src/sample-data/test.pdf "$node_output"
+          grep -q 'Test PDF content' "$node_output"
+          docker run --rm --network container:markdownify-ci -e MCP_TOKEN="$MD_API_KEY" -e CONVERSION_DEADLINE_MS=120000 \
+            -v "$PWD/src/sample-data:/in:ro" markdownify-remote:ci \
+            sh -c 'node examples/upload-and-convert.js /in/test.pdf /tmp/image-example.md && grep -q "Test PDF content" /tmp/image-example.md'
       - name: Prepare disposable agent registry
         run: bun scripts/create-test-agent-registry.ts "$RUNNER_TEMP/markdownify-agents.json" "$GITHUB_ENV"
       - name: Verify container agent isolation
@@ -79,6 +100,12 @@ jobs:
             -e MD_PUBLIC_BASE_URL=http://localhost:8000 markdownify-remote:ci
           bash scripts/wait-for-container.sh markdownify-agents-ci
           bun scripts/multitenant-http-smoke.ts
+          # The documented streaming helper against the same multitenant container, as agent "a".
+          # MD_TEST_AGENT_KEYS (JSON, masked) was exported by the registry step through GITHUB_ENV.
+          example_output="$RUNNER_TEMP/multitenant-upload-and-convert.md"
+          MCP_TOKEN="$(jq -r .a <<<"$MD_TEST_AGENT_KEYS")" CONVERSION_DEADLINE_MS=120000 \
+            bun examples/upload-and-convert.ts src/sample-data/test.pdf "$example_output"
+          grep -q 'Test PDF content' "$example_output"
   stdio-and-compose:
     runs-on: ubuntu-latest
     timeout-minutes: 25

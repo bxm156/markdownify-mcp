@@ -1,3 +1,17 @@
+/**
+ * Runs markitdown as a child process to convert one uploaded file to Markdown.
+ *
+ * The child gets the input path as its only argument (no shell); stdout streams through a byte limit into the output
+ * file (created exclusively, mode 0o600), and stderr is drained and discarded. Exit status 0 is success. On abort or
+ * failure the child is killed with SIGKILL.
+ *
+ * Abort reasons (conversionAbort) and the codes a failed job persists:
+ *   cancelled    409 CONVERSION_CANCELLED    delete_job during conversion; also any abort without a recognised reason
+ *   interrupted  503 CONVERSION_INTERRUPTED  graceful shutdown; the same retryable code as crash recovery
+ *   timedOut     504 CONVERSION_TIMEOUT      the MD_CONVERSION_TIMEOUT_MS deadline, with details.timeout_ms
+ * Other failures: a nonzero exit is 422 CONVERSION_FAILED, output over the limit is 413 OUTPUT_LIMIT_EXCEEDED, and any
+ * other error (such as a missing executable) becomes INTERNAL_ERROR in the job service.
+ */
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { Transform } from "node:stream";
@@ -6,6 +20,7 @@ import { resolveMarkitdownPath } from "../utils.js";
 import { ServiceError } from "./errors.js";
 import { resolveConverterExecutable } from "./health.js";
 
+/** Writes the Markdown for `inputPath` to a new file at `outputPath`, honouring `signal`; rejects with a ServiceError or an errno-style Error. */
 export type Converter = (inputPath: string, outputPath: string, signal: AbortSignal) => Promise<void>;
 
 /** Abort reasons for a running conversion. Each carries the error code that the failed job keeps. */
@@ -17,6 +32,7 @@ export const conversionAbort = {
   /** The MD_CONVERSION_TIMEOUT_MS deadline. */
   timedOut: (timeoutMs: number) => new ServiceError(504, "Conversion timed out", "CONVERSION_TIMEOUT", { timeout_ms: timeoutMs }),
 };
+/** Codes that mark a ServiceError as one of the conversionAbort reasons. */
 const abortCodes = new Set<string>(["CONVERSION_CANCELLED", "CONVERSION_INTERRUPTED", "CONVERSION_TIMEOUT"]);
 /** The error for an aborted signal: its reason when that is a conversion abort reason, otherwise a cancellation. */
 export function abortError(signal: AbortSignal): ServiceError {
@@ -24,19 +40,20 @@ export function abortError(signal: AbortSignal): ServiceError {
   return reason instanceof ServiceError && abortCodes.has(reason.code) ? reason : conversionAbort.cancelled();
 }
 
-/** No shell is involved, so on win32 only `.exe`/`.com` converters run (see resolveConverterExecutable); stdout is
- * streamed and bounded, including during conversion. */
+/** Runs the converter without a shell; stdout is streamed and bounded, including during conversion. */
 export function createConverter(options: { maxOutputBytes: number; projectRoot?: string; executable?: string }): Converter {
   return async (inputPath, outputPath, signal) => {
     if (signal.aborted) throw abortError(signal);
+    // Resolution: options.executable, else resolveMarkitdownPath (MARKITDOWN_PATH, <projectRoot>/.venv/bin/markitdown, or
+    // "markitdown"), then resolveConverterExecutable's PATH rules (health.ts).
     const requested = options.executable ?? resolveMarkitdownPath(options.projectRoot ?? process.cwd());
-    // Spawn the file the health check reports, never a different search result. On POSIX an unresolved name is still
-    // handed to spawn so its error (ENOENT, EACCES) surfaces as before. On win32 spawn would search the working directory
-    // first and could pick a file health never saw, so an unresolved name fails here instead.
+    // Spawn exactly the file the health check reports, never a different search result. A miss fails closed: spawn would
+    // search its own way (for example with an unset or empty PATH) and could run a file health never saw.
+    // The code is ENOENT, which the job service maps to INTERNAL_ERROR.
     const executable = await resolveConverterExecutable(requested);
     if (signal.aborted) throw abortError(signal);
-    if (executable === undefined && process.platform === "win32") throw Object.assign(new Error("Converter executable not found"), { code: "ENOENT" });
-    const child = spawn(executable ?? requested, [inputPath], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    if (executable === undefined) throw Object.assign(new Error("Converter executable not found"), { code: "ENOENT" });
+    const child = spawn(executable, [inputPath], { stdio: ["ignore", "pipe", "pipe"] });
     let bytes = 0;
     // Drain stderr without retaining document contents or exposing server paths to clients.
     child.stderr.resume();
@@ -57,7 +74,7 @@ export function createConverter(options: { maxOutputBytes: number; projectRoot?:
     } catch (error) {
       stop();
       // A nonzero exit can arrive before the output stream has closed. Wait
-      // for both before the caller removes its partial output (also on Windows).
+      // for both before the caller removes its partial output.
       await Promise.allSettled([exited, streamed]);
       // A killed child exits nonzero; report why it was killed, not a document failure.
       throw signal.aborted ? abortError(signal) : error;

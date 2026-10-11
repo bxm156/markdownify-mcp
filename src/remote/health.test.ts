@@ -86,7 +86,10 @@ test("health measures storage, omits foreign usage, and fails readiness during s
     const r = await fetch(f.base + p, { method: "POST", headers: { Host: "127.0.0.1" } });
     expect(r.status).toBe(405); expect(r.headers.get("allow")).toBe("GET, HEAD");
   }
-  expect((await f.request({ jsonrpc: "2.0", id: 1, method: "ping" })).status).toBe(503);
+  // An anonymous probe while not ready is retryable SERVICE_UNAVAILABLE, not the generic REQUEST_REJECTED.
+  const unavailable = await f.request({ jsonrpc: "2.0", id: 1, method: "ping" });
+  expect(unavailable.status).toBe(503);
+  expect((await unavailable.json()).error_info).toMatchObject({ code: "SERVICE_UNAVAILABLE", retryable: true });
 });
 test("authenticated health tool returns only the caller's metrics", async () => {
   const f = await fixture();
@@ -107,7 +110,7 @@ test("real health detects missing converter and unwritable storage without leaki
   const f = await fixture();
   const previous = process.env.MARKITDOWN_PATH;
   try {
-    process.env.MARKITDOWN_PATH = path.join(f.dataDir, "private-missing.exe");
+    process.env.MARKITDOWN_PATH = path.join(f.dataDir, "private-missing");
     const h = await checkRuntime(path.join(f.dataDir, "absent"), false);
     expect(h.converter.available).toBe(false); expect(h.storage.writable).toBe(false);
     expect(JSON.stringify(h)).not.toContain(f.dataDir);
@@ -268,13 +271,13 @@ test("healthTimeoutMs above the setTimeout limit is rejected", () => {
 test("anonymous probe gating treats any present Authorization header as a credential that must verify", async () => {
   const f = await fixture();
   const ping = { jsonrpc: "2.0", id: 1, method: "ping" };
-  // The scheme match is case-sensitive today: a lowercase "bearer" with a valid registry token is rejected, not anonymous.
-  for (const authorization of ["", "Basic Zm9v", "bearer a", "Bearer "]) {
+  // A present header that does not verify is never treated as anonymous; the scheme itself is case-insensitive.
+  for (const authorization of ["", "Basic Zm9v", "bearer wrong", "Bearer "]) {
     const response = await f.request(ping, { Authorization: authorization });
     expect([authorization, response.status]).toEqual([authorization, 401]);
     expect(response.headers.get("www-authenticate")).toBe("Bearer");
   }
-  expect((await f.request(ping, { Authorization: "Bearer a" })).status).toBe(200);
+  for (const authorization of ["Bearer a", "bearer a", "BEARER a"]) expect((await f.request(ping, { Authorization: authorization })).status).toBe(200);
   expect((await f.request(ping)).status).toBe(200);
 });
 test("readyz 503 body stays minimal after shutdown", async () => {
@@ -303,7 +306,7 @@ test("livez stays 200 while readyz is 503 for unwritable storage or a missing co
   } finally { statfs.mockRestore(); }
   const previous = process.env.MARKITDOWN_PATH;
   try {
-    process.env.MARKITDOWN_PATH = path.join(f.dataDir, "private-missing.exe");
+    process.env.MARKITDOWN_PATH = path.join(f.dataDir, "private-missing");
     const g = await fixture(true, { converter: undefined });
     const ready = await fetch(g.base + "/readyz", { headers: { Host: "127.0.0.1" } });
     expect(ready.status).toBe(503);

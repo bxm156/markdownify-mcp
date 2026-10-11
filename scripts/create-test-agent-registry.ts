@@ -1,4 +1,14 @@
-/** CI-only fixture: random disposable credentials; never source production secrets. */
+/**
+ * CI-only fixture: random disposable credentials; never source production secrets.
+ *
+ * Writes a credential registry with three agents (a and b in tenantA, c in
+ * tenantB) holding only token hashes, masks the tokens in the GitHub Actions
+ * log (`::add-mask::`), and appends them to the given GITHUB_ENV file as
+ * MD_TEST_AGENT_KEYS={"a":...,"b":...,"c":...} for multitenant-http-smoke.ts.
+ *
+ * Usage: bun scripts/create-test-agent-registry.ts <registry.json> <github-env-file>
+ * The registry file must not exist yet.
+ */
 import { randomBytes, createHash } from "node:crypto";
 import fs from "node:fs/promises";
 

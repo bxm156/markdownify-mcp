@@ -115,13 +115,27 @@ test("jku, x5u, x5c and jwk headers are rejected before key resolution, whoever 
   // Unrelated optional headers remain fine.
   expect(await verifier().authenticate(await signed({}, { alg: "RS256", kid: "first", typ: "JWT", cty: "x" }))).not.toBeNull();
 });
-test("crit is rejected even for an extension the signer declares and jose itself would accept", async () => {
+test("crit is rejected before key resolution, even for an extension the signer declares and jose itself would accept", async () => {
   const token = await new SignJWT(claims()).setProtectedHeader({ alg: "RS256", kid: "first", crit: ["x-ext"], "x-ext": 1 }).sign(key.privateKey, { crit: { "x-ext": true } });
   // Control: a verifier told that the extension is understood accepts the very same token, so only the authenticator's own policy rejects it.
   await expect(jwtVerify(token, key.publicKey, { crit: { "x-ext": true }, issuer, audience })).resolves.toMatchObject({ protectedHeader: { crit: ["x-ext"], "x-ext": 1 } });
   await expect(jwtVerify(token, key.publicKey, { issuer, audience })).rejects.toThrow();
-  expect(await verifier().authenticate(token)).toBeNull();
-  expect(await kidBlind().authenticate(token)).toBeNull();
+  let resolved = 0;
+  const counting = createJwtAuthenticator({ issuer, audience, getKey: async () => { resolved++; return key.publicKey; } });
+  // Control: the counting resolver accepts a token without crit, so the resolver is not what rejects the cases below.
+  expect(await counting.authenticate(await signed())).not.toBeNull(); expect(resolved).toBe(1);
+  // Any crit member is refused, whatever its value (assembled and signed by hand, as jose refuses to sign most of them).
+  // crit: ["b64"] with b64: true is one jose verifies by default and would hand to the resolver; only jwt.ts refuses it.
+  const handSigned = async (header: Record<string, unknown>) => {
+    const input = `${b64({ alg: "RS256", kid: "first", ...header })}.${b64(claims())}`;
+    return `${input}.${Buffer.from(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key.privateKey as CryptoKey, Buffer.from(input))).toString("base64url")}`;
+  };
+  const tokens = [token, ...await Promise.all([{ crit: ["b64"], b64: true }, { crit: [] }, { crit: ["exp"] }, { crit: "x-ext", "x-ext": 1 }, { crit: null }, { crit: {} }, { crit: 0 }].map(handSigned))];
+  for (const [name, auth] of [["pinned JWKS", verifier()], ["resolver that trusts any kid", kidBlind()], ["counting resolver", counting]] as const) {
+    for (const [index, candidate] of tokens.entries()) expect(await auth.authenticate(candidate), `${name} #${index}`).toBeNull();
+  }
+  // The key resolver never runs for these tokens: no key lookup (and no JWKS fetch in production) happens for them.
+  expect(resolved).toBe(1);
 });
 test("exp, iat and sub must each be well-formed on their own", async () => {
   setSystemTime(new Date("2026-03-01T12:00:00Z"));
@@ -180,7 +194,10 @@ test("calls need the gateway call scope and a per-tool scope, with either the ba
 });
 test("a call-only token authenticates but cannot list tools", async () => {
   const f = await deployment(), c = await f.client("machine-a", "mcp:tools/call mcp:tools/lookup_error:call");
-  await expect(c.listTools()).rejects.toThrow("Scope not granted");
+  // The JSON-RPC error keeps its message and carries the errorResponse body in `data`.
+  const error = await c.listTools().then(() => undefined, (caught: unknown) => caught as { code: number; message: string; data: any });
+  expect(error?.code).toBe(-32600); expect(error?.message).toContain("Scope not granted");
+  expect(error?.data).toMatchObject({ error: "Scope not granted", error_info: { code: "AUTH_SCOPE_REQUIRED", retryable: false } });
   ok(await c.callTool({ name: "lookup_error", arguments: { code: "FILE_TOO_LARGE" } }));
 });
 

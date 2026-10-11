@@ -1,3 +1,8 @@
+/**
+ * Helpers shared by the remote server test files: polling, tool-result parsing, raw MCP requests and the JWT fixture.
+ * It imports bun:test, so tsconfig.json excludes it from the Node build. Servers, clients and temp data directories made
+ * through the JWT fixture are disposed by its close(); the other helpers leave nothing to clean up.
+ */
 import { expect } from "bun:test";
 import { SignJWT, generateKeyPair, exportJWK, createLocalJWKSet, type CryptoKey, type JWK } from "jose";
 import fs from "node:fs/promises";
@@ -13,16 +18,17 @@ import { createJwtAuthenticator } from "./jwt.js";
 
 /** Shared test utilities. Not imported by production code. */
 
+/** waitFor timing: overall deadline (default 2000 ms), poll interval (default 5 ms) and the label used in the timeout error. */
 export type WaitForOptions = { timeoutMs?: number; intervalMs?: number; label?: string };
 
-/**
- * Poll `predicate` until it returns a truthy value and return that value.
- * A predicate that throws counts as "not yet"; the last error is reported if the deadline passes.
- * Prefer this over fixed sleeps so tests wait for the actual state change.
- */
 /** The truthy members of T: `cond && value` predicates resolve to the value type alone. */
 export type Truthy<T> = Exclude<T, false | 0 | 0n | "" | null | undefined>;
 
+/**
+ * Polls `predicate` every `intervalMs` until it returns a truthy value, and returns that value. A predicate that
+ * throws counts as "not yet"; past `timeoutMs` this throws, quoting the last predicate error. Prefer it to fixed
+ * sleeps, so a test waits for the actual state change.
+ */
 export async function waitFor<T>(predicate: () => T | Promise<T>, { timeoutMs = 2000, intervalMs = 5, label = "condition" }: WaitForOptions = {}): Promise<Truthy<T>> {
   const deadline = Date.now() + timeoutMs;
   let lastError: unknown;
@@ -56,6 +62,7 @@ export function mcpInitialize(base: string, authorization: string) {
   return fetch(`${base}/mcp`, { method: "POST", headers: { Host: "127.0.0.1", Authorization: authorization, "Content-Type": "application/json", Accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "probe", version: "1" } } }) });
 }
 
+/** createJwtFixture options. Defaults: issuer https://litellm.test, audience "markdownify", kid "first", list and call scopes. */
 export type JwtFixtureOptions = {
   issuer?: string; audience?: string;
   /** `kid` of the published key and of tokens signed by default. */
@@ -67,10 +74,12 @@ export type JwtFixtureOptions = {
   /** Extra default claims for every signed token (overridden by per-call changes). */
   claims?: Record<string, unknown>;
 };
+/** Options for a fixture deployment(). */
 export type JwtDeploymentOptions = {
   /** JobService option overrides on top of the defaults (large limits, converter that copies input to output). */
   jobs?: Record<string, unknown>;
 };
+/** The value createJwtFixture resolves to. */
 export type JwtFixture = Awaited<ReturnType<typeof createJwtFixture>>;
 
 /**
@@ -116,12 +125,19 @@ export async function createJwtFixture({ issuer = "https://litellm.test", audien
     return { url: `${server.url}/jwks`, requests: () => requests, setKeys: (next: JWK[]) => { keys = next; } };
   }
 
+  /**
+   * A JobService on a fresh temp data directory plus its HTTP server on a random loopback port, authenticated by `auth`
+   * (default: verifier()). Returns the service, its effective options, the base URL, an MCP client factory and `put`.
+   * The fixture's close() closes the service and server and deletes the data directory.
+   */
   async function deployment(auth: Authenticator = verifier(), { jobs = {} }: JwtDeploymentOptions = {}) {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-jwt-"));
     const options = { dataDir, maxUploadBytes: 1000, maxOutputBytes: 1000, maxStorageBytes: 1_000_000, maxJobs: 50, retentionMs: 3_600_000, uploadTtlMs: 3_600_000, conversionTimeoutMs: 1000, concurrency: 1, converter: async (input: string, output: string) => { await fs.writeFile(output, await fs.readFile(input)); }, ...jobs };
     const service = new JobService(options); await service.init();
     const httpOptions = { authenticator: auth, publicBaseUrl: "http://127.0.0.1", allowedHosts: ["127.0.0.1"] };
     const server = createHttpServer(service, httpOptions); await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
+    // createHttpServer has already captured the port-less origin for its target and Origin checks; mcp.ts reads
+    // publicBaseUrl per request, so the upload_url it returns gets the real port.
     const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`; httpOptions.publicBaseUrl = base;
     defer(async () => { await service.close(); server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); await fs.rm(dataDir, { recursive: true, force: true }); });
     /** MCP client authenticated as `subject` with a freshly signed token. */

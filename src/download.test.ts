@@ -1,11 +1,18 @@
-import { expect, spyOn, test } from "bun:test";
+import { beforeEach, expect, spyOn, test } from "bun:test";
 import http, { createServer, type IncomingHttpHeaders, type RequestListener } from "node:http";
 import https from "node:https";
 import net from "node:net";
 import tls from "node:tls";
 import { EventEmitter } from "node:events";
 import { gzipSync } from "node:zlib";
-import { ConnectFailedError, download, interleaveFamilies, USER_AGENT } from "./download";
+import {
+  CONNECTION_MEMORY_LIMIT,
+  ConnectFailedError,
+  download,
+  interleaveFamilies,
+  resetConnectionMemory,
+  USER_AGENT,
+} from "./download";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import packageJson from "../package.json";
@@ -26,6 +33,9 @@ async function withServer(
 }
 
 const loopback = [{ address: "127.0.0.1", family: 4 }];
+
+// Every test starts without remembered address families.
+beforeEach(() => resetConnectionMemory());
 /** The unspied net.connect, for test servers' own connections. */
 const directConnect = net.connect.bind(net);
 const downloadModule = JSON.stringify(new URL("./download.ts", import.meta.url).href);
@@ -64,6 +74,7 @@ IX5GtFz9bBbcIxlnfk2v2tXKpmqy6INp54/nZpECsQ==
 async function withHandshakeStallServer(
   handler: RequestListener,
   body: (port: number, held: net.Socket[]) => Promise<void>,
+  { reset = false }: { reset?: boolean } = {},
 ): Promise<void> {
   const backend = https.createServer({ key: TLS_KEY, cert: TLS_CERT }, handler);
   await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
@@ -72,6 +83,9 @@ async function withHandshakeStallServer(
     client.on("error", () => {});
     if (held.length === 0) {
       held.push(client);
+      // With `reset`, drop the connection as soon as the ClientHello arrives,
+      // i.e. after TCP connected but in the middle of the TLS handshake.
+      if (reset) client.once("data", () => client.destroy());
       client.resume(); // read and discard the ClientHello so the client's close is observed
       return;
     }
@@ -108,10 +122,17 @@ function refusedSocket(error: NodeJS.ErrnoException): net.Socket {
  * packets, without depending on how any real IP behaves. Other addresses
  * connect normally. `onStall` runs when an attempt to a stalled address has
  * started; `ca` is added to TLS connections so the test certificate is trusted.
+ * Connections to `refused` addresses fail at once with ECONNREFUSED, and those
+ * listed in `slowMs` connect only after that many milliseconds.
  */
 function interceptConnects(
   stalled: string[] = [],
-  { onStall = () => {}, ca }: { onStall?: () => void; ca?: string } = {},
+  { onStall = () => {}, ca, refused = [], slowMs = {} }: {
+    onStall?: () => void;
+    ca?: string;
+    refused?: string[];
+    slowMs?: Record<string, number>;
+  } = {},
 ) {
   const attempts: string[] = [];
   const sockets: net.Socket[] = [];
@@ -126,6 +147,9 @@ function interceptConnects(
           const address = Array.isArray(args[1]) ? args[1][0].address : args[1];
           attempts.push(address);
           if (stalled.includes(address)) onStall();
+          else if (refused.includes(address)) {
+            answer(Object.assign(new Error(`controlled refusal of ${address}`), { code: "ECONNREFUSED" }));
+          } else if (slowMs[address] !== undefined) setTimeout(() => answer(...args), slowMs[address]);
           else answer(...args);
         });
       },
@@ -274,17 +298,17 @@ test("one error lists every address and its failure code when all are refused", 
   try {
     const error = await download.fetch(
       "http://down.invalid/path?token=secret",
-      [{ address: "192.0.2.1", family: 4 }, { address: "2001:db8::2", family: 6 }],
+      [{ address: "2001:db8::2", family: 6 }, { address: "192.0.2.1", family: 4 }],
       AbortSignal.timeout(2000),
     ).then(() => undefined, (error) => error);
     expect(error).toBeInstanceOf(ConnectFailedError);
     expect(error.code).toBe("ERR_ALL_ADDRESSES_FAILED");
     expect(error.attempts).toEqual([
-      { address: "192.0.2.1", family: 4, code: "ECONNREFUSED" },
-      { address: "2001:db8::2", family: 6, code: "EHOSTUNREACH" },
+      { address: "2001:db8::2", family: 6, code: "ECONNREFUSED" },
+      { address: "192.0.2.1", family: 4, code: "EHOSTUNREACH" },
     ]);
     expect(error.message).toBe(
-      "Could not connect to http://down.invalid/path: tried 192.0.2.1 (ECONNREFUSED), 2001:db8::2 (EHOSTUNREACH)",
+      "Could not connect to http://down.invalid/path: tried 2001:db8::2 (ECONNREFUSED), 192.0.2.1 (EHOSTUNREACH)",
     );
     expect(error.message).not.toContain("secret");
     expect(connectSpy).toHaveBeenCalledTimes(2);
@@ -323,16 +347,75 @@ test.each([
   );
 });
 
-test("families alternate, starting with the first address's family and keeping order within each", () => {
+test("families alternate, starting with IPv6 unless told otherwise and keeping order within each", () => {
   const v6a = { address: "2001:db8::1", family: 6 };
   const v6b = { address: "2001:db8::2", family: 6 };
   const v6c = { address: "2001:db8::3", family: 6 };
   const v4a = { address: "192.0.2.1", family: 4 };
   const v4b = { address: "192.0.2.2", family: 4 };
   expect(interleaveFamilies([v6a, v6b, v6c, v4a, v4b])).toEqual([v6a, v4a, v6b, v4b, v6c]);
-  expect(interleaveFamilies([v4a, v4b, v6a])).toEqual([v4a, v6a, v4b]);
+  // RFC 8305 section 4: IPv6 first even when the resolver listed IPv4 first.
+  expect(interleaveFamilies([v4a, v4b, v6a])).toEqual([v6a, v4a, v4b]);
+  expect(interleaveFamilies([v4a, v4b, v6a], 4)).toEqual([v4a, v6a, v4b]);
+  expect(interleaveFamilies([v6a, v6b, v4a], 4)).toEqual([v4a, v6a, v6b]);
+  // A single family keeps the resolver's order whichever family is preferred.
   expect(interleaveFamilies([v4a, v4b])).toEqual([v4a, v4b]);
+  expect(interleaveFamilies([v6b, v6a], 4)).toEqual([v6b, v6a]);
   expect(interleaveFamilies([])).toEqual([]);
+});
+
+/**
+ * Fetches http://<host>:<port>/ with an unreachable IPv6 address and the IPv4
+ * loopback, listed IPv4 first, and returns the addresses in attempt order.
+ */
+async function dualStackAttempts(host: string, port: number): Promise<string[]> {
+  const connects = interceptConnects(["2001:db8::1"]);
+  try {
+    const response = await download.fetch(
+      `http://${host}:${port}/`,
+      [...loopback, { address: "2001:db8::1", family: 6 }],
+      AbortSignal.timeout(5000),
+      { connectTimeoutMs: 60_000, attemptDelayMs: 20 },
+    );
+    expect(await response.text()).toBe("ok");
+    return connects.attempts;
+  } finally {
+    connects.restore();
+  }
+}
+
+test("IPv6 is attempted first, and a host where IPv4 won starts with IPv4 next time", async () => {
+  await withServer(
+    (_request, response) => response.end("ok"),
+    async (port) => {
+      // No memory yet: IPv6 first although the resolver listed IPv4 first; IPv4 wins.
+      expect(await dualStackAttempts("x.invalid", port)).toEqual(["2001:db8::1", "127.0.0.1"]);
+      // IPv4 won for x.invalid, so it goes first there now and wins before the stagger.
+      expect((await dualStackAttempts("x.invalid", port))[0]).toBe("127.0.0.1");
+      // Another host is unaffected.
+      expect(await dualStackAttempts("y.invalid", port)).toEqual(["2001:db8::1", "127.0.0.1"]);
+      // Forgetting restores the default for x.invalid too.
+      resetConnectionMemory();
+      expect((await dualStackAttempts("x.invalid", port))[0]).toBe("2001:db8::1");
+    },
+  );
+});
+
+test("the remembered families are bounded, evicting the host whose last win is oldest", async () => {
+  expect(CONNECTION_MEMORY_LIMIT).toBe(256);
+  resetConnectionMemory(2);
+  await withServer(
+    (_request, response) => response.end("ok"),
+    async (port) => {
+      // IPv4 wins for a, b, then a again (refreshing it), then c: b is evicted.
+      for (const host of ["a.invalid", "b.invalid", "a.invalid", "c.invalid"]) {
+        await dualStackAttempts(host, port);
+      }
+      expect((await dualStackAttempts("a.invalid", port))[0]).toBe("127.0.0.1");
+      expect((await dualStackAttempts("c.invalid", port))[0]).toBe("127.0.0.1");
+      expect((await dualStackAttempts("b.invalid", port))[0]).toBe("2001:db8::1");
+    },
+  );
 });
 
 test("a stalled address is overtaken by the next one after the stagger delay, well within its budget", async () => {
@@ -400,7 +483,8 @@ test("when every address stalls, the deadline rejects with one error listing eac
       signal,
       { connectTimeoutMs: 20, attemptDelayMs: 10 },
     ).then(() => undefined, (error) => error);
-    // The first address spent its budget; the last one has none and ran into the deadline.
+    // The first address spent its budget, which made the second the last one
+    // possible: its own budget was lifted and it ran into the deadline.
     expect(signal.aborted).toBe(true);
     expect(error).toBeInstanceOf(ConnectFailedError);
     expect(error.cause).toBe(signal.reason);
@@ -620,6 +704,175 @@ test("under Node, staggered attempts, TLS stalls and the combined error release 
       for (const s of held) s.destroy();
       server.closeAllConnections(); secure.closeAllConnections();
       await new Promise(r => server.close(r)); await new Promise(r => front.close(r)); await new Promise(r => secure.close(r));
+    }
+  `);
+}, 15_000);
+
+test.each(["ECONNRESET", "EPIPE", "ECONNABORTED"])(
+  "a connection-phase %s starts the next validated address at once",
+  async (code) => {
+    await withServer(
+      (_request, response) => response.end("second address"),
+      async (port) => {
+        const realConnect = net.connect.bind(net);
+        const reset = Object.assign(new Error("controlled reset"), { code });
+        const connectSpy = spyOn(net, "connect")
+          .mockImplementationOnce(() => refusedSocket(reset))
+          .mockImplementation(realConnect as any);
+        try {
+          const response = await download.fetch(
+            `http://reset.invalid:${port}/`,
+            [{ address: "192.0.2.1", family: 4 }, ...loopback],
+            AbortSignal.timeout(2000),
+            { attemptDelayMs: 60_000 },
+          );
+          expect(await response.text()).toBe("second address");
+          expect(connectSpy).toHaveBeenCalledTimes(2);
+        } finally {
+          connectSpy.mockRestore();
+        }
+      },
+    );
+  },
+);
+
+test("a TLS handshake reset after TCP connects falls through to the next address at once", async () => {
+  await withHandshakeStallServer(
+    (_request, response) => response.end("secure second address"),
+    async (port, held) => {
+      const connects = interceptConnects([], { ca: TLS_CERT });
+      try {
+        const response = await download.fetch(
+          `https://tls.invalid:${port}/`,
+          [...loopback, ...loopback],
+          AbortSignal.timeout(10_000),
+          // Budget and stagger far beyond the deadline: only the reset can move on.
+          { connectTimeoutMs: 60_000, attemptDelayMs: 60_000 },
+        );
+        expect(await response.text()).toBe("secure second address");
+        expect(held).toHaveLength(1);
+        expect(connects.sockets).toHaveLength(2);
+        expect(connects.sockets[0].destroyed).toBe(true);
+      } finally {
+        connects.restore();
+      }
+    },
+    { reset: true },
+  );
+});
+
+test.each([
+  ["after", 60_000],
+  ["while", 30],
+])(
+  "when the last address starts %s the first one's budget runs out and stalls too, it runs until the caller's deadline",
+  async (_when, attemptDelayMs) => {
+    const connects = interceptConnects(["192.0.2.1", "192.0.2.2"]);
+    const deadlineMs = 600;
+    const budgetMs = 100;
+    const started = performance.now();
+    const signal = AbortSignal.timeout(deadlineMs);
+    try {
+      const error = await download.fetch(
+        "http://blackhole.invalid/",
+        [{ address: "192.0.2.1", family: 4 }, { address: "192.0.2.2", family: 4 }],
+        signal,
+        { connectTimeoutMs: budgetMs, attemptDelayMs },
+      ).then(() => undefined, (error) => error);
+      // Not at about two budgets: the second address was not cut off at its own budget.
+      expect(performance.now() - started).toBeGreaterThan(deadlineMs - 50);
+      expect(error).toBeInstanceOf(ConnectFailedError);
+      expect(error.cause).toBe(signal.reason);
+      expect(error.attempts.map((attempt: { code: string }) => attempt.code)).toEqual(["ETIMEDOUT", "TimeoutError"]);
+      expect(connects.sockets.every((socket) => socket.destroyed)).toBe(true);
+    } finally {
+      connects.restore();
+    }
+  },
+);
+
+test("after two fast failures the third address may take longer than the budget and still win", async () => {
+  await withServer(
+    (_request, response) => response.end("slow third address"),
+    async (port) => {
+      const connects = interceptConnects([], {
+        refused: ["192.0.2.1", "192.0.2.2"],
+        slowMs: { "127.0.0.1": 250 },
+      });
+      try {
+        const response = await download.fetch(
+          `http://slow.invalid:${port}/`,
+          [{ address: "192.0.2.1", family: 4 }, { address: "192.0.2.2", family: 4 }, ...loopback],
+          AbortSignal.timeout(5000),
+          { connectTimeoutMs: 50, attemptDelayMs: 60_000 },
+        );
+        expect(await response.text()).toBe("slow third address");
+        expect(connects.attempts).toEqual(["192.0.2.1", "192.0.2.2", "127.0.0.1"]);
+      } finally {
+        connects.restore();
+      }
+    },
+  );
+});
+
+test("an attempt that becomes the last one possible mid-flight has its budget lifted", async () => {
+  await withServer(
+    (_request, response) => response.end("slow survivor"),
+    async (port) => {
+      // The first address stalls and spends its budget at 100 ms; the second,
+      // started at 30 ms, would hit its own budget at 130 ms but connects at ~280 ms.
+      const connects = interceptConnects(["192.0.2.1"], { slowMs: { "127.0.0.1": 250 } });
+      try {
+        const response = await download.fetch(
+          `http://survivor.invalid:${port}/`,
+          [{ address: "192.0.2.1", family: 4 }, ...loopback],
+          AbortSignal.timeout(5000),
+          { connectTimeoutMs: 100, attemptDelayMs: 30 },
+        );
+        expect(await response.text()).toBe("slow survivor");
+        expect(connects.attempts).toEqual(["192.0.2.1", "127.0.0.1"]);
+        expect(connects.sockets[0].destroyed).toBe(true);
+      } finally {
+        connects.restore();
+      }
+    },
+  );
+});
+
+test("under Node, a TLS handshake reset also falls through and leaves no timer behind", async () => {
+  await runUnderNode(`
+    import assert from 'node:assert/strict';
+    import https from 'node:https';
+    import net from 'node:net';
+    import tls from 'node:tls';
+    import {download} from ${downloadModule};
+    const realTlsConnect = tls.connect;
+    tls.connect = (options) => realTlsConnect({...options, ca: ${JSON.stringify(TLS_CERT)}});
+    const secure = https.createServer({key: ${JSON.stringify(TLS_KEY)}, cert: ${JSON.stringify(TLS_CERT)}},
+      (req, res) => res.end('secure host=' + req.headers.host));
+    await new Promise(r => secure.listen(0, '127.0.0.1', r));
+    let connections = 0;
+    // The first connection is dropped once the ClientHello arrives; later ones reach the TLS server.
+    const front = net.createServer(client => {
+      client.on('error', () => {});
+      if (connections++ === 0) { client.once('data', () => client.destroy()); return; }
+      const upstream = net.connect(secure.address().port, '127.0.0.1');
+      client.pipe(upstream).pipe(client);
+      client.on('close', () => upstream.destroy()); upstream.on('close', () => client.destroy());
+      upstream.on('error', () => {});
+    });
+    await new Promise(r => front.listen(0, '127.0.0.1', r));
+    try {
+      const response = await download.fetch('https://tls.invalid:' + front.address().port + '/',
+        [{address: '127.0.0.1', family: 4}, {address: '127.0.0.1', family: 4}], AbortSignal.timeout(5000),
+        {connectTimeoutMs: 60000, attemptDelayMs: 60000});
+      assert.equal(await response.text(), 'secure host=tls.invalid:' + front.address().port);
+      assert.equal(connections, 2);
+      await new Promise(r => setImmediate(r));
+      assert.equal(process.getActiveResourcesInfo().filter(r => r === 'Timeout').length, 0);
+    } finally {
+      secure.closeAllConnections();
+      await new Promise(r => front.close(r)); await new Promise(r => secure.close(r));
     }
   `);
 }, 15_000);

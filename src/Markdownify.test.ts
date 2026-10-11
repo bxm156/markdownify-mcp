@@ -365,6 +365,12 @@ describe("Markdownify.get with a ~ path", () => {
     }
   });
 
+  test("accepts an upper-case Markdown extension", async () => {
+    fs.writeFileSync(path.join(home, "UPPER.MD"), "# Upper");
+    const result = await Markdownify.get({ filePath: "~/UPPER.MD" });
+    expect(result.text).toBe("# Upper");
+  });
+
   test("reports a missing file", async () => {
     await expect(Markdownify.get({ filePath: "~/missing.md" })).rejects.toThrow(
       "File does not exist",
@@ -385,25 +391,196 @@ test("Markdownify.toMarkdown explains a missing markitdown executable", async ()
   }
 });
 
-test.skipIf(process.platform === "win32")(
-  "Markdownify.fromRepo reports empty repomix output",
-  async () => {
-    const saved = process.env.REPOMIX_PATH;
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-repomix-"));
-    const stub = path.join(dir, "repomix");
-    fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    process.env.REPOMIX_PATH = stub;
-    try {
-      await expect(
-        Markdownify.fromRepo({ repoUrl: "octocat/Hello-World" }),
-      ).rejects.toThrow("repomix produced no output");
-    } finally {
-      if (saved === undefined) delete process.env.REPOMIX_PATH;
-      else process.env.REPOMIX_PATH = saved;
-      fs.rmSync(dir, { recursive: true, force: true });
+test("Markdownify.toMarkdown's missing-markitdown hint names the platform's pip and the pinned version", async () => {
+  const saved = process.env.MARKITDOWN_PATH;
+  process.env.MARKITDOWN_PATH = path.join(tempDir, "no-such-markitdown");
+  try {
+    const error = await Markdownify.toMarkdown({
+      filePath: path.join(sampleDataDir, "test.pdf"),
+    }).catch((e: Error) => e);
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message).toContain('"markitdown[all]==0.1.5"');
+    if (process.platform === "win32") {
+      expect(message).toContain(".venv\\Scripts\\pip install");
+    } else {
+      expect(message).toContain("python3 -m venv .venv && .venv/bin/pip install");
     }
-  },
-);
+  } finally {
+    if (saved === undefined) delete process.env.MARKITDOWN_PATH;
+    else process.env.MARKITDOWN_PATH = saved;
+  }
+});
+
+test("Markdownify.toMarkdown error messages have a single prefix", async () => {
+  const markitdownSpy = spyOn(Markdownify as any, "_markitdown").mockRejectedValue(
+    new Error("boom"),
+  );
+  try {
+    const error = await Markdownify.toMarkdown({
+      filePath: path.join(sampleDataDir, "test.pdf"),
+    }).catch((e: Error) => e);
+    expect((error as Error).message).toBe("Processing to Markdown failed: boom");
+    expect((error as Error).message).not.toMatch(/^Error/);
+  } finally {
+    markitdownSpy.mockRestore();
+  }
+});
+
+// Stub executables are shell scripts, so these tests need POSIX.
+describe.skipIf(process.platform === "win32")("external tool stubs", () => {
+  const savedEnv = {
+    MARKITDOWN_PATH: process.env.MARKITDOWN_PATH,
+    REPOMIX_PATH: process.env.REPOMIX_PATH,
+    MD_CONVERTER_TIMEOUT_MS: process.env.MD_CONVERTER_TIMEOUT_MS,
+    MD_GIT_HOSTS: process.env.MD_GIT_HOSTS,
+  };
+  let dir: string;
+  let lookupSpy: ReturnType<typeof spyOn>;
+
+  /** Writes an executable stub that records its arguments, then runs `body`. */
+  function stub(name: string, body: string): string {
+    const file = path.join(dir, name);
+    fs.writeFileSync(
+      file,
+      `#!/bin/sh\nprintf '%s\\n' "$@" > "${path.join(dir, `${name}.args`)}"\n${body}\n`,
+      { mode: 0o755 },
+    );
+    return file;
+  }
+  const ran = (name: string) => fs.existsSync(path.join(dir, `${name}.args`));
+  const argsOf = (name: string) =>
+    fs.readFileSync(path.join(dir, `${name}.args`), "utf-8").trimEnd().split("\n");
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "mdfy-stubs-"));
+    delete process.env.MD_CONVERTER_TIMEOUT_MS;
+    delete process.env.MD_GIT_HOSTS;
+    // Keep repository host checks offline.
+    lookupSpy = spyOn(dns.promises, "lookup").mockResolvedValue([
+      { address: "140.82.112.3", family: 4 },
+    ] as any);
+  });
+
+  afterEach(() => {
+    lookupSpy.mockRestore();
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("Markdownify.fromRepo reports empty repomix output", async () => {
+    process.env.REPOMIX_PATH = stub("repomix", "exit 0");
+    await expect(
+      Markdownify.fromRepo({ repoUrl: "octocat/Hello-World" }),
+    ).rejects.toThrow("repomix produced no output");
+    expect(lookupSpy).toHaveBeenCalledWith("github.com", expect.anything());
+  });
+
+  test("Markdownify.fromRepo passes a valid branch to repomix", async () => {
+    process.env.REPOMIX_PATH = stub("repomix", "echo packed");
+    const result = await Markdownify.fromRepo({
+      repoUrl: "octocat/Hello-World",
+      branch: "feature/x-1",
+      compress: true,
+    });
+    expect(result.text).toBe("packed\n");
+    expect(argsOf("repomix")).toEqual([
+      "--remote",
+      "octocat/Hello-World",
+      "--style",
+      "markdown",
+      "--stdout",
+      "--quiet",
+      "--remote-branch",
+      "feature/x-1",
+      "--compress",
+    ]);
+  });
+
+  for (const branch of ["--upload-pack=touch /tmp/pwned", "-x", "a b", "a..b", "a@{1}"]) {
+    test(`Markdownify.fromRepo refuses branch ${JSON.stringify(branch)} before running repomix`, async () => {
+      process.env.REPOMIX_PATH = stub("repomix", "echo packed");
+      await expect(
+        Markdownify.fromRepo({ repoUrl: "octocat/Hello-World", branch }),
+      ).rejects.toThrow("Invalid git ref: Branch");
+      expect(ran("repomix")).toBe(false);
+      expect(lookupSpy).not.toHaveBeenCalled();
+    });
+  }
+
+  for (const repoUrl of [
+    "https://169.254.169.254/latest/meta-data",
+    "http://127.0.0.1/a/b",
+    "git@10.0.0.1:a/b.git",
+    "https://git.example.com/a/b",
+    "https://github.com/a/b/tree/--upload-pack=x",
+  ]) {
+    test(`Markdownify.fromRepo refuses ${repoUrl} before running repomix`, async () => {
+      process.env.REPOMIX_PATH = stub("repomix", "echo packed");
+      await expect(Markdownify.fromRepo({ repoUrl })).rejects.toThrow();
+      expect(ran("repomix")).toBe(false);
+    });
+  }
+
+  test("Markdownify.fromRepo refuses an allowlisted host with a private address before running repomix", async () => {
+    process.env.REPOMIX_PATH = stub("repomix", "echo packed");
+    lookupSpy.mockResolvedValue([{ address: "127.0.0.1", family: 4 }] as any);
+    await expect(
+      Markdownify.fromRepo({ repoUrl: "octocat/Hello-World" }),
+    ).rejects.toThrow('Repository host "github.com" resolves to a loopback');
+    expect(ran("repomix")).toBe(false);
+  });
+
+  test("Markdownify.fromRepo kills a repomix run that exceeds the timeout", async () => {
+    process.env.REPOMIX_PATH = stub("repomix", "exec sleep 30");
+    await expect(
+      Markdownify.fromRepo({ repoUrl: "octocat/Hello-World", timeoutMs: 200 }),
+    ).rejects.toThrow("repomix timed out after 200 ms");
+  });
+
+  test("Markdownify.toMarkdown kills a markitdown run that exceeds the timeout", async () => {
+    process.env.MARKITDOWN_PATH = stub("markitdown", "exec sleep 30");
+    await expect(
+      Markdownify.toMarkdown({
+        filePath: path.join(sampleDataDir, "test.pdf"),
+        timeoutMs: 200,
+      }),
+    ).rejects.toThrow(
+      "Processing to Markdown failed: markitdown timed out after 200 ms",
+    );
+    expect(ran("markitdown")).toBe(true);
+  });
+
+  test("MD_CONVERTER_TIMEOUT_MS sets the default limit", async () => {
+    process.env.MARKITDOWN_PATH = stub("markitdown", "exec sleep 30");
+    process.env.MD_CONVERTER_TIMEOUT_MS = "150";
+    await expect(
+      Markdownify.toMarkdown({ filePath: path.join(sampleDataDir, "test.pdf") }),
+    ).rejects.toThrow("markitdown timed out after 150 ms");
+  });
+
+  test("a converter that exits in time is not reported as timed out", async () => {
+    process.env.MARKITDOWN_PATH = stub("markitdown", "echo '# Converted'");
+    const result = await Markdownify.toMarkdown({
+      filePath: path.join(sampleDataDir, "test.pdf"),
+      timeoutMs: 60_000,
+    });
+    expect(result.text).toBe("# Converted\n");
+  });
+
+  test("a converter failure is not reported as a timeout", async () => {
+    process.env.MARKITDOWN_PATH = stub("markitdown", "echo nope >&2; exit 3");
+    const error = await Markdownify.toMarkdown({
+      filePath: path.join(sampleDataDir, "test.pdf"),
+      timeoutMs: 60_000,
+    }).catch((e: Error) => e);
+    expect((error as Error).message).toStartWith("Processing to Markdown failed: Command failed");
+    expect((error as Error).message).not.toContain("timed out");
+  });
+});
 
 networkTest("Markdownify.fromRepo converts a git repo to markdown via shorthand", async () => {
   const result = await Markdownify.fromRepo({
@@ -459,6 +636,18 @@ test("Markdownify.fromRepo rejects empty URL", async () => {
   await expect(
     Markdownify.fromRepo({ repoUrl: "" }),
   ).rejects.toThrow("Repository URL is required");
+});
+
+test("Markdownify.fromRepo rejects an invalid branch before checking the URL", async () => {
+  const lookupSpy = spyOn(dns.promises, "lookup");
+  try {
+    await expect(
+      Markdownify.fromRepo({ repoUrl: "octocat/Hello-World", branch: "--upload-pack=x" }),
+    ).rejects.toThrow('Invalid git ref: Branch must not start with "-"');
+    expect(lookupSpy).not.toHaveBeenCalled();
+  } finally {
+    lookupSpy.mockRestore();
+  }
 });
 
 test("Markdownify.fromRepo rejects file:// URLs", async () => {
@@ -552,7 +741,7 @@ test("Markdownify.toMarkdown handles error from _markitdown method", async () =>
 
   const pdfPath = path.join(sampleDataDir, "test.pdf");
   await expect(Markdownify.toMarkdown({ filePath: pdfPath })).rejects.toThrow(
-    "Error processing to Markdown: Mocked _markitdown error",
+    "Processing to Markdown failed: Mocked _markitdown error",
   );
 
   Markdownify["_markitdown"] = originalMarkitdown;
@@ -661,7 +850,7 @@ describe("Markdownify.toMarkdown staging directory", () => {
     try {
       await expect(
         Markdownify.toMarkdown({ url: "https://example.com/page" }),
-      ).rejects.toThrow("Error processing to Markdown: converter exploded");
+      ).rejects.toThrow("Processing to Markdown failed: converter exploded");
       expect(existedDuringRun).toBe(true);
       expect(listStaged()).toEqual([]);
     } finally {
@@ -840,7 +1029,7 @@ describe("Markdownify local files", () => {
     });
     await expect(
       Markdownify.toMarkdown({ filePath: path.join(allowedDir, "sub", "doc.txt") }),
-    ).rejects.toThrow("Error processing to Markdown: converter exploded");
+    ).rejects.toThrow("Processing to Markdown failed: converter exploded");
     expect(existedDuringRun).toBe(true);
     expect(listStaged()).toEqual([]);
   });

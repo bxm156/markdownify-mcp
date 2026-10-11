@@ -1,19 +1,81 @@
-/** Run with Bun: bun examples/upload-and-convert.ts input.docx output.md */
+/**
+ * Run with Node 22.18+ or Bun: node examples/upload-and-convert.ts input.docx output.md
+ * (Node 22.6-22.17: node --experimental-strip-types ...; the image ships it
+ * compiled: node examples/upload-and-convert.js ...).
+ *
+ * Example client for the remote server: uploads a local file, converts it and
+ * writes the Markdown to a new file. Two modes:
+ * - direct: MCP_TOKEN is the bearer token for MCP_URL;
+ * - gateway: LITELLM_API_KEY authenticates to a LiteLLM MCP gateway at
+ *   MCP_URL (e.g. .../markdownify/mcp), and MARKDOWNIFY_BASE_URL is the
+ *   server's own origin for the binary upload, which bypasses the gateway.
+ *   MARKDOWNIFY_AGENT_TOKEN optionally forwards a per-agent token as
+ *   `x-mcp-<MARKDOWNIFY_SERVER_ALIAS>-authorization` (alias default
+ *   "markdownify").
+ * CONVERSION_DEADLINE_MS bounds the whole run (default 300000).
+ *
+ * Safety: plain http is refused except to loopback; the upload URL must be on
+ * the expected origin with no credentials, query or fragment; the output file
+ * must not exist yet; and raw tool output and server error text are never
+ * printed (create_upload returns a scoped credential), only local guidance.
+ *
+ * Self-contained on purpose: it imports only @modelcontextprotocol/sdk and
+ * Node built-ins, never src/, so it runs from a copy outside this repository.
+ */
 import { createReadStream } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { lookupError } from "../src/remote/errors.js";
 
+/** Local guidance for one error code, matching error_info in the server's catalogue (src/remote/errors.ts, docs/ERRORS.md). */
+type Guidance = { message: string; next_steps: string[] };
+/**
+ * Condensed guidance for the codes this flow can meet. Server text is never
+ * echoed: error_info.code selects an entry here. Call the server's lookup_error
+ * tool or read docs/ERRORS.md for the full recovery steps of any code.
+ */
+const guidance: Record<string, Guidance> = {
+  AUTH_REQUIRED: { message: "Authorization required", next_steps: ["Supply this agent's active credential or gateway-issued JWT. Never substitute another agent's identity."] },
+  AUTH_SCOPE_REQUIRED: { message: "Scope not granted", next_steps: ["Ask the gateway/operator to grant this tool's scope to your agent."] },
+  FILE_TOO_LARGE: { message: "File exceeds upload limit", next_steps: ["Reduce or split the document to fit limit_bytes, or ask the operator to raise MD_MAX_UPLOAD_BYTES."] },
+  JOB_LIMIT_EXCEEDED: { message: "Temporary job capacity exhausted", next_steps: ["Wait for retention expiry or delete your own unneeded jobs, then retry; ask the operator if the scope stays full."] },
+  STORAGE_LIMIT_EXCEEDED: { message: "Temporary storage capacity exhausted", next_steps: ["Wait for expiry or delete your own unneeded jobs, then retry; ask the operator to adjust the storage budget."] },
+  OUTPUT_LIMIT_EXCEEDED: { message: "Converted Markdown exceeds output limit", next_steps: ["Reduce or split the source, or ask the operator to raise MD_MAX_OUTPUT_BYTES."] },
+  CONVERSION_TIMEOUT: { message: "Conversion timed out", next_steps: ["Reduce or split the source, or ask the operator to raise MD_CONVERSION_TIMEOUT_MS."] },
+  CONVERSION_CANCELLED: { message: "Conversion cancelled", next_steps: ["If conversion is still needed, create a new upload after confirming the service is available."] },
+  CONVERSION_INTERRUPTED: { message: "Conversion interrupted by server restart", next_steps: ["After the service recovers, run the upload again with bounded retries."] },
+  CONVERSION_FAILED: { message: "Document conversion failed", next_steps: ["Check that the file is valid and supported; do not repeatedly submit the unchanged document."] },
+  JOB_NOT_FOUND: { message: "Job not found", next_steps: ["Check your own agent credential; if the job was removed, upload the original file again."] },
+  JOB_EXPIRED: { message: "Job expired", next_steps: ["The result is no longer available; upload the original file again if needed."] },
+  UPLOAD_SIZE_MISMATCH: { message: "Upload size does not match declared size", next_steps: ["Recheck the file's actual byte count and upload it again."] },
+  UPLOAD_INTERRUPTED: { message: "Upload cancelled or timed out", next_steps: ["Run the upload again with bounded retries."] },
+  UPLOAD_IN_PROGRESS: { message: "Upload already in progress", next_steps: ["Wait for the existing upload; do not upload concurrently to the same reservation."] },
+  UPLOAD_ALREADY_COMPLETED: { message: "Upload already consumed", next_steps: ["Do not upload again; start a new run."] },
+  UPLOAD_INCOMPLETE: { message: "File upload is incomplete", next_steps: ["Finish the binary upload before starting the conversion."] },
+  MARKDOWN_NOT_READY: { message: "Markdown is not ready", next_steps: ["Poll the job status with backoff and a finite deadline."] },
+  INVALID_ARGUMENTS: { message: "Invalid tool arguments", next_steps: ["Check the file name and size and the tool input schema before retrying."] },
+  UNSUPPORTED_FORMAT: { message: "Unsupported file format", next_steps: ["Use PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, HTML or JSON."] },
+  INVALID_PAGINATION: { message: "Invalid pagination parameters", next_steps: ["Follow the returned next_offset; max_chars must be 1 to 100000."] },
+  AUDIT_UNAVAILABLE: { message: "Audit unavailable", next_steps: ["Notify the operator to restore audit storage; retry only after recovery."] },
+  SERVICE_UNAVAILABLE: { message: "Service closing", next_steps: ["Wait for service recovery, then retry with bounded backoff."] },
+  UNKNOWN_TOOL: { message: "Unknown tool", next_steps: ["Discover available tools with listTools; gateways may prefix names."] },
+  REQUEST_REJECTED: { message: "Request rejected", next_steps: ["Check the endpoint, method, host/origin and body size, or ask the operator."] },
+  UNKNOWN_ERROR_CODE: { message: "Unknown error code", next_steps: ["Report the sanitized error and job ID to the operator; the lookup_error tool explains known codes."] },
+  INTERNAL_ERROR: { message: "Operation failed", next_steps: ["Preserve the job ID and report the error to the operator; avoid blind retries."] },
+};
+
+/** A safe one-line description of a failed call, from the local guidance table. */
 function failureMessage(payload: any): string {
   // Render only locally known guidance and whitelisted numeric limits. Never
   // echo arbitrary upstream messages, filenames, credentials or raw payloads.
-  const info = lookupError(typeof payload?.error_info?.code === "string" ? payload.error_info.code : "INTERNAL_ERROR");
+  const rawCode = typeof payload?.error_info?.code === "string" ? payload.error_info.code : "INTERNAL_ERROR";
+  const code = Object.hasOwn(guidance, rawCode) ? rawCode : "UNKNOWN_ERROR_CODE";
+  const info = guidance[code];
   const limits = ["limit_bytes", "requested_bytes", "reserved_bytes", "limit_jobs", "timeout_ms"]
     .filter(key => Number.isSafeInteger(payload?.error_info?.details?.[key]) && payload.error_info.details[key] >= 0)
     .map(key => `${key}=${payload.error_info.details[key]}`);
-  return `${info.code}: ${info.message}${limits.length ? ` (${limits.join(", ")})` : ""}. ${info.next_steps.join(" ")}`;
+  return `${code}: ${info.message}${limits.length ? ` (${limits.join(", ")})` : ""}. ${info.next_steps.join(" ")}`;
 }
 
 const [input, output] = process.argv.slice(2);
@@ -25,6 +87,7 @@ const agentToken = gatewayKey ? process.env.MARKDOWNIFY_AGENT_TOKEN : token;
 if (!gatewayKey && !token) throw new Error("Set MCP_TOKEN for direct access or LITELLM_API_KEY for gateway access");
 if (gatewayKey && !process.env.MARKDOWNIFY_BASE_URL) throw new Error("Gateway mode requires MARKDOWNIFY_BASE_URL for the direct binary upload origin");
 const uploadOrigin = new URL(process.env.MARKDOWNIFY_BASE_URL ?? endpoint.origin).origin;
+/** Throws unless `url` is https:, or http: to a loopback host. */
 function permitLocalHttp(url: URL): void {
   if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) throw new Error("Use HTTPS for remote endpoints");
 }
@@ -33,6 +96,7 @@ permitLocalHttp(new URL(uploadOrigin));
 const timeoutMs = Number(process.env.CONVERSION_DEADLINE_MS ?? 300000);
 if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000) throw new Error("Invalid CONVERSION_DEADLINE_MS");
 const deadline = Date.now() + timeoutMs;
+/** Milliseconds left before the overall deadline; throws once it has passed. */
 const remaining = () => {
   const ms = deadline - Date.now();
   if (ms <= 0) throw new Error("Conversion deadline exceeded; the server job will expire automatically");
@@ -81,6 +145,7 @@ try {
   } finally { bytes.destroy(); }
   const { job_id } = await call<{ job_id: string }>("start_conversion", { upload_id: upload.upload_id });
   console.log(`Conversion queued: ${job_id}`);
+  // Poll with backoff: 500 ms, growing 1.5x per round up to 5 s.
   let delay = 500;
   for (;;) {
     const status = await call<{ status: string; error_info?: unknown }>("get_conversion_status", { job_id });

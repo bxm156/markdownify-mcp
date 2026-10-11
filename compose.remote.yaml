@@ -12,6 +12,11 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - markdownify-data:/data
+    # Crash recovery: the server refreshes /data/.lock every 5 s. After a SIGKILL, OOM kill or host crash, restarts
+    # fail with "Data directory is in use" until the lock has not been modified for MD_LOCK_STALE_AFTER_MS
+    # (default 60000 ms); the next start then reclaims it automatically and logs {"event":"stale_lock_reclaimed",...}.
+    # With MD_LOCK_STALE_AFTER_MS=0 nothing is reclaimed: stop the service, then remove the lock by hand:
+    #   docker compose -f compose.remote.yaml run --rm --no-deps --entrypoint rm markdownify -f /data/.lock
     restart: unless-stopped
     init: true
     read_only: true
@@ -24,6 +29,8 @@ services:
     mem_limit: 1g
     cpus: 2
     pids_limit: 128
+    # Keep this above MD_SHUTDOWN_TIMEOUT_MS (default 10000 ms) so a graceful shutdown finishes before SIGKILL and
+    # removes /data/.lock; 15s is SHUTDOWN_TIMEOUT_WARN_MS in src/remote/config.ts, and CI asserts the two match.
     stop_grace_period: 15s
 
 volumes:

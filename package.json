@@ -4,9 +4,16 @@
   "description": "MCP Markdownify Server - Model Context Protocol Server for Converting Almost Anything to Markdown",
   "license": "MIT",
   "author": "@zcaceres (@zachcaceres | zach.dev)",
-  "homepage": "https://github.com/zcaceres/markdownify-mcp",
-  "bugs": "https://github.com/zcaceres/markdownify-mcp/issues",
+  "homepage": "https://github.com/bxm156/markdownify-mcp",
+  "bugs": "https://github.com/bxm156/markdownify-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bxm156/markdownify-mcp.git"
+  },
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "bin": {
     "mcp-markdownify-server": "dist/index.js"
   },
@@ -21,7 +28,8 @@
     "start:remote": "node dist/remote/index.js",
     "test:remote": "bun test src/remote",
     "test:converter": "bun scripts/remote-converter-smoke.ts",
-    "build": "tsc && chmod +x dist/*.js",
+    "test:http-smoke": "bun scripts/remote-http-smoke.ts",
+    "build": "tsc && node -e \"if (process.platform !== 'win32') for (const f of require('fs').readdirSync('dist')) if (f.endsWith('.js')) require('fs').chmodSync('dist/' + f, 0o755)\"",
     "dev": "tsc --watch",
     "preinstall": "node preinstall.js",
     "prepublishOnly": "bun run build",
@@ -39,7 +47,7 @@
   },
   "devDependencies": {
     "@types/bun": "1.4.2",
-    "@types/node": "^25.3.5",
+    "@types/node": "^22",
     "typescript": "^6.0.2"
   }
 }

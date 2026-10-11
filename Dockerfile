@@ -11,10 +11,13 @@ RUN bun run build
 # Runtime stage: Bun + Python venv with MarkItDown installed exactly once.
 # [all] matches what setup.sh (the preinstall hook) provides for local installs,
 # including OCR/audio extras; the version matches the pin used in CI.
+# ffmpeg is what makes the audio extra usable: without it the audio-to-markdown tool
+# cannot decode input for transcription. It adds an estimated 200-300 MB (with its codec
+# libraries) to the runtime image; the rest of the image is unchanged.
 FROM oven/bun:1.4.2-debian AS runner
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv bash git \
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv bash git ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # The runtime finds this via resolveMarkitdownPath: MARKITDOWN_PATH, then ./.venv/bin/markitdown, then PATH.

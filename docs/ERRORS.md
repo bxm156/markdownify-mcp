@@ -17,7 +17,24 @@ MCP tool errors have `isError: true` and JSON text:
 }
 ```
 
-This abbreviated example illustrates the shape; follow the actual returned next_steps. Upload errors use the same envelope with HTTP status. A status call itself succeeds for a failed conversion but returns `status: failed`, `error` and `error_info`: stop polling. Codes/details survive restart; old manifests without codes receive safe fallback guidance.
+A tools/list refused for a missing scope (JWT mode without `mcp:tools/list`) cannot return a tool result, so it is a JSON-RPC error that carries the same body in its `data`. Read the code from `error.data.error_info.code`, not from the message:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "error": {
+    "code": -32600,
+    "message": "Scope not granted",
+    "data": {
+      "error": "Scope not granted",
+      "error_info": {"code": "AUTH_SCOPE_REQUIRED", "message": "Scope not granted", "retryable": false, "next_steps": ["Ask the gateway/operator to grant this tool's scope to your agent. ..."]}
+    }
+  }
+}
+```
+
+The MCP SDK client surfaces this as an `McpError` with `code` -32600 and the same `data`. These abbreviated examples illustrate the shape; follow the actual returned next_steps. Upload errors use the same envelope with HTTP status. A status call itself succeeds for a failed conversion but returns `status: failed`, `error` and `error_info`: stop polling. Codes/details survive restart; old manifests without codes receive safe fallback guidance.
 
 | Code | Recovery | Setting |
 | --- | --- | --- |
@@ -27,7 +44,7 @@ This abbreviated example illustrates the shape; follow the actual returned next_
 | OUTPUT_LIMIT_EXCEEDED | Reduce/split input or adjust output cap; new upload | MD_MAX_OUTPUT_BYTES |
 | CONVERSION_TIMEOUT | Reduce/split input or adjust timeout; new upload | MD_CONVERSION_TIMEOUT_MS |
 | CONVERSION_INTERRUPTED | New upload after service recovers, bounded retries | Server restart (graceful or crash) |
-| CONVERSION_CANCELLED | Stop polling; new upload only if still needed | Explicit cancellation |
+| CONVERSION_CANCELLED | Not returned for a deleted job, which reads as JOB_NOT_FOUND (see Stopped conversions); if seen, call delete_job again | Explicit cancellation, operator-visible |
 | CONVERSION_FAILED | Check/repair source; give operator job ID/code | Parser diagnostics remain private |
 | UPLOAD_SIZE_MISMATCH | Exact declared bytes on valid reservation, or new reservation | Actual vs declared size |
 | UPLOAD_INTERRUPTED | Check state/expiry before bounded retry of PUT | MD_UPLOAD_TTL_MS |
@@ -35,6 +52,7 @@ This abbreviated example illustrates the shape; follow the actual returned next_
 | JOB_NOT_FOUND | Verify own ID/credential; never probe other owners | Foreign and missing responses are identical |
 | MARKDOWN_NOT_READY | Check status; poll queued/running, follow failed-job guidance | Concurrency queues work |
 | AUDIT_UNAVAILABLE / INTERNAL_ERROR | Operator recovery before retrying | Storage/permissions/service health |
+| SERVICE_UNAVAILABLE | Bounded retry with backoff once the service is ready again (`retryable: true`) | Shutdown in progress, or an anonymous JWT-mode initialize/ping while `/readyz` is not ready (HTTP 503) |
 
 Quota details contain configured `scope` and limits, never usage counts or other owners' IDs. For `scope: "agent"` the limit is the caller's own operator override when one is configured. `reserved_bytes` is the space required by the attempted upload, not total used storage. Unknown lookup codes return `UNKNOWN_ERROR_CODE` with `isError: true`. Request/schema/auth errors also carry guidance.
 
@@ -46,7 +64,9 @@ A running conversion that is stopped before it finishes fails with one of three 
 | --- | --- | --- |
 | CONVERSION_INTERRUPTED | The server stopped while the job was running. A graceful shutdown (SIGTERM, SIGINT or SIGHUP) stops the converter and records this code before the process exits. After a crash or SIGKILL, the next start finds the job still `running` and records the same code. | true |
 | CONVERSION_TIMEOUT | The conversion ran longer than `MD_CONVERSION_TIMEOUT_MS`. `details.timeout_ms` reports the deadline. | false |
-| CONVERSION_CANCELLED | The conversion was cancelled explicitly: `delete_job` on a running job. The job is removed right after, so its owner then sees `JOB_NOT_FOUND`. | false |
+| CONVERSION_CANCELLED | The conversion was cancelled explicitly: `delete_job` on a running job. The code is internal (see below): the owner never sees it as a job's error. | false |
+
+`delete_job` on a running job stops the converter, records `CONVERSION_CANCELLED` and then removes the job before it returns. No tombstone is kept, so the owner's later `get_conversion_status` and `get_markdown` calls return `JOB_NOT_FOUND`, exactly as for any other deleted job. The code is visible only to operators: it is written to the job's on-disk manifest just before the job directory is removed, and the audit log shows the `delete_job` record followed by a `conversion_failed` record (status `failed`) for that job. It never appears as a job's error in a tool response, except when the removal itself fails or the process stops before it completes: the job then remains `failed` with this code, and calling `delete_job` again removes it. `lookup_error` still describes the code.
 
 The first reason wins. A deadline that passes while a shutdown is already stopping the converter does not turn `CONVERSION_INTERRUPTED` into `CONVERSION_TIMEOUT`. A converter killed for any of these reasons is never reported as `CONVERSION_FAILED`, which is kept for documents the parser rejects.
 

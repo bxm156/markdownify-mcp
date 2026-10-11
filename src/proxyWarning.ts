@@ -1,4 +1,10 @@
 /**
+ * Startup notice about proxy settings that the stdio server deliberately
+ * ignores (download.ts pins each connection to validated addresses, which a
+ * proxy would undo). It writes only to stderr, never throws, and must run
+ * under Node and Bun.
+ */
+/**
  * Notes on stderr (stdout carries the MCP protocol) when proxy variables are
  * set, because URL conversions connect directly and ignore them.
  */

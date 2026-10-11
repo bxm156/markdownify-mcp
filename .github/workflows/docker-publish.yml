@@ -23,19 +23,76 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # Pin the Node the smoke scripts and Node-subprocess tests spawn; the runner default drifts.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Parity with remote-mvp.yml. Before the image is pushed, this job repeats the source checks that are
+      # cheap or that exercise what ships: typecheck, MD_* docs check, assert guard, bash -n and shellcheck,
+      # remote and full tests (MD_TEST_NETWORK=1), the converter, JWT and LiteLLM anonymous-health smokes,
+      # the fixture generator test, the stdio smoke's response-waiting test, compose file validation, and the
+      # candidate image with three isolated agents plus the upload-and-convert example.
+      # It relies on remote-mvp.yml (which runs on the same commit) for the heavier or less relevant checks:
+      # scripts/docker-smoke-test.sh (a second image build of the stdio Dockerfile, which is not published),
+      # the single-key container smoke, and the LiteLLM -O run and negative-path harness (extra pip install and
+      # server spawns for regressions in the test code, not in the image). Add a check to both files if it
+      # should gate publishing.
       - name: Build and test source
         run: |
           bun install --frozen-lockfile --ignore-scripts
           bun run typecheck
+          bun scripts/check-env-docs.ts
           bun run build:remote
           bun test src/remote
           python -m pip install 'markitdown[pdf,docx,xlsx,pptx]==0.1.5'
           bun run build
-          bun test
+          MD_TEST_NETWORK=1 bun test
           bun scripts/remote-converter-smoke.ts
           bun scripts/jwt-http-smoke.ts
           python -m pip install 'litellm[mcp]==1.104.0'
           python scripts/litellm-health-smoke.py
+      - name: Reject assert statements in Python scripts (python -O strips them)
+        run: |
+          # Same check as remote-mvp.yml: parses each file, so the word in comments and strings is not flagged.
+          # TODO(#70): add mkdocs_hooks.py once its self-check uses explicit raises instead of assert.
+          python - scripts/*.py <<'PY'
+          import ast, sys
+          found = [f"{path}:{node.lineno}" for path in sys.argv[1:]
+                   for node in ast.walk(ast.parse(open(path, encoding="utf-8").read(), path))
+                   if isinstance(node, ast.Assert)]
+          for place in found:
+              print(f"::error file={place.split(':')[0]},line={place.split(':')[1]}::Use an explicit raise instead of assert (python -O strips it)")
+          sys.exit(1 if found else 0)
+          PY
+      - name: Check shell script syntax
+        shell: bash
+        run: for f in scripts/*.sh setup.sh; do bash -n "$f"; done
+      - name: Lint shell scripts with shellcheck
+        shell: bash
+        run: shellcheck -x scripts/*.sh setup.sh
+      - name: Test the stdio smoke test's response waiting (no Docker needed)
+        run: bash scripts/docker-smoke-test.test.sh
+      - name: Test the Office fixture generator (real DOCX, XLSX and PPTX files)
+        run: |
+          python scripts/create_remote_fixtures_test.py
+          python -O scripts/create_remote_fixtures_test.py
+      - name: Validate compose files
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Same setup as remote-mvp.yml: Compose resolves env_file and bind sources, so use the documented
+          # examples and a placeholder registry. .dockerignore keeps .env.* and secrets out of image builds.
+          cp .env.remote.example .env.remote
+          cp .env.multitenant.example .env.multitenant
+          cp .env.jwt.example .env.jwt
+          mkdir -p secrets
+          printf '{"credentials":[]}\n' > secrets/agents.json
+          for file in compose.remote.yaml compose.multitenant.yaml compose.jwt.yaml; do
+            echo "Validating $file"
+            docker compose -f "$file" config -q
+          done
+          # Remove the placeholders so the build context for the image stays as it was.
+          rm -rf .env.remote .env.multitenant .env.jwt secrets
       - uses: docker/setup-buildx-action@v4
       - name: Build candidate without registry credentials
         uses: docker/build-push-action@v7

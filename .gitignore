@@ -4,6 +4,8 @@ secrets/
 *.agent-token
 .env
 .env.remote
+.env.multitenant
+.env.jwt
 dist
 .venv
 .claude

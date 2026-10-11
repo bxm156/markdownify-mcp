@@ -276,6 +276,17 @@ test("405 responses name the allowed method on /mcp and /uploads/<id>", async ()
   }
 });
 
+test("the Bearer scheme is matched case-insensitively (RFC 7235), for MCP requests and owner-authenticated uploads", async () => {
+  const { port, upload } = await fixture();
+  for (const scheme of ["Bearer", "bearer", "BEARER", "bEaReR"]) {
+    const response = await raw(port, [mcpPost(["Host: 127.0.0.1", `Authorization: ${scheme} ${SECRET}`, JSON_TYPE, ACCEPT])]);
+    expect([scheme, response.status, response.json?.result]).toEqual([scheme, 200, {}]);
+  }
+  const { upload_id, required_headers } = await upload();
+  const response = await raw(port, [message(`PUT /uploads/${upload_id} HTTP/1.1`, ["Host: 127.0.0.1", ...uploadHeaders(required_headers), `Authorization: bearer ${SECRET}`, OCTET], "hello")]);
+  expect(response.status).toBe(204);
+});
+
 test("every 401 carries WWW-Authenticate: Bearer and the AUTH_REQUIRED code", async () => {
   const { port, upload } = await fixture();
   const { upload_id, required_headers } = await upload();
@@ -286,7 +297,7 @@ test("every 401 carries WWW-Authenticate: Bearer and the AUTH_REQUIRED code", as
     "mcp with wrong token": mcpPost([host, "Authorization: Bearer wrong", JSON_TYPE, ACCEPT]),
     "mcp with empty token": mcpPost([host, "Authorization: Bearer ", JSON_TYPE, ACCEPT]),
     "mcp with Basic scheme": mcpPost([host, `Authorization: Basic ${SECRET}`, JSON_TYPE, ACCEPT]),
-    "mcp with lowercase bearer scheme": mcpPost([host, `Authorization: bearer ${SECRET}`, JSON_TYPE, ACCEPT]),
+    "mcp with lowercase bearer scheme and wrong token": mcpPost([host, "Authorization: bearer wrong", JSON_TYPE, ACCEPT]),
     "mcp with token only": mcpPost([host, `Authorization: ${SECRET}`, JSON_TYPE, ACCEPT]),
     "mcp with oversized token": mcpPost([host, `Authorization: Bearer ${"x".repeat(5000)}`, JSON_TYPE, ACCEPT]),
     "upload without credentials": message(`PUT /uploads/${upload_id} HTTP/1.1`, [host, ...scoped, OCTET], "hello"),

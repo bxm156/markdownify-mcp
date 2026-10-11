@@ -1,3 +1,13 @@
+/**
+ * The error catalog. Every client-visible failure carries one of these codes, and lookup_error returns the same static
+ * guidance (message, retryable, next_steps) to agents.
+ *
+ * Contract: messages and details are fixed strings and numbers chosen here or by the code that throws. Paths, errno
+ * codes, stacks, converter output, credentials and other principals' usage never reach a client: anything that is not
+ * a ServiceError is reported as INTERNAL_ERROR. Codes are persisted in failed job manifests (error_code), so renaming or
+ * removing one turns stored jobs' guidance into UNKNOWN_ERROR_CODE; add codes instead. `retryable` means a bounded
+ * retry can succeed later, never unlimited retries.
+ */
 type Guidance = { message: string; retryable: boolean; next_steps: string[] };
 const catalog = {
   AUTH_SCOPE_REQUIRED: { message: "Scope not granted", retryable: false, next_steps: ["Ask the gateway/operator to grant this tool's scope to your agent. Do not edit or forge JWT claims; refresh through the configured signer after authorization changes."] },
@@ -22,20 +32,28 @@ const catalog = {
   INVALID_PAGINATION: { message: "Invalid pagination parameters", retryable: false, next_steps: ["Use nonnegative offset and max_chars from 1 to 100000. Follow the returned next_offset; offsets count Unicode code points."] },
   AUTH_REQUIRED: { message: "Authorization required", retryable: false, next_steps: ["Have the runtime/operator supply this agent's active credential or gateway-issued JWT. Never substitute another agent's identity. In registry or single-key (MD_API_KEY) mode, credential changes require a server restart because they are read once at startup; in JWT mode, access is managed in LiteLLM and revocation is bounded by token and upload-grant expiry.", "For expired scoped upload credentials, create a fresh reservation from the original file and use its returned headers. Delete only your own unneeded reservation when cleanup is authorized."] },
   AUDIT_UNAVAILABLE: { message: "Audit unavailable", retryable: false, next_steps: ["Stop operations and notify the operator to restore audit storage/permissions. Retry only after recovery; do not bypass auditing."] },
-  SERVICE_UNAVAILABLE: { message: "Service closing", retryable: true, next_steps: ["Wait for service recovery, then retry with bounded backoff. Check status before repeating an upload or conversion."] },
+  SERVICE_UNAVAILABLE: { message: "Service unavailable", retryable: true, next_steps: ["The service is shutting down or not ready (storage, converter or audit). Wait for recovery, then retry with bounded backoff. Check status before repeating an upload or conversion."] },
   UNKNOWN_TOOL: { message: "Unknown tool", retryable: false, next_steps: ["Discover available tools with listTools; gateways may prefix names."] },
   UNKNOWN_ERROR_CODE: { message: "Unknown error code", retryable: false, next_steps: ["Use the exact error_info.code returned by this server. If unavailable, report the sanitized error and job ID to the operator."] },
   REQUEST_REJECTED: { message: "Request rejected", retryable: false, next_steps: ["Check the response message, endpoint, method, content type, host/origin and body size. Correct the request or ask the operator; do not bypass host/auth checks."] },
   INTERNAL_ERROR: { message: "Operation failed", retryable: false, next_steps: ["Preserve the job ID and report the error to the operator. Check status after recovery before repeating operations; avoid blind retries."] },
 } satisfies Record<string, Guidance>;
+/** A catalog code. */
 export type ErrorCode = keyof typeof catalog;
+/** Instance-specific values attached to an error: configured limits, the request's own sizes and the failing quota scope; never other principals' usage. */
 export type ErrorDetails = { scope?: "global" | "tenant" | "agent"; limit_bytes?: number; requested_bytes?: number; reserved_bytes?: number; limit_jobs?: number; timeout_ms?: number };
+/** The error_info object returned to clients: catalog guidance plus the code, the thrower's message and any details. */
 export type ErrorInfo = Guidance & { code: ErrorCode; details?: ErrorDetails };
+/** Static guidance for a code; an unknown code gets UNKNOWN_ERROR_CODE guidance. next_steps is copied so callers cannot mutate the catalog. */
 export function lookupError(code: string): ErrorInfo {
   const known = Object.hasOwn(catalog, code) ? code as ErrorCode : "UNKNOWN_ERROR_CODE";
   const entry = catalog[known];
   return { code: known, message: entry.message, retryable: entry.retryable, next_steps: [...entry.next_steps] };
 }
+/**
+ * Codes for errors identified only by message: ServiceErrors thrown without an explicit code, and failed manifests
+ * written before error_code was stored (hence the retired "Conversion cancelled or timed out").
+ */
 const legacy: Record<string, ErrorCode> = {
   "Job not found": "JOB_NOT_FOUND", "Job expired": "JOB_EXPIRED", "Invalid principal": "AUTH_REQUIRED", "Authorization required": "AUTH_REQUIRED",
   "Audit unavailable": "AUDIT_UNAVAILABLE", "Service closing": "SERVICE_UNAVAILABLE", "Invalid filename": "INVALID_ARGUMENTS", "Invalid or excessive file size": "INVALID_ARGUMENTS",
@@ -44,14 +62,18 @@ const legacy: Record<string, ErrorCode> = {
   "File upload is incomplete": "UPLOAD_INCOMPLETE", "Markdown is not ready": "MARKDOWN_NOT_READY", "Invalid pagination parameters": "INVALID_PAGINATION", "Offset exceeds Markdown length": "INVALID_PAGINATION",
   "Conversion interrupted by server restart": "CONVERSION_INTERRUPTED", "Conversion cancelled or timed out": "CONVERSION_TIMEOUT", "Document conversion failed": "CONVERSION_FAILED",
 };
+/** The code for a known message, otherwise INTERNAL_ERROR. */
 export function legacyCode(message: string): ErrorCode { return legacy[message] ?? "INTERNAL_ERROR"; }
+/** A client-safe failure: HTTP status, fixed message, catalog code (derived from the message when omitted) and optional details. */
 export class ServiceError extends Error {
   constructor(public statusCode: number, message: string, public code: ErrorCode = legacyCode(message), public details?: ErrorDetails) { super(message); }
 }
+/** error_info for any thrown value; anything but a ServiceError becomes INTERNAL_ERROR so its message never leaks. */
 export function errorInfo(error: unknown): ErrorInfo {
   if (!(error instanceof ServiceError)) return lookupError("INTERNAL_ERROR");
   return { ...lookupError(error.code), message: error.message, ...(error.details ? { details: error.details } : {}) };
 }
+/** The body of an HTTP error response or failed tool result: `{ error, error_info }`. */
 export function errorResponse(error: unknown) {
   const info = errorInfo(error);
   return { error: info.message, error_info: info };

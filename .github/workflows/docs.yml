@@ -13,8 +13,13 @@ on:
       - examples/**
       - compose*.yaml
       - .env*.example
+      # Code and CI that the docs describe or link to (the build takes under a minute).
+      - Dockerfile.remote
+      - scripts/**
+      - src/remote/**
       - .github/workflows/docker-publish.yml
       - .github/workflows/docs.yml
+      - .github/workflows/remote-mvp.yml
   push:
     branches: [main]
     paths:
@@ -29,8 +34,13 @@ on:
       - examples/**
       - compose*.yaml
       - .env*.example
+      # Code and CI that the docs describe or link to (the build takes under a minute).
+      - Dockerfile.remote
+      - scripts/**
+      - src/remote/**
       - .github/workflows/docker-publish.yml
       - .github/workflows/docs.yml
+      - .github/workflows/remote-mvp.yml
   workflow_dispatch:
 permissions:
   contents: read

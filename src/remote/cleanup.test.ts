@@ -37,7 +37,16 @@ const manifest = async (dataDir: string, id: string) => JSON.parse(await fs.read
 const files = async (dataDir: string, id: string) => (await fs.readdir(path.join(dataDir, id))).sort();
 const health = async (instance: JobService, actor = alice) => await instance.health(actor) as any;
 const advance = (ms: number) => setSystemTime(new Date(Date.now() + ms));
-const lines = (spy: { mock: { calls: unknown[][] } }, message: string) => spy.mock.calls.filter(call => call[0] === message);
+/**
+ * Every stderr call as a parsed operator event. Asserts the contract on each one: a single string argument that is one
+ * line of JSON with an `event` name and no data-directory path.
+ */
+const events = (spy: { mock: { calls: unknown[][] } }, dataDir?: string) => spy.mock.calls.map(call => {
+  expect(call).toHaveLength(1); expect(typeof call[0]).toBe("string");
+  const line = call[0] as string; expect(line).not.toContain("\n"); if (dataDir) expect(line).not.toContain(dataDir);
+  const parsed = JSON.parse(line); expect(parsed.event).toMatch(/^[a-z_]+$/); return parsed as Record<string, unknown>;
+});
+const lines = (spy: { mock: { calls: unknown[][] } }, event: string, dataDir?: string) => events(spy, dataDir).filter(entry => entry.event === event);
 const deadPid = () => spawnSync(process.execPath, ["-e", ""]).pid!;
 afterEach(async () => {
   setSystemTime();
@@ -69,15 +78,15 @@ describe("retention cleanup resilience", () => {
         expect(foreign.cleanup).toMatchObject({ own_jobs_failed_last_sweep: 0, own_jobs_pending_retry: 0 });
         expect(JSON.stringify(foreign)).not.toContain("EACCES"); expect(JSON.stringify(foreign)).not.toContain(failing);
       }
-      expect(lines(logged, "Job cleanup failed")).toHaveLength(1); expect(lines(logged, "Job cleanup sweep incomplete")).toHaveLength(1);
-      expect(lines(logged, "Job cleanup sweep incomplete")[0][1]).toMatchObject({ jobs_failed: 1, failures_total: 1, consecutive_failed_sweeps: 1, last_error_code: "EACCES" });
+      expect(lines(logged, "job_cleanup_failed", options.dataDir)).toEqual([{ event: "job_cleanup_failed", job_id: failing, status: "completed", code: "EACCES" }]);
+      expect(lines(logged, "job_cleanup_sweep_failed", options.dataDir)).toEqual([{ event: "job_cleanup_sweep_failed", jobs_failed: 1, failures_total: 1, consecutive_failed_sweeps: 1, last_error_code: "EACCES", duration_ms: expect.any(Number) }]);
       const log = JSON.stringify(logged.mock.calls);
       expect(log).toContain(failing); expect(log).toContain("EACCES"); expect(log).not.toContain(options.dataDir); expect(log).not.toContain("permission denied");
       // Repeated sweeps keep retrying the failed job and still remove the other tenant's expired tombstone.
       advance(120_000); await instance.cleanup();
       await expect(fs.stat(path.join(options.dataDir, other))).rejects.toMatchObject({ code: "ENOENT" });
-      expect(lines(logged, "Job cleanup failed")).toHaveLength(2);
-      expect(lines(logged, "Job cleanup sweep incomplete")[1][1]).toMatchObject({ failures_total: 2, consecutive_failed_sweeps: 2 });
+      expect(lines(logged, "job_cleanup_failed", options.dataDir)).toHaveLength(2);
+      expect(lines(logged, "job_cleanup_sweep_failed")[1]).toMatchObject({ failures_total: 2, consecutive_failed_sweeps: 2 });
       rm.mockRestore(); await instance.cleanup();
       expect(await files(options.dataDir, failing)).toEqual(["job.json"]);
       expect((await manifest(options.dataDir, failing)).status).toBe("expired");
@@ -108,7 +117,7 @@ describe("retention cleanup resilience", () => {
       expect(pending.cleanup).toMatchObject({ own_jobs_failed_last_sweep: 1, own_jobs_pending_retry: 1 });
       // The reservation is not released before the tombstone commit succeeds.
       await expect(instance.createUpload(alice, { filename: "next.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 507 });
-      expect(lines(logged, "Job cleanup failed")).toHaveLength(1); expect(JSON.stringify(logged.mock.calls)).not.toContain(options.dataDir);
+      expect(lines(logged, "job_cleanup_failed", options.dataDir)).toHaveLength(1); expect(JSON.stringify(logged.mock.calls)).not.toContain(options.dataDir);
       spy.mockRestore(); await instance.cleanup();
       const tombstone = await manifest(options.dataDir, failing);
       expect(tombstone.status).toBe("expired"); expect(tombstone).not.toHaveProperty("token_hash"); expect(tombstone).not.toHaveProperty("upload_auth_hash");
@@ -130,7 +139,7 @@ describe("retention cleanup resilience", () => {
       // Once the tombstone itself expires, the sweep reports the failure once and keeps the tombstone for the next attempt.
       advance(120_000); await instance.cleanup();
       expect((await manifest(options.dataDir, expired)).status).toBe("expired");
-      expect(lines(logged, "Job cleanup failed")).toHaveLength(1); expect(lines(logged, "Job cleanup failed")[0][1]).toMatchObject({ status: "expired", code: "EACCES" });
+      expect(lines(logged, "job_cleanup_failed")).toHaveLength(1); expect(lines(logged, "job_cleanup_failed", options.dataDir)[0]).toMatchObject({ status: "expired", code: "EACCES" });
       expect((await health(instance, bob)).cleanup).toMatchObject({ own_jobs_failed_last_sweep: 1, own_jobs_pending_retry: 1 });
       expect((await health(instance, bob)).own_jobs.expired).toBe(1);
       rm.mockRestore(); await instance.cleanup();
@@ -147,9 +156,20 @@ describe("retention cleanup resilience", () => {
       advance(120_000); await instance.cleanup();
       expect(await files(options.dataDir, id)).toEqual(["job.json"]); expect((await manifest(options.dataDir, id)).status).toBe("expired");
       // The failed write logs the readiness transition once, then the lifecycle event it could not record.
-      expect(logged.mock.calls.map(call => call[0])).toEqual([JSON.stringify({ event: "audit_sink_unavailable", code: "UNKNOWN" }), "Job audit unavailable"]);
+      expect(events(logged, options.dataDir)).toEqual([{ event: "audit_sink_unavailable", code: "UNKNOWN" }, { event: "job_audit_unavailable", audit_event: "job_expired", job_id: id }]);
       expect((await health(instance)).cleanup).toMatchObject({ own_jobs_failed_last_sweep: 0, own_jobs_pending_retry: 0 });
     } finally { logged.mockRestore(); setSystemTime(); }
+  });
+
+  test("a sweep that fails as a whole logs one job_cleanup_sweep_aborted line with only an errno-style code", async () => {
+    const { instance, options } = await service();
+    const sweep = spyOn(instance as any, "sweepOnce").mockImplementation(() => Promise.reject(Object.assign(new Error(`EIO: i/o error, scandir '${options.dataDir}'`), { code: "EIO", path: options.dataDir })));
+    const logged = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      (instance as any).tick();
+      await waitFor(() => logged.mock.calls.length > 0, { label: "the aborted sweep event" });
+      expect(events(logged, options.dataDir)).toEqual([{ event: "job_cleanup_sweep_aborted", code: "EIO" }]);
+    } finally { sweep.mockRestore(); logged.mockRestore(); }
   });
 
   test("concurrent cleanup calls and timer ticks share one in-flight sweep that never overlaps itself", async () => {
@@ -165,7 +185,7 @@ describe("retention cleanup resilience", () => {
       return realRm(target, opts);
     }) as typeof fs.rm);
     const logged = spyOn(console, "error").mockImplementation(() => undefined);
-    const passes = () => lines(logged, "Job cleanup failed").length;
+    const passes = () => lines(logged, "job_cleanup_failed").length;
     let first: Promise<void> | undefined;
     try {
       advance(120_000); first = instance.cleanup(); await reached;
@@ -241,7 +261,7 @@ describe("one process per data volume", () => {
   test("existing locks fail closed and crash leftovers require operator removal", async () => {
     const { instance, options } = await service(), lock = path.join(options.dataDir, ".lock");
     expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(process.pid));
-    if (process.platform !== "win32") expect((await fs.stat(lock)).mode & 0o777).toBe(0o600);
+    expect((await fs.stat(lock)).mode & 0o777).toBe(0o600);
     // The current test process holds the lock, so a second service on the same volume is refused.
     await expect(new JobService(options).init()).rejects.toThrow("Data directory is in use");
     await instance.close(); await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
@@ -361,8 +381,8 @@ describe("retired owner purge tool", () => {
     await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" }); expect(await files(options.dataDir, id)).toContain("input.txt");
   });
 
-  // Root bypasses directory permissions, so this real read-only check only runs as an unprivileged POSIX user.
-  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("a dry run succeeds on a read-only data directory and --apply is refused", async () => {
+  // Root bypasses directory permissions, so this real read-only check only runs as an unprivileged user.
+  test.skipIf(process.getuid?.() === 0)("a dry run succeeds on a read-only data directory and --apply is refused", async () => {
     const { instance, options } = await service();
     const id = await uploaded(instance, alice); await instance.close();
     await fs.chmod(options.dataDir, 0o555);
@@ -430,7 +450,7 @@ describe.skipIf(!node)("compiled entry points under node", () => {
     expect(await fs.readFile(path.join(options.dataDir, corrupt, "job.json"), "utf8")).toBe("{not json");
   }, 30_000);
 
-  test.skipIf(process.platform === "win32")("an interrupted purge --apply exits with the signal status and leaves no lock", async () => {
+  test("an interrupted purge --apply exits with the signal status and leaves no lock", async () => {
     const preloadDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-purge-signal-")); directories.push(preloadDir);
     // Hang removal of one job directory in pure JavaScript (no blocked I/O thread), and report when it is reached.
     const preload = path.join(preloadDir, "hang-rm.mjs");
@@ -482,22 +502,15 @@ describe.skipIf(!node)("compiled entry points under node", () => {
     try { expect(await refused.exited).toBe(1); } finally { if (refused.child.exitCode === null) refused.child.kill("SIGKILL"); }
     expect(refused.stderr()).toContain("Data directory is in use: MD_DATA_DIR/.lock exists"); expect(refused.stderr()).toContain("remove MD_DATA_DIR/.lock and restart");
     await fs.rm(lock, { force: true });
-    for (const signal of process.platform === "win32" ? ["SIGKILL"] as const : ["SIGTERM", "SIGHUP"] as const) {
+    for (const signal of ["SIGTERM", "SIGHUP"] as const) {
       const restarted = start();
       try {
         await ready(restarted);
         expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(restarted.child.pid));
-        if (process.platform === "win32") {
-          // Windows kill() terminates the child without running Node's signal handlers.
-          restarted.child.kill("SIGKILL");
-          await restarted.exited;
-          expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(restarted.child.pid));
-        } else {
-          restarted.child.kill(signal);
-          expect(await restarted.exited).toBe(0);
-          // POSIX graceful shutdown on SIGTERM and SIGHUP releases the lock again.
-          await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
-        }
+        restarted.child.kill(signal);
+        expect(await restarted.exited).toBe(0);
+        // Graceful shutdown on SIGTERM and SIGHUP releases the lock again.
+        await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
       } finally { if (restarted.child.exitCode === null) restarted.child.kill("SIGKILL"); }
     }
   }, 30_000);

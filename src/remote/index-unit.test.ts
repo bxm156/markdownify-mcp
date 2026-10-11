@@ -2,8 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createServer, type Server } from "node:http";
 import net from "node:net";
 import type { JobService } from "./jobs.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, SHUTDOWN_TIMEOUT_WARN_MS, WINDOWS_UNSUPPORTED_MESSAGE } from "./config.js";
 import { startRemoteServer, type ProcessHandle, type RemoteConfig, type RemoteServer } from "./index.js";
+import { HEADERS_TIMEOUT_MS, REQUEST_TIMEOUT_MS } from "./http.js";
 
 // Unit tests for startRemoteServer: every process-level side effect (exit, signal registration, logging) and the job
 // service are injected, so shutdown deadlines, server timeouts and listen-error cleanup run in-process.
@@ -42,16 +43,54 @@ afterEach(async () => {
 });
 
 describe("startRemoteServer", () => {
+  test("refuses to start on Windows: one stderr line, exit status 1, no job service and no listener", async () => {
+    expect(WINDOWS_UNSUPPORTED_MESSAGE).toBe("The remote server is not supported on Windows. Run the Linux container image (see docs/CONTAINERS.md) instead.");
+    const proc = fakeProcess(), logs: string[] = [];
+    let jobsCreated = 0, serversCreated = 0;
+    const attempt = startRemoteServer({
+      config: makeConfig({ MD_PORT: String(await freePort()) }),
+      createJobs: () => { jobsCreated++; return stubJobs().jobs; },
+      createServer: () => { serversCreated++; return createServer(); },
+      processHandle: proc.handle, log: message => logs.push(message), platform: "win32",
+    });
+    // The injected exit returns, so startup stops by rejecting rather than by ending the process.
+    await expect(attempt).rejects.toThrow(WINDOWS_UNSUPPORTED_MESSAGE);
+    expect(logs).toEqual([WINDOWS_UNSUPPORTED_MESSAGE]);
+    expect(proc.exits).toEqual([1]);
+    expect(jobsCreated).toBe(0); expect(serversCreated).toBe(0);
+    expect(proc.listeners.size).toBe(0);
+  });
+
   test("initialises jobs, listens, logs and applies the request and header timeouts", async () => {
     const port = await freePort();
     const started = await start(makeConfig({ MD_PORT: String(port) }));
     expect(started.calls).toEqual({ init: 1, close: 0 });
     expect(started.server.listening).toBe(true);
     expect(started.logs).toEqual([`Markdownify remote listening on 127.0.0.1:${port}`]);
-    expect(started.server.requestTimeout).toBe(300000);
-    expect(started.server.headersTimeout).toBe(30000);
+    // http.ts is the single source of both deadlines; startRemoteServer does not override them.
+    expect([REQUEST_TIMEOUT_MS, HEADERS_TIMEOUT_MS]).toEqual([300_000, 30_000]);
+    expect(started.server.requestTimeout).toBe(REQUEST_TIMEOUT_MS);
+    expect(started.server.headersTimeout).toBe(HEADERS_TIMEOUT_MS);
     expect([...started.proc.listeners.keys()].sort()).toEqual(["SIGHUP", "SIGINT", "SIGTERM"]);
     expect(started.proc.exits).toEqual([]);
+  });
+
+  test("warns once at startup when MD_SHUTDOWN_TIMEOUT_MS exceeds the stop-grace ceiling, and not at or below it", async () => {
+    expect(SHUTDOWN_TIMEOUT_WARN_MS).toBe(15_000);
+    const above = await start(makeConfig({ MD_PORT: String(await freePort()), MD_SHUTDOWN_TIMEOUT_MS: String(SHUTDOWN_TIMEOUT_WARN_MS + 1) }));
+    const warnings = above.logs.filter(line => line.startsWith("{"));
+    expect(warnings.map(line => JSON.parse(line))).toEqual([{ event: "shutdown_timeout_warning", shutdown_timeout_ms: SHUTDOWN_TIMEOUT_WARN_MS + 1, ceiling_ms: SHUTDOWN_TIMEOUT_WARN_MS }]);
+    expect(warnings[0]).not.toContain("\n");
+    // The warning does not stop startup, and nothing else repeats it.
+    expect(above.server.listening).toBe(true);
+    expect(above.logs).toHaveLength(2);
+    await above.shutdown();
+    expect(above.logs.filter(line => line.startsWith("{"))).toHaveLength(1);
+    for (const timeout of [SHUTDOWN_TIMEOUT_WARN_MS, SHUTDOWN_TIMEOUT_WARN_MS - 1, undefined]) {
+      const port = await freePort();
+      const quiet = await start(makeConfig({ MD_PORT: String(port), ...(timeout === undefined ? {} : { MD_SHUTDOWN_TIMEOUT_MS: String(timeout) }) }));
+      expect(quiet.logs, String(timeout)).toEqual([`Markdownify remote listening on 127.0.0.1:${port}`]);
+    }
   });
 
   test("a clean shutdown closes jobs and the server, never forces an exit, and leaves no pending deadline", async () => {

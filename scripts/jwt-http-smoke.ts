@@ -1,4 +1,20 @@
-/** Real compiled Node service + PDF converter; optional actual LiteLLM signer fixture. */
+/**
+ * Real compiled Node service + PDF converter; optional actual LiteLLM signer fixture.
+ *
+ * Starts a local JWKS endpoint and dist/remote/index.js in JWT mode (under
+ * MD_TEST_NODE, default `node`), then with three subjects (machine-a/b/c)
+ * checks that upload grants are bound to their own upload, single-use and
+ * not accepted on /mcp; that jobs are invisible to other subjects
+ * (JOB_NOT_FOUND); and that examples/upload-and-convert.ts works through a
+ * LiteLLM-style gateway holding the only key. Tokens are signed here with a
+ * throwaway RS256 key, or taken from MD_TEST_LITELLM_SIGNER_FIXTURE, a JSON
+ * file made by the actual LiteLLM signer ({ issuer, audience, jwks,
+ * tokens[subject][tool] }).
+ *
+ * Usage: bun run build && bun scripts/jwt-http-smoke.ts (from the repo root).
+ * Any failed check throws, so the run exits non-zero; the child service, the
+ * helper servers and the temp directory are cleaned up either way.
+ */
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -27,7 +43,9 @@ async function stop(server: ReturnType<typeof createServer>) { server.closeAllCo
 const directory = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-jwt-http-"));
 const provider = createServer((_req, res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(jwks)); });
 const jwksPort = await listen(provider);
+// Borrow a free port for the service; it is released again before the child binds it.
 const probe = createServer(); const port = await listen(probe); await stop(probe); const base = `http://127.0.0.1:${port}`;
+// Drop any inherited auth settings so only the JWT configuration below applies.
 const env = { ...process.env }; for (const name of Object.keys(env)) if (name.startsWith("MD_JWT_") || ["MD_API_KEY", "MD_AUTH_FILE"].includes(name)) delete env[name];
 Object.assign(env, { MD_JWT_ISSUER: issuer, MD_JWT_AUDIENCE: audience, MD_JWT_JWKS_URL: `http://127.0.0.1:${jwksPort}/jwks`, MD_JWT_ALLOW_HTTP_LOCALHOST: "1", MD_PUBLIC_BASE_URL: base, MD_HOST: "127.0.0.1", MD_PORT: String(port), MD_DATA_DIR: path.join(directory, "data") });
 const child = spawn(process.env.MD_TEST_NODE ?? "node", ["dist/remote/index.js"], { env, stdio: ["ignore", "ignore", "pipe"], windowsHide: true });

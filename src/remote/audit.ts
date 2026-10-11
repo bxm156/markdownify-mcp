@@ -1,7 +1,21 @@
+/**
+ * Append-only JSON Lines audit log (`audit.jsonl` in the data directory). Records are metadata only: a timestamp, the
+ * event, owner, job ID, status, reason and repeat_count, each validated against a fixed format; never document
+ * contents, filenames, tokens or paths. The live file and its archives are mode 0o600, and writes are serialized, so
+ * records never interleave.
+ *
+ * Rotation: before an append that would take the live file past maxBytes (default 4 MiB), the live file becomes `.1` and
+ * older archives shift up, keeping at most `archives` (default 3, at most 10); see rotate for how an interrupted
+ * rotation resumes. Read coalescing and pass-based sampling happen in the job service (jobs.ts auditRead), not here.
+ */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { validatePrincipal } from "./identity.js";
 
+/**
+ * One audit record as submitted (the single declaration; jobs.ts imports it). createAuditLogger validates it, adds the
+ * timestamp and drops any field not listed here.
+ */
 export interface AuditEvent {
   event: string;
   tenant_id: string;
@@ -9,7 +23,7 @@ export interface AuditEvent {
   job_id?: string;
   status?: string;
   reason?: string;
-  /** read_markdown_repeat only: how many reads of the completed result followed the first recorded one. */
+  /** read_markdown_repeat only: the read pass number over the completed result (a multiple of AUDIT_READ_REPEAT_EVERY; see jobs.ts auditRead), not a count of reads. */
   repeat_count?: number;
 }
 
@@ -30,8 +44,8 @@ export class AuditRecordError extends Error {
  */
 export type AuditLogger = ((event: AuditEvent) => Promise<void>) & { probe: () => Promise<void> };
 
-/** An errno-style code safe for logs: never a path or message. */
-function errnoCode(error: unknown) {
+/** An errno-style code safe for operator logs (`/^[A-Z0-9_]{1,32}$/`, else "UNKNOWN"): never a path, message or stack. Shared with jobs.ts. */
+export function errnoCode(error: unknown) {
   const raw = (error as NodeJS.ErrnoException | null)?.code;
   return typeof raw === "string" && /^[A-Z0-9_]{1,32}$/.test(raw) ? raw : "UNKNOWN";
 }
@@ -46,6 +60,7 @@ export async function createAuditLogger(directory: string, options: { maxBytes?:
   const created = await fs.open(target, "a", 0o600);
   await created.close();
   await fs.chmod(target, 0o600);
+  // Tracked in memory from the startup size; this process is the only writer while it holds the data-directory lock.
   let size = (await fs.stat(target)).size;
   let pending: Promise<void> = Promise.resolve();
   let rotationFailing = false;
@@ -65,6 +80,7 @@ export async function createAuditLogger(directory: string, options: { maxBytes?:
     try { await fs.rename(target, `${target}.1`); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; } // Nothing live to archive.
   };
+  // Each write waits for the previous one (ignoring its failure), so appends and rotations never overlap.
   const write = (event: AuditEvent) => {
     const operation = pending.catch(() => undefined).then(async () => {
       let principal: ReturnType<typeof validatePrincipal>;

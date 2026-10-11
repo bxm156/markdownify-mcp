@@ -37,6 +37,7 @@ try:
     from mkdocs.plugins import event_priority
 except ImportError:  # self-check without MkDocs installed
     def event_priority(priority):
+        """No-op stand-in for ``mkdocs.plugins.event_priority``."""
         return lambda func: func
 
 # Repository files rendered on the site through include-markdown wrappers.
@@ -63,12 +64,15 @@ log = logging.getLogger("mkdocs.hooks.repo_links")
 
 @dataclass
 class LinkContext:
+    """Where a page lives, for resolving its relative links."""
+
     repo_url: str  # e.g. https://github.com/owner/repo
     repo_root: str  # local checkout root (directory holding mkdocs.yml)
     page_uri: str  # page path relative to docs/, e.g. "QUICKSTART.md"
 
     @property
     def page_dir(self) -> str:
+        """Directory of the page relative to docs/ ("" for a top-level page)."""
         return posixpath.dirname(self.page_uri)
 
 
@@ -146,6 +150,11 @@ def rewrite_links(markdown: str, ctx: LinkContext) -> str:
 
 @event_priority(-100)  # after include-markdown (priority 100) inlines files
 def on_page_markdown(markdown, page, config, files, **kwargs):
+    """MkDocs ``on_page_markdown`` event; see the module docstring.
+
+    Points a wrapper page's "Edit this page" link at its included source file
+    and returns ``markdown`` with repository links rewritten.
+    """
     repo_url = config.repo_url.rstrip("/")
     for source, wrapper in WRAPPED_PAGES.items():
         if page.file.src_uri == wrapper and page.edit_url:
@@ -159,6 +168,7 @@ def on_page_markdown(markdown, page, config, files, **kwargs):
 
 
 def _self_check() -> None:
+    """Check ``rewrite_links`` on a fixture with code spans, fences and LF/CRLF input."""
     root = os.path.dirname(os.path.abspath(__file__))
     repo = "https://github.com/bxm156/markdownify-mcp"
     ctx = LinkContext(repo_url=repo, repo_root=root, page_uri="QUICKSTART.md")
@@ -204,12 +214,17 @@ def _self_check() -> None:
         "lines [x](../LICENSE)` is code.",
         "",
     ])
+    # Explicit checks rather than assert, which ``python -O`` would strip.
     actual = rewrite_links(source, ctx)
-    assert actual == expected, f"unexpected rewrite:\n{actual}"
-    # The same fixture with CRLF line endings (several source docs use CRLF).
+    if actual != expected:
+        raise AssertionError(f"unexpected rewrite:\n{actual}")
+    # The same fixture with CRLF line endings. The docs are stored with LF
+    # (.gitattributes), but a CRLF working copy (e.g. an editor or a checkout
+    # with different settings) must still be rewritten correctly.
     actual_crlf = rewrite_links(source.replace("\n", "\r\n"), ctx)
     expected_crlf = expected.replace("\n", "\r\n")
-    assert actual_crlf == expected_crlf, f"unexpected CRLF rewrite:\n{actual_crlf!r}"
+    if actual_crlf != expected_crlf:
+        raise AssertionError(f"unexpected CRLF rewrite:\n{actual_crlf!r}")
     print("mkdocs_hooks self-check passed")
 
 
