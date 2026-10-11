@@ -1,10 +1,23 @@
+/**
+ * Runtime readiness checks (storage and converter) and the converter resolution rules shared with converter.ts.
+ *
+ * Converter resolution: resolveMarkitdownPath picks MARKITDOWN_PATH when set, else <cwd>/.venv/bin/markitdown when it
+ * exists, else the bare name "markitdown". A name containing a slash is used as given; a bare name is searched on PATH
+ * (DEFAULT_PATH when PATH is unset; empty entries are skipped). The first regular file with execute permission wins.
+ * Readiness reports the converter available exactly when this finds a file, and the converter spawns that same file.
+ *
+ * Checks never expose paths or error details and settle within their timeout. The only filesystem writes are one small
+ * `.health-<uuid>` probe file in the data directory, created exclusively and deleted at once; no audit record is written.
+ */
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { resolveMarkitdownPath } from "../utils.js";
 
+/** Result of checkRuntime. free_bytes is null when statfs failed; check "custom" means an injected converter, always available. */
 export type RuntimeHealth = { checked_at: string; storage: { writable: boolean; free_bytes: number | null }; converter: { available: boolean; check: "custom" | "executable" } };
+/** Default deadline for one readiness check, and for waiting on the audit recovery probe (jobs.ts). */
 export const HEALTH_TIMEOUT_MS = 5000;
 /** Largest delay setTimeout honours; Node clamps anything above it to 1 ms. */
 export const MAX_TIMER_MS = 2 ** 31 - 1;
@@ -28,6 +41,7 @@ export async function resolveConverterExecutable(exe: string, env: NodeJS.Proces
   }
   return undefined;
 }
+/** In-flight runs keyed by data directory and converter mode; an entry is deleted only when its filesystem work finishes. */
 const inFlight = new Map<string, Promise<RuntimeHealth>>();
 /** Keep the underlying filesystem work single-flight even after its response deadline. */
 export function checkRuntime(dataDir: string, customConverter: boolean, timeoutMs = HEALTH_TIMEOUT_MS): Promise<RuntimeHealth> {

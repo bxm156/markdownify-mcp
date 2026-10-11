@@ -1,3 +1,13 @@
+/**
+ * MCP tool surface of the remote server. http.ts builds one server per authenticated request, bound to that request's
+ * principal, so every tool acts only on the caller's own jobs.
+ *
+ * Authorization: a principal without `scopes` (credential registry or MD_API_KEY mode) may list and call every tool. A
+ * JWT principal needs `mcp:tools/list` to list tools; to call one it needs `mcp:tools/call` and a per-tool scope
+ * `mcp:tools/<name>:call`, where <name> is the bare tool name or the tool prefix (default "markdownify-") followed by it.
+ * A tools/call failure is returned as an isError result whose text is an errorResponse body; a tools/list scope failure
+ * is a JSON-RPC error.
+ */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
@@ -5,8 +15,10 @@ import { JobService, ServiceError } from "./jobs.js";
 import type { AuthenticatedPrincipal } from "./auth.js";
 import { errorResponse, lookupError } from "./errors.js";
 
+/** Name and version reported by initialize, including by the anonymous probe server in http.ts. */
 export const SERVER_INFO = { name: "markdownify-remote", version: "0.1.0" } as const;
 const id = z.string().uuid();
+/** Tool descriptions (written for the calling agent) and strict input schemas: unknown argument keys are rejected. */
 const definitions = {
   get_service_health: { description: "Use to check service readiness, storage/converter/audit checks, and your own job states, reserved bytes, your own jobs' retention cleanup failures, configured quota/concurrency limits and limits.effective (the tightest caps that apply to you, including any operator override for you). Never returns other users' job counts, usage or IDs. Queue saturation is normal and does not make the process unhealthy. This is not a converter quality test; follow existing error guidance on failures.", schema: z.strictObject({}) },
   create_upload: { description: "Use first for a new accessible file or replacement of an expired/failed job. Reserve private storage using basename and actual byte count. Runtime must PUT bytes to upload_url with required_headers: use returned scoped Authorization in JWT mode, otherwise add owner bearer Authorization. Files do not pass through MCP. Keep both upload credentials secret; grants expire and are consumed once. Follow error_info/lookup_error on limits; avoid blind retries and duplicate reservations.", schema: z.strictObject({ filename: z.string().min(1).max(255), size_bytes: z.number().int().positive() }) },
@@ -17,6 +29,7 @@ const definitions = {
   lookup_error: { description: "Use when a tool, upload response or failed status returns error_info.code and you need recovery guidance. Returns the code's meaning, retryable flag and next_steps. This static lookup does not inspect jobs or reveal credentials/other-agent usage; instance-specific limits are in the original error_info.details. retryable never means unlimited retries.", schema: z.strictObject({ code: z.string().min(1).max(64) }) },
 };
 
+/** Builds the MCP server for one request and principal; `publicBaseUrl` is the base of create_upload's upload_url. */
 export function createRemoteServer(service: JobService, publicBaseUrl: string, principal: AuthenticatedPrincipal): Server {
   const base = publicBaseUrl.replace(/\/$/, "");
   const server = new Server(SERVER_INFO, { capabilities: { tools: {} } });
@@ -35,6 +48,8 @@ export function createRemoteServer(service: JobService, publicBaseUrl: string, p
       let result: unknown;
       switch (params.name) {
         case "create_upload": {
+          // A JWT principal (one with scopes) PUTs with a scoped upload credential instead of a JWT (see http.ts), so one is
+          // issued and returned as the upload's Authorization header.
           const upload = await service.createUpload(principal, args, !!principal.scopes);
           result = { upload_id: upload.upload_id, expires_at: upload.expires_at, upload_url: `${base}/uploads/${upload.upload_id}`, required_headers: { "X-Upload-Token": upload.upload_token, "Content-Type": "application/octet-stream", ...(upload.upload_auth_token ? { Authorization: `Bearer ${upload.upload_auth_token}` } : {}) } };
           break;
@@ -45,6 +60,7 @@ export function createRemoteServer(service: JobService, publicBaseUrl: string, p
         case "delete_job": result = await service.deleteJob(principal, args.job_id); break;
         case "get_service_health": result = await service.health(principal); break;
         case "lookup_error": {
+          // lookupError answers an unknown code with UNKNOWN_ERROR_CODE guidance; report that as a tool error, not a lookup result.
           result = lookupError(args.code);
           if ((result as { code: string }).code === "UNKNOWN_ERROR_CODE") throw new ServiceError(400, "Unknown error code", "UNKNOWN_ERROR_CODE");
           break;

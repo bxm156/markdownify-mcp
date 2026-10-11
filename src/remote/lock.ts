@@ -1,3 +1,12 @@
+/**
+ * Data-directory lock: one process per data volume, either the server or a running purge-owner --apply.
+ *
+ * Protocol: `<realpath(dataDir)>/.lock` is created exclusively (mode 0o600) with the contents "<pid>\n<uuid>\n". If it
+ * already exists, acquisition fails with LockHeldError; a lock is never reclaimed automatically. Release (releaseLock,
+ * or the exit hook for anything still held) unlinks the file only while it still holds exactly what this acquisition
+ * wrote. A lock left by SIGKILL, an OOM kill or a host crash must be removed by an operator after stopping every user of
+ * the volume (LOCK_REMOVAL_HINT).
+ */
 import { randomUUID } from "node:crypto";
 import { readFileSync, rmSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -8,7 +17,9 @@ import path from "node:path";
 // A lock is only ever unlinked while its contents still match, so a lock replaced by an operator and re-acquired by
 // another process is never removed by this one.
 const held = new Map<string, string>();
+/** Whether the process "exit" listener that releases held locks is installed (at most once per process). */
 let exitHook = false;
+/** Operator guidance appended to lock errors. */
 export const LOCK_REMOVAL_HINT = "If no markdownify process is using this volume (for example after a crash or SIGKILL), remove MD_DATA_DIR/.lock and restart; see docs/MULTITENANT.md";
 /** The data directory's lock file already exists. */
 export class LockHeldError extends Error {}
@@ -33,6 +44,11 @@ export async function acquireLock(dataDir: string) {
   if (!exitHook) { exitHook = true; process.on("exit", () => { for (const [directory, mine] of held) { try { const target = path.join(directory, ".lock"); if (readFileSync(target, "utf8") === mine) rmSync(target, { force: true }); } catch {} } held.clear(); }); }
   return real;
 }
+/**
+ * Releases a lock this process acquired, given the real path acquireLock returned; a no-op for any other path. A lock
+ * whose contents changed is left in place and forgotten. A read failure other than ENOENT keeps it held for the exit
+ * hook to retry.
+ */
 export async function releaseLock(real: string) {
   const mine = held.get(real), target = path.join(real, ".lock");
   if (mine === undefined) return;
