@@ -11,6 +11,11 @@ const overrideFields = { max_jobs: "maxJobs", max_storage_bytes: "maxStorageByte
  */
 export const SHUTDOWN_TIMEOUT_WARN_MS = 15_000;
 /**
+ * The remote server and its operator CLIs ship only as a Linux container image and do not support Windows; on a Windows
+ * host, run that image (for example with Docker Desktop). The stdio server is separate and still supports Windows.
+ */
+export const WINDOWS_UNSUPPORTED_MESSAGE = "The remote server is not supported on Windows. Run the Linux container image (see docs/CONTAINERS.md) instead.";
+/**
  * Operator-managed agent-scope caps, read once at startup. Unlisted principals keep the defaults: this is not an
  * allowlist and never grants or denies access. Overrides above a global cap are rejected rather than silently clamped.
  */

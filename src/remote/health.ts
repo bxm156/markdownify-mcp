@@ -8,43 +8,23 @@ export type RuntimeHealth = { checked_at: string; storage: { writable: boolean; 
 export const HEALTH_TIMEOUT_MS = 5000;
 /** Largest delay setTimeout honours; Node clamps anything above it to 1 ms. */
 export const MAX_TIMER_MS = 2 ** 31 - 1;
-/** Extensions Windows can start directly with CreateProcess. `spawn` without a shell refuses `.cmd`/`.bat` (EINVAL) and
- * cannot run anything else, so these are the only converter files that count on win32. */
-const WIN32_RUNNABLE = new Set([".com", ".exe"]);
-/** Windows' own order when PATHEXT is unset, restricted to directly runnable extensions. */
-const WIN32_DEFAULT_PATHEXT = ".COM;.EXE";
-/** The POSIX search list used when PATH is unset (not when it is empty), close to what libc's execvp falls back to.
- * A container started without PATH therefore still finds /usr/bin/markitdown. win32 has no such fallback. */
+/** The search list used when PATH is unset (not when it is empty), close to what libc's execvp falls back to.
+ * A container started without PATH therefore still finds /usr/bin/markitdown. */
 export const DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin";
-/** Paths probed for the converter executable, in order. POSIX: a path is used as given; a bare name is looked up on PATH
+/** Paths probed for the converter executable, in order. A path is used as given; a bare name is looked up on PATH
  * (`defaultPath` when PATH is unset), and empty PATH entries are skipped so the working directory is never searched.
- * win32: only `.com`/`.exe` files qualify. A name without an extension gets each runnable PATHEXT suffix (empty and
- * shell-only entries such as `.CMD`/`.BAT` are dropped), a name with another extension has no candidates, and a bare name
- * is looked up on PATH. `env`, `platform` and `defaultPath` are parameters so both platforms' rules are testable anywhere. */
-export function converterCandidates(exe: string, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform, defaultPath: string = DEFAULT_PATH): string[] {
-  const paths = platform === "win32" ? path.win32 : path.posix;
-  let names = [exe];
-  if (platform === "win32") {
-    const extension = paths.extname(exe);
-    names = extension ? (WIN32_RUNNABLE.has(extension.toLowerCase()) ? [exe] : [])
-      : (env.PATHEXT ?? WIN32_DEFAULT_PATHEXT).split(";").filter(suffix => WIN32_RUNNABLE.has(suffix.toLowerCase())).map(suffix => exe + suffix);
-  }
-  if (paths.isAbsolute(exe) || /[\\/]/.test(exe)) return names;
-  return (env.PATH ?? (platform === "win32" ? "" : defaultPath)).split(paths.delimiter).filter(Boolean).flatMap(dir => names.map(name => paths.join(dir, name)));
+ * The remote server runs on POSIX only (it refuses to start on Windows), so these are POSIX rules. */
+export function converterCandidates(exe: string, env: NodeJS.ProcessEnv = process.env, defaultPath: string = DEFAULT_PATH): string[] {
+  if (path.isAbsolute(exe) || /[\\/]/.test(exe)) return [exe];
+  return (env.PATH ?? defaultPath).split(path.delimiter).filter(Boolean).map(dir => path.join(dir, exe));
 }
-/** The access check a converter candidate must pass: execute permission on POSIX; existence on win32, which has no
- * execute bit (runnability there comes from the extension filter in converterCandidates). */
-export function converterAccessMode(platform: NodeJS.Platform = process.platform): number {
-  return platform === "win32" ? constants.F_OK : constants.X_OK;
-}
-/** The first candidate that is a regular file passing converterAccessMode, or undefined. Health reports the converter
+/** The first candidate that is a regular file with execute permission (X_OK), or undefined. Health reports the converter
  * available exactly when this finds one, and the converter spawns the path it returns, so both name the same file.
  * `stop` is checked before each candidate so an abandoned health check stops touching the filesystem. */
-export async function resolveConverterExecutable(exe: string, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform, stop: () => boolean = () => false, defaultPath: string = DEFAULT_PATH): Promise<string | undefined> {
-  const mode = converterAccessMode(platform);
-  for (const candidate of converterCandidates(exe, env, platform, defaultPath)) {
+export async function resolveConverterExecutable(exe: string, env: NodeJS.ProcessEnv = process.env, stop: () => boolean = () => false, defaultPath: string = DEFAULT_PATH): Promise<string | undefined> {
+  for (const candidate of converterCandidates(exe, env, defaultPath)) {
     if (stop()) return undefined;
-    try { if (!(await fs.stat(candidate)).isFile()) continue; await fs.access(candidate, mode); return candidate; } catch {}
+    try { if (!(await fs.stat(candidate)).isFile()) continue; await fs.access(candidate, constants.X_OK); return candidate; } catch {}
   }
   return undefined;
 }
@@ -77,7 +57,7 @@ async function runRuntime(dataDir: string, customConverter: boolean, timeoutMs: 
   })();
   const converter = (async () => {
     if (customConverter) return;
-    if (await resolveConverterExecutable(resolveMarkitdownPath(process.cwd()), process.env, process.platform, () => abandoned) !== undefined) result.converter.available = true;
+    if (await resolveConverterExecutable(resolveMarkitdownPath(process.cwd()), process.env, () => abandoned) !== undefined) result.converter.available = true;
   })();
   const work = Promise.all([storage, converter]).finally(settled);
   const done = await Promise.race([work.then(() => true), new Promise<false>(resolve => { timer = setTimeout(resolve, timeoutMs, false); })]);

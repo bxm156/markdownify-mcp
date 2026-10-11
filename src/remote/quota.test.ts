@@ -235,7 +235,7 @@ describe("MD_QUOTA_OVERRIDES_FILE configuration", () => {
     return target;
   }
   const entry = (changes: Record<string, unknown> = {}) => ({ tenant_id: "user-a", agent_id: "user-a", max_jobs: 5, ...changes });
-  test.skipIf(process.platform === "win32")("a FIFO is rejected without blocking startup", async () => {
+  test("a FIFO is rejected without blocking startup", async () => {
     const fifo = path.join(path.dirname(await file({ overrides: [] })), "fifo.json");
     execFileSync("mkfifo", [fifo]);
     // A blocking open would stall the whole event loop, so a timer in this process could never fire; bound it in a child process.

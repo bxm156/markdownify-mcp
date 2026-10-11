@@ -3,8 +3,9 @@ name: Cross-platform
 # paths: no /proc/self/fd (the device/inode fallback), no O_NOFOLLOW on
 # Windows. The real converter (markitdown, same pin as the other workflows) is
 # installed so the converter-dependent tests run instead of skipping.
-# src/remote/converter.test.ts stays on Linux only: it drives the converter
-# through POSIX `#!/bin/sh` wrapper scripts and process-group signals.
+# Only the stdio server supports macOS and Windows. The remote server
+# (src/remote) is Linux-only: it ships as a container image and refuses to
+# start on Windows, so none of its tests run here.
 on:
   push:
   pull_request:
@@ -41,4 +42,4 @@ jobs:
           bun -e "if (!Bun.which('markitdown')) { console.error('markitdown is not on PATH'); process.exit(1); }"
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run typecheck
-      - run: bun test src/utils.test.ts src/Markdownify.test.ts src/download.test.ts src/server.test.ts src/tools.test.ts src/remote/health-paths.test.ts
+      - run: bun test src/utils.test.ts src/Markdownify.test.ts src/download.test.ts src/server.test.ts src/tools.test.ts

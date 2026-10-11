@@ -24,19 +24,18 @@ export function abortError(signal: AbortSignal): ServiceError {
   return reason instanceof ServiceError && abortCodes.has(reason.code) ? reason : conversionAbort.cancelled();
 }
 
-/** No shell is involved, so on win32 only `.exe`/`.com` converters run (see resolveConverterExecutable); stdout is
- * streamed and bounded, including during conversion. */
+/** Runs the converter without a shell; stdout is streamed and bounded, including during conversion. */
 export function createConverter(options: { maxOutputBytes: number; projectRoot?: string; executable?: string }): Converter {
   return async (inputPath, outputPath, signal) => {
     if (signal.aborted) throw abortError(signal);
     const requested = options.executable ?? resolveMarkitdownPath(options.projectRoot ?? process.cwd());
     // Spawn exactly the file the health check reports, never a different search result. A miss fails closed: spawn would
-    // search its own way (an unset or empty PATH, the working directory on win32) and could run a file health never saw.
+    // search its own way (for example with an unset or empty PATH) and could run a file health never saw.
     // The code is ENOENT, which the job service maps to INTERNAL_ERROR.
     const executable = await resolveConverterExecutable(requested);
     if (signal.aborted) throw abortError(signal);
     if (executable === undefined) throw Object.assign(new Error("Converter executable not found"), { code: "ENOENT" });
-    const child = spawn(executable, [inputPath], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const child = spawn(executable, [inputPath], { stdio: ["ignore", "pipe", "pipe"] });
     let bytes = 0;
     // Drain stderr without retaining document contents or exposing server paths to clients.
     child.stderr.resume();
@@ -57,7 +56,7 @@ export function createConverter(options: { maxOutputBytes: number; projectRoot?:
     } catch (error) {
       stop();
       // A nonzero exit can arrive before the output stream has closed. Wait
-      // for both before the caller removes its partial output (also on Windows).
+      // for both before the caller removes its partial output.
       await Promise.allSettled([exited, streamed]);
       // A killed child exits nonzero; report why it was killed, not a document failure.
       throw signal.aborted ? abortError(signal) : error;

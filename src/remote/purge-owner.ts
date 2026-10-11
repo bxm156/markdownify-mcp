@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { WINDOWS_UNSUPPORTED_MESSAGE } from "./config.js";
 import { validatePrincipal, type Principal } from "./identity.js";
 import { LOCK_REMOVAL_HINT, LockHeldError, acquireLock, readLock, releaseLock } from "./lock.js";
 
@@ -59,7 +60,11 @@ async function scan(root: string, candidates: string[], owner: Principal, apply:
 
 // Compare real paths so invocation through a symlink behaves like a direct invocation.
 const isMain = () => { try { return !!process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); } catch { return false; } };
-if (isMain()) {
+if (isMain() && process.platform === "win32") {
+  // Like the server, this CLI is Linux-only: run it inside the container image (see docs/CONTAINERS.md).
+  console.error(WINDOWS_UNSUPPORTED_MESSAGE);
+  process.exitCode = 1;
+} else if (isMain()) {
   // An interrupted purge exits through process.exit so the lock module's exit hook releases a held lock.
   for (const [signal, number] of [["SIGINT", 2], ["SIGTERM", 15], ["SIGHUP", 1]] as const) process.once(signal, () => process.exit(128 + number));
   const [dataDir, tenantId, agentId, flag, ...rest] = process.argv.slice(2);

@@ -66,7 +66,7 @@ const actors = [{tenantId:'team',agentId:'alice'},{tenantId:'team',agentId:'bob'
 const service=new JobService({dataDir:${JSON.stringify(dataDir)},maxUploadBytes:100,maxOutputBytes:1024,maxStorageBytes:100000,maxJobs:20,retentionMs:60000,uploadTtlMs:60000,conversionTimeoutMs:60000,concurrency:1,converter:async()=>{await new Promise(()=>{setInterval(()=>{},1000);});}}); await service.init(); const ids=[];
 for(let i=0;i<actors.length;i++){const actor=actors[i];const job=await service.createUpload(actor,{filename:'a.txt',size_bytes:1});await service.upload(actor,job.upload_id,job.upload_token,Readable.from([String(i)]));await service.startConversion(actor,job.upload_id);ids.push(job.upload_id);if(i===0){while((await service.getStatus(actor,job.upload_id)).status!=='running')await new Promise(r=>setTimeout(r,5));}}
 process.stdout.write(JSON.stringify(ids)+'\\n');`);
-    const child = spawn(process.execPath, [workerFile], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }); children.push(child);
+    const child = spawn(process.execPath, [workerFile], { stdio: ["ignore", "pipe", "pipe"] }); children.push(child);
     let stdout = "", stderr = ""; child.stdout!.on("data", chunk => { stdout += chunk.toString(); }); child.stderr!.on("data", chunk => { stderr += chunk.toString(); });
     await waitFor(() => stdout.includes("\n") || child.exitCode !== null, { label: "crash worker readiness" });
     if (!stdout.includes("\n")) throw new Error(`Worker exited: ${stderr}`);
@@ -128,8 +128,8 @@ process.stdout.write(JSON.stringify(ids)+'\\n');`);
     let calls = 0;
     const { instance, options } = await service({ converter: async (_input, output) => { calls++; await fs.writeFile(output, "recovered"); } });
     const id = await uploaded(instance, alice), manifest = path.join(options.dataDir, id, "job.json"), backup = `${manifest}.backup`;
-    // A real directory at the manifest target prevents atomic file rename on
-    // Windows and Linux, without mocking the implementation or filesystem API.
+    // A real directory at the manifest target prevents the atomic file rename,
+    // without mocking the implementation or filesystem API.
     await fs.rename(manifest, backup); await fs.mkdir(manifest);
     await expect(instance.startConversion(alice, id)).rejects.toMatchObject({ code: expect.stringMatching(/^(EISDIR|EPERM|EACCES)$/) }); expect(calls).toBe(0);
     expect((await instance.getStatus(alice, id)).status).toBe("uploaded");

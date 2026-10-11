@@ -17,15 +17,14 @@ The allowlist is PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, HTML, and JSON. The remote
 
 ## Local setup
 
+The remote server supports Linux only and ships as a Linux container image. The process refuses to start on Windows; run the container instead, for example with Docker Desktop (see [CONTAINERS.md](CONTAINERS.md)).
+
 Use Bun for this repository's package management. The portable remote build produces JavaScript runnable with Node 22 or later.
 
 ```sh
 bun install --frozen-lockfile --ignore-scripts
 python -m venv .venv
-# Unix:
 .venv/bin/pip install 'markitdown[pdf,docx,xlsx,pptx]==0.1.5'
-# Windows instead:
-# .venv\Scripts\python -m pip install "markitdown[pdf,docx,xlsx,pptx]==0.1.5"
 bun run build:remote
 ```
 
