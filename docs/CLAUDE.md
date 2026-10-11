@@ -62,8 +62,11 @@ When the code below changes, update the matching doc in the same PR:
 | `MULTITENANT.md` | "Audited events" table, lifecycle events and the stderr JSON events (`audit_sink_unavailable`, `audit_sink_recovered`, `audit_record_rejected`, `audit_rotation_failed`) |
 | `HEALTH.md` | `/livez`, `/readyz` and `get_service_health` readiness fields (`checks.*`, `limits.effective`); `REMOTE.md` repeats the `/readyz` summary, keep both in step |
 | `REMOTE.md` | the env table: every `MD_*` variable read under `src/remote`, its default and meaning (`bun scripts/check-env-docs.ts` fails CI on a missing one) |
+| `README.md` | the "Stdio environment variables" table: every `MD_*` name and `process.env` read in `src/*.ts` (same script, same CI failure) |
 | `JWT.md` | revocation and expiry bounds (JWT TTL, 5 s `iat` skew, 60 s JWKS cache, 5 s refresh cooldown, 300 s upload grant, retention) |
 | `CONTAINERS.md` | `Dockerfile.remote`, pinned versions, `docker-publish.yml` tags and secrets, compose files |
+
+`bun scripts/check-env-docs.ts` enforces both env tables (remote in `REMOTE.md`, stdio in `README.md`) and prints one line per half; run it after touching either.
 
 Also check `.env.*.example`, `QUICKSTART.md` and `/SKILL.md` when a variable or tool changes.
 

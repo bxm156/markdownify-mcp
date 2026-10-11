@@ -135,7 +135,7 @@ For PowerShell use `$env:MCP_URL='...'` (and similarly for other variables) inst
 | `MD_JWT_TOOL_PREFIX` | `markdownify-` | Optional gateway alias prefix accepted in tool scopes; see [JWT.md](JWT.md) |
 | `MD_JWT_ALLOW_HTTP_LOCALHOST` | unset | Set to `1` only in tests to allow a loopback HTTP JWKS URL; see [JWT.md](JWT.md) |
 
-`bun scripts/check-env-docs.ts` fails if a `MD_*` variable read under `src/remote` is missing from this table; CI runs it, so add a row when you add a variable.
+`bun scripts/check-env-docs.ts` fails if a `MD_*` variable read under `src/remote` is missing from this table; CI runs it, so add a row when you add a variable. The same script also checks the stdio server: every `MD_*` name and `process.env` read under `src/*.ts` must be in the "Stdio environment variables" table of the [README](../README.md#stdio-environment-variables).
 
 The tenant and agent caps (`MD_MAX_TENANT_*`, `MD_MAX_AGENT_*`, see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling)) are checked against these at startup: an explicit value above its global cap, or any storage budget below `1 + MD_MAX_OUTPUT_BYTES`, stops startup with a message naming the variable, and an unset tenant or agent default is lowered to its global cap.
 

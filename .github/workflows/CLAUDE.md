@@ -9,8 +9,10 @@ markitdown 0.1.5 (`markitdown[pdf,docx,xlsx,pptx]==0.1.5`), LiteLLM 1.104.0
 `remote` job runs a `node: [22, 24]` matrix (and builds the image with the matching
 `NODE_IMAGE`) until a cleanup PR drops 22 at its end of life; `engines.node` stays
 `>=22` until then. docker-publish.yml and cross-platform.yml use Node 24 only.
-Actions: `actions/checkout@v5`, `actions/setup-node@v5`, `actions/setup-python@v6`
-(all Node 24 runtimes). The stdio
+Actions, all on Node 24 runtimes (`runs.using: node24`): `actions/checkout@v5`, `actions/setup-node@v5`,
+`actions/setup-python@v6`, and in docs.yml `actions/configure-pages@v6`,
+`actions/deploy-pages@v5`, `actions/upload-pages-artifact@v5` (a composite action over
+`actions/upload-artifact@v7`, also node24; v3 and v4 used upload-artifact v4, node20). The stdio
 `Dockerfile` pins Bun 1.4.2 and `markitdown[all]==0.1.5` (audio/OCR tools) and uses
 the base image's Debian `python3` (`oven/bun:1.4.2-debian` is trixie, so 3.13) plus
 ffmpeg, deliberately without a second Python toolchain. Change a pin in every
@@ -25,7 +27,7 @@ Triggers: every `push` and `pull_request`. No secrets.
   `node --version` on PATH is the leg's major (Node-only tests would otherwise skip
   silently); `bun install --frozen-lockfile --ignore-scripts`;
   `bun run typecheck` (tests, scripts, examples); `bun scripts/check-env-docs.ts`
-  (every `MD_*` in `src/remote` is in the `docs/REMOTE.md` table); an `ast`-based guard that
+  (every `MD_*` in `src/remote` is in the `docs/REMOTE.md` table, and every `MD_*` or `process.env` read in `src/*.ts` is in the README's "Stdio environment variables" table); an `ast`-based guard that
   fails on any `assert` statement in `scripts/*.py` and `mkdocs_hooks.py` (`python -O`
   strips them, use `raise`);
   `bun run build:remote`; `bun test src/remote`; install markitdown; `bun run
@@ -89,7 +91,8 @@ pip cache, `pip install -r docs/requirements.txt`, `python mkdocs_hooks.py`,
 `mkdocs build --strict`; uploads the Pages artifact only on `main`. Job
 `deploy` (10 min, `needs: build`, main only, concurrency group `pages` without
 cancel) has `pages: write`, `id-token: write`, environment `github-pages`, and
-runs `configure-pages` (`enablement: true`) and `deploy-pages`.
+runs `configure-pages` (`enablement: true`) and `deploy-pages`. Use the same
+checkout/setup-python majors as the other workflows.
 
 ## cross-platform.yml ("Cross-platform")
 
