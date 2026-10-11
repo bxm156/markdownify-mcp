@@ -9,6 +9,7 @@ test("every numeric default is pinned, including storage, concurrency and timing
   const config = loadConfig(env);
   expect(config.port).toBe(8000);
   expect(config.host).toBe("127.0.0.1");
+  expect(config.shutdownTimeoutMs).toBe(10_000);
   expect(config.publicBaseUrl).toBe("http://localhost:8000");
   expect(config.allowedHosts).toEqual(["localhost:8000", "localhost:8000", "127.0.0.1:8000"]);
   expect(config.jobs).toEqual({
@@ -56,8 +57,14 @@ test("each default can be overridden independently through its environment varia
     for (const other of Object.keys(jobs)) if (other !== field) expect(jobs[other], `${name} leaked into ${other}`).toEqual(defaults[other]);
   }
 });
+test("MD_SHUTDOWN_TIMEOUT_MS overrides only the shutdown deadline", () => {
+  const changed = loadConfig({ ...env, MD_SHUTDOWN_TIMEOUT_MS: "1234" }), defaults = loadConfig(env);
+  expect(changed.shutdownTimeoutMs).toBe(1234);
+  expect(changed.jobs).toEqual(defaults.jobs);
+  expect([changed.port, changed.host]).toEqual([defaults.port, defaults.host]);
+});
 test("every numeric setting rejects empty, zero, negative, fractional and non-numeric values", () => {
-  for (const name of ["MD_PORT", "MD_MAX_UPLOAD_BYTES", "MD_MAX_STORAGE_BYTES", "MD_MAX_JOBS", "MD_RETENTION_MS", "MD_UPLOAD_TTL_MS", "MD_CONVERSION_TIMEOUT_MS", "MD_MAX_OUTPUT_BYTES", "MD_CONCURRENCY", "MD_MAX_TENANT_JOBS", "MD_MAX_TENANT_STORAGE_BYTES", "MD_MAX_TENANT_CONCURRENCY", "MD_MAX_AGENT_JOBS", "MD_MAX_AGENT_STORAGE_BYTES", "MD_MAX_AGENT_CONCURRENCY"]) {
+  for (const name of ["MD_PORT", "MD_SHUTDOWN_TIMEOUT_MS", "MD_MAX_UPLOAD_BYTES", "MD_MAX_STORAGE_BYTES", "MD_MAX_JOBS", "MD_RETENTION_MS", "MD_UPLOAD_TTL_MS", "MD_CONVERSION_TIMEOUT_MS", "MD_MAX_OUTPUT_BYTES", "MD_CONCURRENCY", "MD_MAX_TENANT_JOBS", "MD_MAX_TENANT_STORAGE_BYTES", "MD_MAX_TENANT_CONCURRENCY", "MD_MAX_AGENT_JOBS", "MD_MAX_AGENT_STORAGE_BYTES", "MD_MAX_AGENT_CONCURRENCY"]) {
     for (const value of ["", "0", "-1", "1.5", "abc", "NaN", "Infinity"]) expect(() => loadConfig({ ...env, [name]: value }), `${name}=${JSON.stringify(value)}`).toThrow(name);
   }
 });

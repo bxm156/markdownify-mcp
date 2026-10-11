@@ -16,6 +16,8 @@ The container runs as UID/GID 10001. Persist `/data` in one named volume and run
 
 Follow [the fresh deployment quickstart](QUICKSTART.md) for credential provisioning, file permissions, and isolated client verification. [compose.multitenant.yaml](../compose.multitenant.yaml) builds locally and applies a read-only root filesystem, writable `/data`, bounded `/tmp`, resource limits, and dropped capabilities. Production traffic should terminate HTTPS at a reverse proxy preserving `Authorization` and `X-Upload-Token`, routing both `/mcp` and `/uploads/*`, and permitting PUT. Set the public HTTPS origin and host allowlist accordingly.
 
+On SIGTERM, SIGINT or SIGHUP the server stops converters and releases the data-volume lock, and forces exit 1 if that takes longer than `MD_SHUTDOWN_TIMEOUT_MS` (default 10,000). Keep the container stop grace period (`stop_grace_period: 15s` in the bundled Compose files) above that value, or the runtime sends SIGKILL first and leaves `.lock` behind.
+
 The image includes `/app/SKILL.md`, deployment documents, and the example client source for inspection. The client runs outside the server container using its own file access and credential; Bun is required to run that TypeScript example directly. Credentials are supplied at runtime, not embedded in documentation or image layers.
 
 ## Docker Hub configuration
