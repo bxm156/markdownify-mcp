@@ -1,0 +1,30 @@
+name: Cross-platform
+# Runs the stdio unit tests where the local-file code takes its non-Linux
+# paths: no /proc/self/fd (the device/inode fallback), no O_NOFOLLOW on
+# Windows. markitdown is not installed here, so tests that need the real
+# converter skip themselves.
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      # src/download.test.ts also runs a few checks under Node (type stripping).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run typecheck
+      - run: bun test src/utils.test.ts src/Markdownify.test.ts src/download.test.ts src/server.test.ts src/tools.test.ts
