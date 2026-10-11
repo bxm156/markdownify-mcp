@@ -1,4 +1,10 @@
 #!/usr/bin/env node
+/**
+ * Operator CLI: list or delete every job of one tenant/agent in a stopped server's data volume (see purgeOwnerJobs).
+ * Usage: node dist/remote/purge-owner.js <data-dir> <tenant_id> <agent_id> [--apply]. Prints a JSON PurgeReport and
+ * exits 0 when complete, 1 when refused or incomplete (unreadable manifests or failed deletions) and 2 on bad usage.
+ * Linux-only, like the server.
+ */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { realpathSync } from "node:fs";
@@ -7,11 +13,14 @@ import { WINDOWS_UNSUPPORTED_MESSAGE } from "./config.js";
 import { validatePrincipal, type Principal } from "./identity.js";
 import { LOCK_REMOVAL_HINT, LockHeldError, acquireLock, readLock, releaseLock } from "./lock.js";
 
+/** One owned job. bytes sums its directory's entries (null if unreadable); code is an errno-style code when deletion failed. */
 export type PurgedJob = { job_id: string; status: string; bytes: number | null; result: "listed" | "deleted" | "failed"; code?: string };
+/** Result of purgeOwnerJobs. Skipped and unreadable directories are reported for review and never touched. */
 export type PurgeReport = { applied: boolean; tenant_id: string; agent_id: string; jobs: PurgedJob[]; skipped: { job_id: string; reason: "missing_manifest" | "legacy_unowned" | "malformed_owner" | "id_mismatch" }[]; unreadable: string[] };
 /** A precondition failed; nothing was read or removed. */
 export class PurgeRefused extends Error {}
 const errorCode = (error: unknown) => { const code = (error as NodeJS.ErrnoException | null)?.code; return typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code) ? code : "UNKNOWN"; };
+/** Sum of the lstat sizes of a job directory's direct entries (job directories are flat; symlinks are not followed). */
 async function directoryBytes(directory: string) { let bytes = 0; for (const name of await fs.readdir(directory)) bytes += (await fs.lstat(path.join(directory, name))).size; return bytes; }
 
 /**
@@ -35,6 +44,7 @@ export async function purgeOwnerJobs(dataDir: string, owner: Principal, apply = 
   catch (error) { if (error instanceof LockHeldError) throw locked; throw new PurgeRefused(`Cannot create MD_DATA_DIR/.lock (${errorCode(error)}); --apply needs write access to the data directory`); }
   try { return await scan(root, candidates, owner, true); } finally { await releaseLock(root); }
 }
+/** Reads each candidate manifest and lists, or when applying deletes, the directories owned by `owner`. */
 async function scan(root: string, candidates: string[], owner: Principal, apply: boolean) {
   const report: PurgeReport = { applied: apply, tenant_id: owner.tenantId, agent_id: owner.agentId, jobs: [], skipped: [], unreadable: [] };
   for (const name of candidates) {

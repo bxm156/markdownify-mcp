@@ -1,8 +1,13 @@
+/**
+ * Environment configuration for the remote server, read and validated once at startup. Every problem throws an Error
+ * naming the variable, so a misconfigured deployment fails to start instead of running on a fallback.
+ */
 import fs from "node:fs";
 import path from "node:path";
 import { loadAuthenticator } from "./auth.js";
 import { quotaKey, validatePrincipal, type QuotaOverride } from "./identity.js";
 
+/** Override-file field names, mapped to the QuotaOverride keys they set. */
 const overrideFields = { max_jobs: "maxJobs", max_storage_bytes: "maxStorageBytes", max_concurrency: "maxConcurrency" } as const;
 /**
  * Ceiling for MD_SHUTDOWN_TIMEOUT_MS before startup warns. The bundled Compose files (compose.remote.yaml,
@@ -22,6 +27,7 @@ export const WINDOWS_UNSUPPORTED_MESSAGE = "The remote server is not supported o
 export function loadQuotaOverrides(file: string, global: { maxJobs: number; maxStorageBytes: number; concurrency: number; maxOutputBytes: number }) {
   const fail = (reason: string): never => { throw new Error(`MD_QUOTA_OVERRIDES_FILE ${reason}`); };
   if (!file) fail("must be a file path");
+  // Read at most one byte past the cap, so an oversized (or growing) file is detected without trusting its stat size.
   const cap = 1024 * 1024;
   let text = "";
   try {
@@ -38,6 +44,8 @@ export function loadQuotaOverrides(file: string, global: { maxJobs: number; maxS
   } catch { fail("must be a readable regular file of at most 1 MiB"); }
   let raw: any;
   try { raw = JSON.parse(text); } catch { fail("must contain valid JSON"); }
+  // Expected shape: {"overrides": [{"tenant_id", "agent_id", and at least one of max_jobs, max_storage_bytes, max_concurrency}]},
+  // with each principal listed at most once.
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).some(key => key !== "overrides") || !Array.isArray(raw.overrides)) fail('must be a JSON object with only an "overrides" array');
   const overrides = new Map<string, QuotaOverride>();
   const caps = { maxJobs: global.maxJobs, maxStorageBytes: global.maxStorageBytes, maxConcurrency: global.concurrency };
@@ -65,6 +73,23 @@ export function loadQuotaOverrides(file: string, global: { maxJobs: number; maxS
   return overrides;
 }
 
+/**
+ * Reads and validates the remote server configuration from `env`.
+ *
+ * The authentication mode comes from loadAuthenticator (JWT, credential registry or single MD_API_KEY).
+ * MD_PUBLIC_BASE_URL must be a bare HTTP(S) origin: it is the base of upload URLs and the only accepted Origin header.
+ * MD_ALLOWED_HOSTS defaults to that origin's host plus localhost and 127.0.0.1 on MD_PORT. Numeric settings must be
+ * positive safe integers.
+ *
+ * Quota model (enforced by JobService): every job that is not expired reserves its input size plus MD_MAX_OUTPUT_BYTES,
+ * and admission checks the job count and reserved bytes at three independent scopes: global (MD_MAX_JOBS,
+ * MD_MAX_STORAGE_BYTES), per tenant (MD_MAX_TENANT_JOBS, MD_MAX_TENANT_STORAGE_BYTES) and per agent (MD_MAX_AGENT_*,
+ * or that principal's entry in MD_QUOTA_OVERRIDES_FILE). Concurrency is capped the same way (MD_CONCURRENCY,
+ * MD_MAX_TENANT_CONCURRENCY, MD_MAX_AGENT_CONCURRENCY). The tightest scope applies. Only override entries are checked
+ * against the global caps; the tenant and agent defaults are not.
+ *
+ * MD_LEGACY_OWNER names the owner adopted by job manifests written before jobs had owners.
+ */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const integer = (name: string, fallback: number) => {
     const raw = env[name];

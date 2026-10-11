@@ -1,3 +1,26 @@
+/**
+ * HTTP front end of the remote server: health probes, the binary upload endpoint and the stateless MCP endpoint.
+ *
+ * Every response carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, and every failure body is an
+ * errorResponse with a catalog code (errors.ts); anything that is not a ServiceError is answered as INTERNAL_ERROR.
+ *
+ * Request checks, in order; the first failure answers:
+ *  1. The target is origin-form ("/path") or "*" and resolves to the public origin (400).
+ *  2. Except on the probes (/livez, /healthz, /readyz): Host is in the allowlist (403), and an Origin header, when
+ *     present, equals the public origin (403).
+ *  3. No query string, on every route (400).
+ *  4. Probes: GET or HEAD only (405), then answer. They never authenticate; only /readyz consults readiness (503 when
+ *     not ready).
+ *  5. Only /mcp and /uploads/<uuid> exist (404).
+ *  6. Authentication (401 with `WWW-Authenticate: Bearer`): an upload in JWT mode presents the scoped upload credential
+ *     from create_upload, everything else the configured authenticator's token. Only a JWT-mode /mcp request without
+ *     an Authorization header may continue unauthenticated.
+ *  7. Uploads: PUT only (405), `Content-Type: application/octet-stream` (415); JobService.upload then checks the
+ *     X-Upload-Token, the job state and the declared size.
+ *  8. MCP: POST only (405), `application/json` (415), a body of at most MAX_JSON_BYTES by Content-Length and while
+ *     reading (413), valid JSON (400). An unauthenticated request may only be initialize, notifications/initialized or
+ *     ping (401), and only while the service is ready (503).
+ */
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { PassThrough } from "node:stream";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -7,19 +30,33 @@ import type { Authenticator } from "./auth.js";
 import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
 import { errorResponse } from "./errors.js";
 
+/**
+ * createHttpServer options. publicBaseUrl must be a bare origin: the only accepted Origin and the base of upload URLs.
+ * allowedHosts defaults to the public host and is compared case-insensitively.
+ */
 export interface HttpOptions { authenticator: Authenticator; publicBaseUrl: string; allowedHosts?: string[] }
+/** Largest accepted MCP request body (1 MiB). Tool arguments are small: files never pass through MCP. */
 const MAX_JSON_BYTES = 1024 * 1024;
 
+/**
+ * Sends a JSON error body. Without `error`, 401 maps to AUTH_REQUIRED and every other status to REQUEST_REJECTED.
+ * Once headers have been sent the response can no longer carry an error, so the socket is destroyed instead.
+ */
 function reply(response: ServerResponse, status: number, message: string, error?: unknown): void {
   if (response.headersSent) { response.destroy(); return; }
   response.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
   response.end(JSON.stringify(errorResponse(error ?? new ServiceError(status, message, status === 401 ? "AUTH_REQUIRED" : "REQUEST_REJECTED"))));
 }
+/** The Bearer credential, or undefined when the header is absent or uses another scheme (matched case-sensitively). */
 function token(request: IncomingMessage): string | undefined {
   const value = request.headers.authorization;
   return value?.startsWith("Bearer ") ? value.slice(7) : undefined;
 }
 
+/**
+ * Builds the HTTP server without listening; the checks it applies are listed in the module comment. Throws when the
+ * authenticator is missing or publicBaseUrl is not a bare HTTP(S) origin.
+ */
 export function createHttpServer(service: JobService, options: HttpOptions): Server {
   const publicUrl = new URL(options.publicBaseUrl);
   if (!options.authenticator || !["http:", "https:"].includes(publicUrl.protocol) || publicUrl.username || publicUrl.password || publicUrl.search || publicUrl.hash || publicUrl.pathname !== "/") throw new Error("Invalid HTTP server configuration");
@@ -100,6 +137,8 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
         const health = await service.health();
         if (!health.ready) { reply(response, 503, "Service unavailable"); return; }
       }
+      // Stateless: no MCP session IDs and plain JSON responses (no SSE), with a fresh server and transport per request. An
+      // anonymous request gets a server without tools, so it can only initialize and ping.
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
       const mcp = principal ? createRemoteServer(service, options.publicBaseUrl, principal) : new McpServer(SERVER_INFO, { capabilities: {} });
       response.on("close", () => { void transport.close(); void mcp.close(); });
@@ -109,6 +148,7 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
       reply(response, error instanceof ServiceError ? error.statusCode : 500, "Operation failed", error);
     }
   });
+  // Defaults for direct callers (tests); startRemoteServer replaces the request and header timeouts (see index.ts).
   server.requestTimeout = 60_000;
   server.headersTimeout = 15_000;
   server.keepAliveTimeout = 5_000;

@@ -1,9 +1,20 @@
+/**
+ * Paged reading of converted Markdown by Unicode code point, without loading whole documents.
+ *
+ * Index checkpoint scheme: `<output>.index.json` holds the total code-point count and one checkpoint per `stride` (4096)
+ * code points, checkpoints[i] = { chars: i * 4096, bytes: the byte offset of that code point }. Byte offsets always fall
+ * on code-point boundaries, so a read seeks to the checkpoint at or below `offset` and decodes forward: the work per page
+ * is the page plus at most 4095 skipped code points. The index is valid only while the output's size and mtime match it;
+ * a missing, malformed or stale index is rebuilt by one full scan and written atomically (temp + rename, mode 0o600).
+ * Decoding is strict UTF-8, so invalid bytes throw, and a leading BOM counts as a code point.
+ */
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 
 const stride = 4096;
 type Checkpoint = { chars: number; bytes: number };
+/** The cached index: `version` guards the format, and size and mtimeMs tie it to one output file. */
 type Index = { version: 1; size: number; mtimeMs: number; total_chars: number; checkpoints: Checkpoint[] };
 const indexPath = (output: string) => `${output}.index.json`;
 
@@ -18,6 +29,7 @@ async function* textChunks(output: string, start = 0) {
   } finally { stream.destroy(); }
 }
 
+/** The validated cached index, or a rebuilt and persisted one. Read errors other than a missing or unparsable index file propagate. */
 async function getIndex(output: string): Promise<Index> {
   const stat = await fs.stat(output);
   try {
@@ -64,6 +76,7 @@ export async function readMarkdownPage(output: string, { offset = 0, max_chars =
       if (position === end) break outer;
     }
   }
+  // Fewer code points than the index promised: the output changed after the index was validated.
   if (position !== end) throw new Error("Markdown output changed while reading");
   return { markdown: chars.join(""), next_offset: end < index.total_chars ? end : null, total_chars: index.total_chars };
 }
