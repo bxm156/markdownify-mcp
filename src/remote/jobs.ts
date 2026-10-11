@@ -26,7 +26,7 @@ export type AuditSink = ((event: AuditEvent) => void | Promise<void>) & { probe?
 export const AUDIT_PROBE_BASE_MS = 2000;
 export const AUDIT_PROBE_MAX_MS = 60_000;
 export const AUDIT_PROBE_PASSES = 2;
-/** After the first recorded read_markdown of a completed result, every Nth further read writes read_markdown_repeat. */
+/** Every Nth read pass over a completed result writes read_markdown_repeat (see auditRead for what a pass is). */
 export const AUDIT_READ_REPEAT_EVERY = 10;
 /** Errno-style code for operator logs; never a message, path or stack. */
 function errnoCode(error: unknown) {
@@ -76,14 +76,17 @@ export class JobService {
    * Read-audit coalescing. Polling is expected (SKILL.md), so read_status and read_markdown are recorded only on the
    * first successful audit of each (event, job status) pair per job: a poll loop yields at most one record per state it
    * observes. Keyed on job ID, which has exactly one immutable owner checked by owned() first, so this is per (owner, job).
-   * The value counts reads after the first record; for read_markdown of a completed result every
-   * AUDIT_READ_REPEAT_EVERY-th one writes read_markdown_repeat, so heavy re-reading stays visible.
-   * Bounded: at most 2 events x 7 statuses (one counter each) per job, only for jobs in this.jobs, dropped by forget() on
-   * deletion and tombstone removal. In memory and per process, so the first read per state after a restart (or on
-   * another replica) is recorded again and repeat counts restart from zero.
+   * Re-reading a completed result is sampled per read pass, not per page: `passes` counts passes (the first
+   * read_markdown after completion starts pass 1) and `offset` is the last requested offset. A read whose offset is not
+   * greater than the previous read's starts a new pass; paging forward within a pass does not count. Every
+   * AUDIT_READ_REPEAT_EVERY-th pass writes read_markdown_repeat with repeat_count = the pass number, so heavy re-reading
+   * stays visible while one read-through of a long document stays one pass.
+   * Bounded: at most 2 events x 7 statuses of marks plus two numbers per job, only for jobs in this.jobs, dropped by
+   * forget() on deletion and tombstone removal. In memory and per process, so the first read per state after a restart
+   * (or on another replica) is recorded again and pass counts restart from zero.
    * authorization_denied, quota_denied and every mutation/lifecycle event are never coalesced or sampled.
    */
-  private auditedReads = new Map<string, Map<string, number>>();
+  private auditedReads = new Map<string, { seen: Set<string>; passes: number; offset: number }>();
   constructor(private options: JobServiceOptions) {
     for (const [name, value] of Object.entries(options)) {
       if (typeof value === "number" && (!Number.isSafeInteger(value) || value <= 0)) throw new Error(`Invalid ${name}`);
@@ -140,24 +143,31 @@ export class JobService {
     this.auditRejections.add(message);
     console.error(JSON.stringify({ event: "audit_record_rejected", message }));
   }
-  /** Coalesced read audit; see auditedReads. Called under the job lock after owned(), so checks and marks cannot race. */
-  private async auditRead(event: "read_status" | "read_markdown", principal: Principal, job: Job) {
+  /**
+   * Coalesced read audit; see auditedReads. Called under the job lock after owned(), so checks and marks cannot race.
+   * `offset` is the requested get_markdown offset; it only matters for read_markdown of a completed result.
+   */
+  private async auditRead(event: "read_status" | "read_markdown", principal: Principal, job: Job, offset = 0) {
     const key = `${event}:${job.status}`;
-    const seen = this.auditedReads.get(job.id)?.get(key);
-    if (seen === undefined) {
+    const sampled = event === "read_markdown" && job.status === "completed";
+    const state = this.auditedReads.get(job.id);
+    if (!state?.seen.has(key)) {
       await this.audit(event, principal, job.id, job.status);
       // Mark only after a successful write, so a read that failed with 503 is recorded on its retry.
       if (!this.jobs.has(job.id)) return;
-      const reads = this.auditedReads.get(job.id) ?? new Map<string, number>();
-      reads.set(key, 0); this.auditedReads.set(job.id, reads);
+      const next = state ?? { seen: new Set<string>(), passes: 0, offset: 0 };
+      next.seen.add(key); this.auditedReads.set(job.id, next);
+      if (sampled) { next.passes = 1; next.offset = offset; }
       return;
     }
-    // Status polling stays coalesced; re-reading a completed result is sampled. The count advances only after a
-    // sampled record is written, so a read whose repeat record failed with 503 writes it on its retry.
-    if (event !== "read_markdown" || job.status !== "completed") return;
-    const count = seen + 1;
-    if (count % AUDIT_READ_REPEAT_EVERY === 0) await this.audit("read_markdown_repeat", principal, job.id, job.status, undefined, count);
-    this.auditedReads.get(job.id)?.set(key, count);
+    // Status polling stays coalesced; re-reading a completed result is sampled per pass. Paging forward continues the
+    // current pass; any other offset starts the next one. State advances only after a sampled record is written, so a
+    // read whose repeat record failed with 503 starts the same pass again, and writes it, on its retry.
+    if (!sampled) return;
+    if (offset > state.offset) { state.offset = offset; return; }
+    const pass = state.passes + 1;
+    if (pass % AUDIT_READ_REPEAT_EVERY === 0) await this.audit("read_markdown_repeat", principal, job.id, job.status, undefined, pass);
+    state.passes = pass; state.offset = offset;
   }
   /**
    * While the last audit write failed, readiness runs the sink's non-writing probe (shared in flight, bounded by the
@@ -397,7 +407,7 @@ export class JobService {
     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(max_chars) || max_chars < 1 || max_chars > 100_000) throw new ServiceError(400, "Invalid pagination parameters");
     return this.locked(id, async () => {
       const job = await this.owned(principal, id); this.available(job);
-      await this.auditRead("read_markdown", principal, job);
+      await this.auditRead("read_markdown", principal, job, offset);
       if (job.status !== "completed") throw new ServiceError(409, "Markdown is not ready");
       try { return await readMarkdownPage(path.join(this.dir(id), "output.md"), { offset, max_chars }); }
       catch (error) { if (error instanceof RangeError) throw new ServiceError(400, "Offset exceeds Markdown length"); throw error; }

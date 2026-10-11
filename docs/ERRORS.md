@@ -27,7 +27,7 @@ This abbreviated example illustrates the shape; follow the actual returned next_
 | OUTPUT_LIMIT_EXCEEDED | Reduce/split input or adjust output cap; new upload | MD_MAX_OUTPUT_BYTES |
 | CONVERSION_TIMEOUT | Reduce/split input or adjust timeout; new upload | MD_CONVERSION_TIMEOUT_MS |
 | CONVERSION_INTERRUPTED | New upload after service recovers, bounded retries | Server restart (graceful or crash) |
-| CONVERSION_CANCELLED | Stop polling; new upload only if still needed | Explicit cancellation |
+| CONVERSION_CANCELLED | Not returned for a deleted job, which reads as JOB_NOT_FOUND (see Stopped conversions); if seen, call delete_job again | Explicit cancellation, operator-visible |
 | CONVERSION_FAILED | Check/repair source; give operator job ID/code | Parser diagnostics remain private |
 | UPLOAD_SIZE_MISMATCH | Exact declared bytes on valid reservation, or new reservation | Actual vs declared size |
 | UPLOAD_INTERRUPTED | Check state/expiry before bounded retry of PUT | MD_UPLOAD_TTL_MS |
@@ -46,7 +46,9 @@ A running conversion that is stopped before it finishes fails with one of three 
 | --- | --- | --- |
 | CONVERSION_INTERRUPTED | The server stopped while the job was running. A graceful shutdown (SIGTERM, SIGINT or SIGHUP) stops the converter and records this code before the process exits. After a crash or SIGKILL, the next start finds the job still `running` and records the same code. | true |
 | CONVERSION_TIMEOUT | The conversion ran longer than `MD_CONVERSION_TIMEOUT_MS`. `details.timeout_ms` reports the deadline. | false |
-| CONVERSION_CANCELLED | The conversion was cancelled explicitly: `delete_job` on a running job. The job is removed right after, so its owner then sees `JOB_NOT_FOUND`. | false |
+| CONVERSION_CANCELLED | The conversion was cancelled explicitly: `delete_job` on a running job. The code is internal (see below): the owner never sees it as a job's error. | false |
+
+`delete_job` on a running job stops the converter, records `CONVERSION_CANCELLED` and then removes the job before it returns. No tombstone is kept, so the owner's later `get_conversion_status` and `get_markdown` calls return `JOB_NOT_FOUND`, exactly as for any other deleted job. The code is visible only to operators: it is written to the job's on-disk manifest just before the job directory is removed, and the audit log shows the `delete_job` record followed by a `conversion_failed` record (status `failed`) for that job. It never appears as a job's error in a tool response, except when the removal itself fails or the process stops before it completes: the job then remains `failed` with this code, and calling `delete_job` again removes it. `lookup_error` still describes the code.
 
 The first reason wins. A deadline that passes while a shutdown is already stopping the converter does not turn `CONVERSION_INTERRUPTED` into `CONVERSION_TIMEOUT`. A converter killed for any of these reasons is never reported as `CONVERSION_FAILED`, which is kept for documents the parser rejects.
 

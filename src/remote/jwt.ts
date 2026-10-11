@@ -11,6 +11,9 @@ export function subjectPrincipal(sub: unknown): Principal | null {
 // Headers that would move key selection into the token. Keys only ever come from the pinned resolver, so these are never
 // honoured; rejecting them outright keeps that true even if key resolution changes, and flags a token that was crafted to probe it.
 const keySourceHeaders = ["jku", "x5u", "jwk", "x5c"] as const;
+// No header extension is ever understood, so any `crit` member (whatever its value) is refused alongside them, before
+// the key resolver runs: such a token can never verify, and it should not cost a key lookup or JWKS fetch to find out.
+const rejectedHeaders = [...keySourceHeaders, "crit"] as const;
 function trustedUrl(value: string, allowLoopback: boolean) {
   const u = new URL(value);
   if (u.username || u.password || u.hash || u.search || (u.protocol !== "https:" && !(allowLoopback && u.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname)))) throw new Error("JWT issuer/JWKS URLs require HTTPS (explicit loopback HTTP is test-only)");
@@ -39,7 +42,7 @@ export function createJwtAuthenticator(options: { issuer: string; audience: stri
       if (!token || token.length > 16384) return null;
       try {
         const header = decodeProtectedHeader(token);
-        if (keySourceHeaders.some(name => Object.hasOwn(header, name))) return null;
+        if (rejectedHeaders.some(name => Object.hasOwn(header, name))) return null;
         const { payload, protectedHeader } = await jwtVerify(token, key, { algorithms: ["RS256"], issuer: options.issuer, audience: options.audience, requiredClaims: ["iss", "aud", "sub", "iat", "exp"], maxTokenAge: maxTtl, clockTolerance: 5 });
         const now = Date.now() / 1000;
         if (payload.aud !== options.audience || typeof protectedHeader.kid !== "string" || !protectedHeader.kid || protectedHeader.kid.length > 256 || !Number.isSafeInteger(payload.iat) || !Number.isSafeInteger(payload.exp) || payload.exp! <= now || payload.exp! <= payload.iat! || payload.exp! - payload.iat! > maxTtl || payload.iat! > now + 5) return null;

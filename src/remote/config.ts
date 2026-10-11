@@ -5,6 +5,12 @@ import { quotaKey, validatePrincipal, type QuotaOverride } from "./identity.js";
 
 const overrideFields = { max_jobs: "maxJobs", max_storage_bytes: "maxStorageBytes", max_concurrency: "maxConcurrency" } as const;
 /**
+ * Ceiling for MD_SHUTDOWN_TIMEOUT_MS before startup warns. The bundled Compose files (compose.remote.yaml,
+ * compose.jwt.yaml, compose.multitenant.yaml) set `stop_grace_period: 15s`; a longer shutdown deadline lets the runtime
+ * SIGKILL the process first, which leaves the data-volume `.lock` behind. Raise both together.
+ */
+export const SHUTDOWN_TIMEOUT_WARN_MS = 15_000;
+/**
  * Operator-managed agent-scope caps, read once at startup. Unlisted principals keep the defaults: this is not an
  * allowlist and never grants or denies access. Overrides above a global cap are rejected rather than silently clamped.
  */
