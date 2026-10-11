@@ -37,20 +37,28 @@ import { errorResponse } from "./errors.js";
 export interface HttpOptions { authenticator: Authenticator; publicBaseUrl: string; allowedHosts?: string[] }
 /** Largest accepted MCP request body (1 MiB). Tool arguments are small: files never pass through MCP. */
 const MAX_JSON_BYTES = 1024 * 1024;
+/**
+ * Deadline for a client to send a whole request, headers and body (5 min). It must cover the slowest accepted upload PUT
+ * (MD_MAX_UPLOAD_BYTES at the client's bandwidth); a request past it is answered 408 and its socket closed.
+ */
+export const REQUEST_TIMEOUT_MS = 300_000;
+/** Deadline for a client to send the complete request headers (30 s), which bounds slow-header connections. */
+export const HEADERS_TIMEOUT_MS = 30_000;
 
 /**
- * Sends a JSON error body. Without `error`, 401 maps to AUTH_REQUIRED and every other status to REQUEST_REJECTED.
+ * Sends a JSON error body. Without `error`, 401 maps to AUTH_REQUIRED, 503 (an anonymous probe while not ready) to the
+ * retryable SERVICE_UNAVAILABLE, and every other status to REQUEST_REJECTED.
  * Once headers have been sent the response can no longer carry an error, so the socket is destroyed instead.
  */
 function reply(response: ServerResponse, status: number, message: string, error?: unknown): void {
   if (response.headersSent) { response.destroy(); return; }
   response.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
-  response.end(JSON.stringify(errorResponse(error ?? new ServiceError(status, message, status === 401 ? "AUTH_REQUIRED" : "REQUEST_REJECTED"))));
+  response.end(JSON.stringify(errorResponse(error ?? new ServiceError(status, message, status === 401 ? "AUTH_REQUIRED" : status === 503 ? "SERVICE_UNAVAILABLE" : "REQUEST_REJECTED"))));
 }
-/** The Bearer credential, or undefined when the header is absent or uses another scheme (matched case-sensitively). */
+/** The Bearer credential, or undefined when the header is absent or uses another scheme. The scheme is case-insensitive (RFC 7235 section 2.1). */
 function token(request: IncomingMessage): string | undefined {
   const value = request.headers.authorization;
-  return value?.startsWith("Bearer ") ? value.slice(7) : undefined;
+  return value && /^bearer /i.test(value) ? value.slice(7) : undefined;
 }
 
 /**
@@ -148,9 +156,9 @@ export function createHttpServer(service: JobService, options: HttpOptions): Ser
       reply(response, error instanceof ServiceError ? error.statusCode : 500, "Operation failed", error);
     }
   });
-  // Defaults for direct callers (tests); startRemoteServer replaces the request and header timeouts (see index.ts).
-  server.requestTimeout = 60_000;
-  server.headersTimeout = 15_000;
+  // The only place these are set: startRemoteServer and direct callers (tests) get the same deadlines.
+  server.requestTimeout = REQUEST_TIMEOUT_MS;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
   server.keepAliveTimeout = 5_000;
   server.maxHeadersCount = 64;
   return server;

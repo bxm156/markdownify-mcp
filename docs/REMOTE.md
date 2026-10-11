@@ -104,11 +104,11 @@ For PowerShell use `$env:MCP_URL='...'` (and similarly for other variables) inst
 | `MD_AUTH_FILE` | Required for isolated agents | Trusted hashed credential registry; see [MULTITENANT.md](MULTITENANT.md) |
 | `MD_PUBLIC_BASE_URL` | `http://localhost:8000` | Direct upload origin |
 | `MD_HOST` / `MD_PORT` | `127.0.0.1` / `8000` | Listener; Compose overrides host to `0.0.0.0` |
-| `MD_ALLOWED_HOSTS` | Public host and local probe hosts | Explicit Host allowlist override |
+| `MD_ALLOWED_HOSTS` | Public host (with and without its default port, for example `example.com` and `example.com:443`) plus `localhost` and `127.0.0.1` on `MD_PORT` | Explicit Host allowlist override; replaces the whole default list |
 | `MD_DATA_DIR` | `./data` | Persistent temporary job directory |
 | `MD_MAX_UPLOAD_BYTES` | 26,214,400 (25 MiB) | Single input limit |
 | `MD_MAX_OUTPUT_BYTES` | 26,214,400 (25 MiB) | Markdown output limit |
-| `MD_MAX_STORAGE_BYTES` | 268,435,456 (256 MiB) | Reservation budget for input plus maximum output per live job |
+| `MD_MAX_STORAGE_BYTES` | 268,435,456 (256 MiB) | Reservation budget for input plus maximum output per live job; must be at least `1 + MD_MAX_OUTPUT_BYTES` |
 | `MD_MAX_JOBS` | 100 | Live job limit; storage reservation usually binds first |
 | `MD_RETENTION_MS` | 86,400,000 (24 hours) | Completed/failed result retention |
 | `MD_UPLOAD_TTL_MS` | 900,000 (15 minutes) | Abandoned upload expiry |
@@ -116,6 +116,10 @@ For PowerShell use `$env:MCP_URL='...'` (and similarly for other variables) inst
 | `MD_CONCURRENCY` | 2 | Maximum active converters |
 | `MD_SHUTDOWN_TIMEOUT_MS` | 10,000 (10 seconds) | Graceful shutdown deadline after SIGTERM, SIGINT or SIGHUP; when it passes the server closes every connection and exits 1. Keep the container `stop_grace_period` (15s in the bundled Compose files) above it. A value above 15,000 still starts, but logs one `{"event":"shutdown_timeout_warning","shutdown_timeout_ms":N,"ceiling_ms":15000}` line on stderr at startup |
 | `MD_QUOTA_OVERRIDES_FILE` | unset | Optional operator-managed per-principal agent caps; see [MULTITENANT.md](MULTITENANT.md#operator-quota-overrides) |
+
+The tenant and agent caps (`MD_MAX_TENANT_*`, `MD_MAX_AGENT_*`, see [MULTITENANT.md](MULTITENANT.md#budgets-and-scheduling)) are checked against these at startup: an explicit value above its global cap, or any storage budget below `1 + MD_MAX_OUTPUT_BYTES`, stops startup with a message naming the variable, and an unset tenant or agent default is lowered to its global cap.
+
+The HTTP listener has two fixed deadlines, set in `src/remote/http.ts` (`REQUEST_TIMEOUT_MS`, `HEADERS_TIMEOUT_MS`) and not configurable: a client must send the complete request headers within 30 seconds and the whole request, headers and body, within 5 minutes; past either, Node answers 408 and closes the connection. The 5-minute request deadline bounds the slowest upload PUT, so a client must sustain about `MD_MAX_UPLOAD_BYTES / 300` bytes per second (roughly 85 KiB/s at the 25 MiB default). Keep reverse-proxy timeouts at or above these values. Idle keep-alive connections close after 5 seconds.
 
 Storage reservations are conservative: even a small file reserves the full configured Markdown output limit. Increase storage or lower output limits to accommodate more live jobs. JSON manifests and scratch buffers add overhead; the application budget is not a filesystem quota. Use a dedicated volume with adequate free space. Store it on an encrypted disk if document confidentiality requires it. Do not log upload authorization headers or whole `create_upload` results in agent traces.
 

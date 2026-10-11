@@ -17,7 +17,24 @@ MCP tool errors have `isError: true` and JSON text:
 }
 ```
 
-This abbreviated example illustrates the shape; follow the actual returned next_steps. Upload errors use the same envelope with HTTP status. A status call itself succeeds for a failed conversion but returns `status: failed`, `error` and `error_info`: stop polling. Codes/details survive restart; old manifests without codes receive safe fallback guidance.
+A tools/list refused for a missing scope (JWT mode without `mcp:tools/list`) cannot return a tool result, so it is a JSON-RPC error that carries the same body in its `data`. Read the code from `error.data.error_info.code`, not from the message:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "error": {
+    "code": -32600,
+    "message": "Scope not granted",
+    "data": {
+      "error": "Scope not granted",
+      "error_info": {"code": "AUTH_SCOPE_REQUIRED", "message": "Scope not granted", "retryable": false, "next_steps": ["Ask the gateway/operator to grant this tool's scope to your agent. ..."]}
+    }
+  }
+}
+```
+
+The MCP SDK client surfaces this as an `McpError` with `code` -32600 and the same `data`. These abbreviated examples illustrate the shape; follow the actual returned next_steps. Upload errors use the same envelope with HTTP status. A status call itself succeeds for a failed conversion but returns `status: failed`, `error` and `error_info`: stop polling. Codes/details survive restart; old manifests without codes receive safe fallback guidance.
 
 | Code | Recovery | Setting |
 | --- | --- | --- |
@@ -35,6 +52,7 @@ This abbreviated example illustrates the shape; follow the actual returned next_
 | JOB_NOT_FOUND | Verify own ID/credential; never probe other owners | Foreign and missing responses are identical |
 | MARKDOWN_NOT_READY | Check status; poll queued/running, follow failed-job guidance | Concurrency queues work |
 | AUDIT_UNAVAILABLE / INTERNAL_ERROR | Operator recovery before retrying | Storage/permissions/service health |
+| SERVICE_UNAVAILABLE | Bounded retry with backoff once the service is ready again (`retryable: true`) | Shutdown in progress, or an anonymous JWT-mode initialize/ping while `/readyz` is not ready (HTTP 503) |
 
 Quota details contain configured `scope` and limits, never usage counts or other owners' IDs. For `scope: "agent"` the limit is the caller's own operator override when one is configured. `reserved_bytes` is the space required by the attempted upload, not total used storage. Unknown lookup codes return `UNKNOWN_ERROR_CODE` with `isError: true`. Request/schema/auth errors also carry guidance.
 

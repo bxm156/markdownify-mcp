@@ -44,7 +44,7 @@ import { quotaKey, validatePrincipal, type Principal, type QuotaOverride } from 
 import { checkRuntime, HEALTH_TIMEOUT_MS, MAX_TIMER_MS, type RuntimeHealth } from "./health.js";
 import { prepareMarkdownIndex, readMarkdownPage } from "./markdown.js";
 import { acquireLock, releaseLock } from "./lock.js";
-import { AuditRecordError } from "./audit.js";
+import { AuditRecordError, errnoCode, type AuditEvent } from "./audit.js";
 
 import { ServiceError, errorInfo, lookupError, legacyCode, type ErrorCode, type ErrorDetails } from "./errors.js";
 export { ServiceError } from "./errors.js";
@@ -56,8 +56,8 @@ export type JobStatus = "awaiting_upload" | "uploaded" | "queued" | "running" | 
  * before ownership lack tenant_id and agent_id until load assigns legacyOwner.
  */
 type Job = { tenant_id: string; agent_id: string; id: string; filename: string; extension: string; size_bytes: number; token_hash?: string; upload_auth_hash?: string; status: JobStatus; created_at: string; expires_at: string; error?: string; error_code?: ErrorCode; error_details?: ErrorDetails };
-/** An audit record as the job service emits it; the logger validates it and adds the timestamp (audit.ts). */
-export type AuditEvent = { event: string; tenant_id: string; agent_id: string; job_id?: string; status?: string; reason?: string; repeat_count?: number };
+/** The audit record type is declared once, in audit.ts; re-exported for sinks written against the job service. */
+export type { AuditEvent } from "./audit.js";
 /** An audit callback, optionally with a probe that checks writability without writing a record (see createAuditLogger). */
 export type AuditSink = ((event: AuditEvent) => void | Promise<void>) & { probe?: () => Promise<void> };
 /**
@@ -70,11 +70,6 @@ export const AUDIT_PROBE_MAX_MS = 60_000;
 export const AUDIT_PROBE_PASSES = 2;
 /** Every Nth read pass over a completed result writes read_markdown_repeat (see auditRead for what a pass is). */
 export const AUDIT_READ_REPEAT_EVERY = 10;
-/** Errno-style code for operator logs; never a message, path or stack. */
-function errnoCode(error: unknown) {
-  const raw = (error as NodeJS.ErrnoException | null)?.code;
-  return typeof raw === "string" && /^[A-Z0-9_]{1,32}$/.test(raw) ? raw : "UNKNOWN";
-}
 /**
  * JobService settings; loadConfig documents the environment variables and defaults. Every numeric option must be a
  * positive safe integer. `converter` replaces markitdown (tests; readiness then reports converter.check "custom").
@@ -276,7 +271,7 @@ export class JobService {
    */
   private async internalAudit(event: string, job: Job) {
     try { await this.audit(event, { tenantId: job.tenant_id, agentId: job.agent_id }, job.id, job.status); }
-    catch { console.error("Job audit unavailable", event, job.id); }
+    catch { console.error(JSON.stringify({ event: "job_audit_unavailable", audit_event: event, job_id: job.id })); }
   }
   /** Drops every in-memory trace of a job whose directory is gone. */
   private forget(id: string) { this.jobs.delete(id); this.cleanupPending.delete(id); this.failedLastSweep.delete(id); this.auditedReads.delete(id); }
@@ -323,7 +318,7 @@ export class JobService {
     this.pump();
   }
   // A periodic tick during a long sweep is skipped rather than queued or run concurrently.
-  private tick() { if (!this.sweep) void this.cleanup().catch(() => console.error("Job cleanup sweep failed")); }
+  private tick() { if (!this.sweep) void this.cleanup().catch(error => console.error(JSON.stringify({ event: "job_cleanup_sweep_aborted", code: errnoCode(error) }))); }
   /**
    * Loads every UUID-named job directory and applies restart recovery (module comment). Any invalid manifest aborts
    * startup rather than serving a partly understood volume; every manifest is validated before any is rewritten. Unowned
@@ -664,14 +659,14 @@ export class JobService {
         await this.save(expired); this.jobs.set(id, expired); this.cleanupPending.delete(id); await this.internalAudit("job_expired", expired);
       }); } catch (error) {
         // Sanitized: event, job ID, status and an errno-style code only; never paths, messages or stacks.
-        const raw = (error as NodeJS.ErrnoException | null)?.code, code = typeof raw === "string" && /^[A-Z0-9_]{1,32}$/.test(raw) ? raw : "UNKNOWN";
+        const code = errnoCode(error);
         failed.add(id); this.cleanupPending.add(id); stats.failures_total++; stats.last_error_code = code;
-        console.error("Job cleanup failed", { event: "job_cleanup_failed", job_id: id, status: this.jobs.get(id)?.status ?? "unknown", code });
+        console.error(JSON.stringify({ event: "job_cleanup_failed", job_id: id, status: this.jobs.get(id)?.status ?? "unknown", code }));
       }
     }
     this.failedLastSweep = failed;
     Object.assign(stats, { last_finished_at: new Date().toISOString(), consecutive_failed_sweeps: failed.size ? stats.consecutive_failed_sweeps + 1 : 0 });
-    if (failed.size) console.error("Job cleanup sweep incomplete", { event: "job_cleanup_sweep_failed", jobs_failed: failed.size, failures_total: stats.failures_total, consecutive_failed_sweeps: stats.consecutive_failed_sweeps, last_error_code: stats.last_error_code, duration_ms: Math.round(performance.now() - started) });
+    if (failed.size) console.error(JSON.stringify({ event: "job_cleanup_sweep_failed", jobs_failed: failed.size, failures_total: stats.failures_total, consecutive_failed_sweeps: stats.consecutive_failed_sweeps, last_error_code: stats.last_error_code, duration_ms: Math.round(performance.now() - started) }));
   }
 
   /**

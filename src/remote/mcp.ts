@@ -5,11 +5,12 @@
  * Authorization: a principal without `scopes` (credential registry or MD_API_KEY mode) may list and call every tool. A
  * JWT principal needs `mcp:tools/list` to list tools; to call one it needs `mcp:tools/call` and a per-tool scope
  * `mcp:tools/<name>:call`, where <name> is the bare tool name or the tool prefix (default "markdownify-") followed by it.
- * A tools/call failure is returned as an isError result whose text is an errorResponse body; a tools/list scope failure
- * is a JSON-RPC error.
+ * A tools/call failure is returned as an isError result whose text is an errorResponse body. A tools/list scope failure
+ * is a JSON-RPC error (code -32600, message "Scope not granted") whose `data` is that same errorResponse body, so a
+ * client reads `error.data.error_info.code` (AUTH_SCOPE_REQUIRED).
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ErrorCode as RpcErrorCode, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { JobService, ServiceError } from "./jobs.js";
 import type { AuthenticatedPrincipal } from "./auth.js";
@@ -18,6 +19,11 @@ import { errorResponse, lookupError } from "./errors.js";
 /** Name and version reported by initialize, including by the anonymous probe server in http.ts. */
 export const SERVER_INFO = { name: "markdownify-remote", version: "0.1.0" } as const;
 const id = z.string().uuid();
+/**
+ * A list-level failure as a JSON-RPC error: the SDK copies a numeric `code`, the message and `data` into the response.
+ * Not an McpError, whose message would gain an "MCP error <code>:" prefix on the wire.
+ */
+function rpcError(error: ServiceError) { return Object.assign(new Error(error.message), { code: RpcErrorCode.InvalidRequest, data: errorResponse(error) }); }
 /** Tool descriptions (written for the calling agent) and strict input schemas: unknown argument keys are rejected. */
 const definitions = {
   get_service_health: { description: "Use to check service readiness, storage/converter/audit checks, and your own job states, reserved bytes, your own jobs' retention cleanup failures, configured quota/concurrency limits and limits.effective (the tightest caps that apply to you, including any operator override for you). Never returns other users' job counts, usage or IDs. Queue saturation is normal and does not make the process unhealthy. This is not a converter quality test; follow existing error guidance on failures.", schema: z.strictObject({}) },
@@ -34,7 +40,7 @@ export function createRemoteServer(service: JobService, publicBaseUrl: string, p
   const base = publicBaseUrl.replace(/\/$/, "");
   const server = new Server(SERVER_INFO, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    if (principal.scopes && !principal.scopes.includes("mcp:tools/list")) throw new ServiceError(403, "Scope not granted", "AUTH_SCOPE_REQUIRED");
+    if (principal.scopes && !principal.scopes.includes("mcp:tools/list")) throw rpcError(new ServiceError(403, "Scope not granted", "AUTH_SCOPE_REQUIRED"));
     return { tools: Object.entries(definitions).map(([name, definition]) => ({ name, description: definition.description, inputSchema: z.toJSONSchema(definition.schema) as any })) };
   });
   server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {

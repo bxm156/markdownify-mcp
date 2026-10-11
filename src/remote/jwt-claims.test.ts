@@ -194,7 +194,10 @@ test("calls need the gateway call scope and a per-tool scope, with either the ba
 });
 test("a call-only token authenticates but cannot list tools", async () => {
   const f = await deployment(), c = await f.client("machine-a", "mcp:tools/call mcp:tools/lookup_error:call");
-  await expect(c.listTools()).rejects.toThrow("Scope not granted");
+  // The JSON-RPC error keeps its message and carries the errorResponse body in `data`.
+  const error = await c.listTools().then(() => undefined, (caught: unknown) => caught as { code: number; message: string; data: any });
+  expect(error?.code).toBe(-32600); expect(error?.message).toContain("Scope not granted");
+  expect(error?.data).toMatchObject({ error: "Scope not granted", error_info: { code: "AUTH_SCOPE_REQUIRED", retryable: false } });
   ok(await c.callTool({ name: "lookup_error", arguments: { code: "FILE_TOO_LARGE" } }));
 });
 

@@ -20,6 +20,9 @@ Built with `bun run build:remote` (tsc to `dist/remote/`), shipped as `Dockerfil
   - Listener: `MD_HOST`, `MD_PORT`, `MD_PUBLIC_BASE_URL` (a bare origin), `MD_ALLOWED_HOSTS`, `MD_DATA_DIR`.
   - Limits: `MD_MAX_UPLOAD_BYTES`, `MD_MAX_OUTPUT_BYTES`, `MD_MAX_STORAGE_BYTES`, `MD_MAX_JOBS`, `MD_CONCURRENCY`,
     `MD_RETENTION_MS`, `MD_UPLOAD_TTL_MS`, `MD_CONVERSION_TIMEOUT_MS`, `MD_MAX_{TENANT,AGENT}_{JOBS,STORAGE_BYTES,CONCURRENCY}`.
+  - Tenant/agent caps are checked like override entries: an explicit value above its global cap is rejected, an unset
+    one is lowered to it, and every storage budget must be at least `1 + MD_MAX_OUTPUT_BYTES`. The default
+    `MD_ALLOWED_HOSTS` holds the public host bare and with its default port.
   - `MD_SHUTDOWN_TIMEOUT_MS` (default 10 000). `MD_QUOTA_OVERRIDES_FILE` is read by `loadQuotaOverrides`: at most
     1 MiB, read through `O_NONBLOCK`, agent-scope caps only, never above the global caps.
 - `http.ts`: routes `POST /mcp`, `PUT /uploads/<uuid>` and probes `/livez`, `/healthz` (liveness) and `/readyz`
@@ -27,11 +30,13 @@ Built with `bun run build:remote` (tsc to `dist/remote/`), shipped as `Dockerfil
   targets and any query (400). The Host allowlist and an `Origin` that must equal the public origin (403) do not
   apply to probes. Bodies: `/mcp` JSON at most 1 MiB (413); uploads are bounded by the declared size. Status codes:
   405 with `Allow` for a wrong method; 415 unless the content type is exactly `application/json` (lowercase) or
-  `application/octet-stream`; 401 with `WWW-Authenticate: Bearer`. In JWT mode only, a request with no
-  Authorization header may send `initialize`, `notifications/initialized` or `ping`, gated by readiness.
+  `application/octet-stream`; 401 with `WWW-Authenticate: Bearer` (the scheme is case-insensitive). In JWT mode only, a
+  request with no Authorization header may send `initialize`, `notifications/initialized` or `ping`, gated by
+  readiness (503 `SERVICE_UNAVAILABLE`). `REQUEST_TIMEOUT_MS` (5 min) and `HEADERS_TIMEOUT_MS` (30 s) are set only here.
 - `mcp.ts`: 7 tools: `get_service_health`, `create_upload`, `start_conversion`, `get_conversion_status`,
   `get_markdown`, `delete_job`, `lookup_error`. Schemas are `z.strictObject`. In JWT mode a call needs
-  `mcp:tools/call` plus `mcp:tools/<name>:call` (or `<prefix><name>`), and a listing needs `mcp:tools/list`.
+  `mcp:tools/call` plus `mcp:tools/<name>:call` (or `<prefix><name>`), and a listing needs `mcp:tools/list`. A listing
+  denial is a JSON-RPC error (-32600) whose `data` is the errorResponse body (`data.error_info.code`).
 - `auth.ts` / `jwt.ts` / `identity.ts`: a principal is `{tenantId, agentId}` matching `[A-Za-z0-9_-]{1,64}`. Registry
   tokens are compared as SHA-256 hashes with `timingSafeEqual` over every entry. JWT accepts RS256 only with a pinned
   JWKS (256 KiB cap). Headers `jku`/`x5u`/`jwk`/`x5c`/`crit` are rejected before key lookup. `sub` is both tenant and
@@ -79,13 +84,14 @@ Built with `bun run build:remote` (tsc to `dist/remote/`), shipped as `Dockerfil
 
 ## Operator stderr events
 
-Single-line JSON (`console.error(JSON.stringify(...))`): `audit_sink_unavailable` {code}, `audit_sink_recovered`
-{via: write|probe}, `audit_record_rejected` {message: fixed string}, `audit_rotation_failed` {code},
-`shutdown_timeout_warning` {shutdown_timeout_ms, ceiling_ms}. Cleanup logs a prefix plus an object, not JSON:
-`Job cleanup failed {event: "job_cleanup_failed", job_id, status, code}` and `Job cleanup sweep incomplete
-{event: "job_cleanup_sweep_failed", ...}`. Plain lines: `Job audit unavailable <event> <id>`, `Job cleanup sweep
-failed`. Rule: an errno-style `code` (`/^[A-Z0-9_]{1,32}$/`, else `UNKNOWN`) and IDs only. Never paths, messages,
-secrets, filenames or audit metadata values. Log once per transition, not once per failure.
+Every event is one `console.error(JSON.stringify({ event, ... }))` call (one argument, one line): `audit_sink_unavailable`
+{code}, `audit_sink_recovered` {via: write|probe}, `audit_record_rejected` {message: fixed string},
+`audit_rotation_failed` {code}, `job_audit_unavailable` {audit_event, job_id}, `job_cleanup_failed` {job_id, status,
+code}, `job_cleanup_sweep_failed` {jobs_failed, failures_total, consecutive_failed_sweeps, last_error_code,
+duration_ms}, `job_cleanup_sweep_aborted` {code}, `shutdown_timeout_warning` {shutdown_timeout_ms, ceiling_ms}. Rule:
+an errno-style `code` from the shared `errnoCode()` in `audit.ts` (`/^[A-Z0-9_]{1,32}$/`, else `UNKNOWN`) and IDs
+only. Never paths, messages, secrets, filenames or audit metadata values. Log once per transition, not once per
+failure. The table lives in `docs/MULTITENANT.md` "Operator stderr events".
 
 ## Invariants
 

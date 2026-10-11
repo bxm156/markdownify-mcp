@@ -78,15 +78,17 @@ export function loadQuotaOverrides(file: string, global: { maxJobs: number; maxS
  *
  * The authentication mode comes from loadAuthenticator (JWT, credential registry or single MD_API_KEY).
  * MD_PUBLIC_BASE_URL must be a bare HTTP(S) origin: it is the base of upload URLs and the only accepted Origin header.
- * MD_ALLOWED_HOSTS defaults to that origin's host plus localhost and 127.0.0.1 on MD_PORT. Numeric settings must be
- * positive safe integers.
+ * MD_ALLOWED_HOSTS defaults to that origin's host (both bare and with its default port when the origin has none, since
+ * clients may send either) plus localhost and 127.0.0.1 on MD_PORT. Numeric settings must be positive safe integers.
  *
  * Quota model (enforced by JobService): every job that is not expired reserves its input size plus MD_MAX_OUTPUT_BYTES,
  * and admission checks the job count and reserved bytes at three independent scopes: global (MD_MAX_JOBS,
  * MD_MAX_STORAGE_BYTES), per tenant (MD_MAX_TENANT_JOBS, MD_MAX_TENANT_STORAGE_BYTES) and per agent (MD_MAX_AGENT_*,
  * or that principal's entry in MD_QUOTA_OVERRIDES_FILE). Concurrency is capped the same way (MD_CONCURRENCY,
- * MD_MAX_TENANT_CONCURRENCY, MD_MAX_AGENT_CONCURRENCY). The tightest scope applies. Only override entries are checked
- * against the global caps; the tenant and agent defaults are not.
+ * MD_MAX_TENANT_CONCURRENCY, MD_MAX_AGENT_CONCURRENCY). The tightest scope applies. The tenant and agent caps get the
+ * same checks as override entries: a value set above its global cap is rejected, and every storage budget (global,
+ * tenant, agent) must be at least 1 + MD_MAX_OUTPUT_BYTES, or no upload could ever be admitted. An unset tenant or agent
+ * cap is lowered to its global cap instead of rejected (the tightest scope would apply anyway).
  *
  * MD_LEGACY_OWNER names the owner adopted by job manifests written before jobs had owners.
  */
@@ -111,9 +113,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const publicUrl = new URL(env.MD_PUBLIC_BASE_URL ?? `http://localhost:${port}`);
   if (!["http:", "https:"].includes(publicUrl.protocol) || publicUrl.username || publicUrl.password || publicUrl.search || publicUrl.hash || publicUrl.pathname !== "/") throw new Error("MD_PUBLIC_BASE_URL must be an HTTP(S) origin without credentials, query or path");
   const publicBaseUrl = publicUrl.origin;
-  const allowedHosts = env.MD_ALLOWED_HOSTS?.split(",").map(value => value.trim()).filter(Boolean) ?? [publicUrl.host, `localhost:${port}`, `127.0.0.1:${port}`];
+  // URL.host omits a default port, but a client may still send it (Host: example.com:443), so both forms are allowed.
+  const publicHosts = publicUrl.port ? [publicUrl.host] : [publicUrl.host, `${publicUrl.hostname}:${publicUrl.protocol === "https:" ? 443 : 80}`];
+  const allowedHosts = env.MD_ALLOWED_HOSTS?.split(",").map(value => value.trim()).filter(Boolean) ?? [...new Set([...publicHosts, `localhost:${port}`, `127.0.0.1:${port}`])];
   if (!allowedHosts.length || allowedHosts.some(host => /[\s\/\\?#@]/.test(host))) throw new Error("MD_ALLOWED_HOSTS must contain comma-separated Host header values");
   const maxJobs = integer("MD_MAX_JOBS", 100), maxStorageBytes = integer("MD_MAX_STORAGE_BYTES", 256 * 1024 * 1024), concurrency = integer("MD_CONCURRENCY", 2), maxOutputBytes = integer("MD_MAX_OUTPUT_BYTES", 25 * 1024 * 1024);
+  // Tenant and agent caps: an explicit value above its global cap is rejected like an override entry; an unset default
+  // is lowered to the global cap. A storage budget below one job's reservation is rejected either way.
+  const floor = 1 + maxOutputBytes, floorReason = `${floor} (one input byte plus MD_MAX_OUTPUT_BYTES)`;
+  if (maxStorageBytes < floor) throw new Error(`MD_MAX_STORAGE_BYTES must be at least ${floorReason}`);
+  const scoped = (name: string, fallback: number, capName: string, cap: number) => {
+    const set = env[name] !== undefined, value = set ? integer(name, fallback) : Math.min(fallback, cap);
+    if (value > cap) throw new Error(`${name} must be at most ${capName} (${cap})`);
+    if (capName === "MD_MAX_STORAGE_BYTES" && value < floor) throw new Error(`${name}${set ? "" : ` (default ${value})`} must be at least ${floorReason}`);
+    return value;
+  };
   const quotaOverrides = env.MD_QUOTA_OVERRIDES_FILE === undefined ? undefined : loadQuotaOverrides(env.MD_QUOTA_OVERRIDES_FILE, { maxJobs, maxStorageBytes, concurrency, maxOutputBytes });
   return {
     authenticator, publicBaseUrl, allowedHosts, port, host: env.MD_HOST ?? "127.0.0.1",
@@ -128,12 +142,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       conversionTimeoutMs: integer("MD_CONVERSION_TIMEOUT_MS", 120_000),
       maxOutputBytes,
       concurrency,
-      maxTenantJobs: integer("MD_MAX_TENANT_JOBS", 25),
-      maxTenantStorageBytes: integer("MD_MAX_TENANT_STORAGE_BYTES", 128 * 1024 * 1024),
-      maxTenantConcurrency: integer("MD_MAX_TENANT_CONCURRENCY", 1),
-      maxAgentJobs: integer("MD_MAX_AGENT_JOBS", 10),
-      maxAgentStorageBytes: integer("MD_MAX_AGENT_STORAGE_BYTES", 128 * 1024 * 1024),
-      maxAgentConcurrency: integer("MD_MAX_AGENT_CONCURRENCY", 1),
+      maxTenantJobs: scoped("MD_MAX_TENANT_JOBS", 25, "MD_MAX_JOBS", maxJobs),
+      maxTenantStorageBytes: scoped("MD_MAX_TENANT_STORAGE_BYTES", 128 * 1024 * 1024, "MD_MAX_STORAGE_BYTES", maxStorageBytes),
+      maxTenantConcurrency: scoped("MD_MAX_TENANT_CONCURRENCY", 1, "MD_CONCURRENCY", concurrency),
+      maxAgentJobs: scoped("MD_MAX_AGENT_JOBS", 10, "MD_MAX_JOBS", maxJobs),
+      maxAgentStorageBytes: scoped("MD_MAX_AGENT_STORAGE_BYTES", 128 * 1024 * 1024, "MD_MAX_STORAGE_BYTES", maxStorageBytes),
+      maxAgentConcurrency: scoped("MD_MAX_AGENT_CONCURRENCY", 1, "MD_CONCURRENCY", concurrency),
       legacyOwner,
       quotaOverrides,
     },

@@ -65,7 +65,7 @@ test("JWT agents use scoped upload grants, enforce tool scopes and keep files pr
   expect(parsed(await a.callTool({ name: "get_service_health", arguments: {} })).own_jobs.completed).toBe(1);
   const denied = await limited.callTool({ name: "delete_job", arguments: { job_id: upload.upload_id } }); expect(errorCode(denied)).toBe("AUTH_SCOPE_REQUIRED");
   const listDenied = await f.client("machine-a", "mcp:tools/call mcp:tools/lookup_error:call");
-  await expect(listDenied.listTools()).rejects.toThrow("Scope not granted");
+  await expect(listDenied.listTools()).rejects.toMatchObject({ code: -32600, data: { error_info: { code: "AUTH_SCOPE_REQUIRED", retryable: false } } });
 });
 test("upload grants survive restart but expire", async () => {
   const f = await deployment(verifier(), 200), actor = { tenantId: "machine-a", agentId: "machine-a" };
