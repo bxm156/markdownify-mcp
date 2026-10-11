@@ -29,10 +29,12 @@ import { createRemoteServer, SERVER_INFO } from "./mcp.js";
 import type { Authenticator } from "./auth.js";
 import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
 import { errorResponse } from "./errors.js";
+import { publicHostForms } from "./config.js";
 
 /**
  * createHttpServer options. publicBaseUrl must be a bare origin: the only accepted Origin and the base of upload URLs.
- * allowedHosts defaults to the public host and is compared case-insensitively.
+ * allowedHosts defaults to the public host, bare and with its default port (publicHostForms, as in loadConfig), and is
+ * compared case-insensitively.
  */
 export interface HttpOptions { authenticator: Authenticator; publicBaseUrl: string; allowedHosts?: string[] }
 /** Largest accepted MCP request body (1 MiB). Tool arguments are small: files never pass through MCP. */
@@ -68,7 +70,7 @@ function token(request: IncomingMessage): string | undefined {
 export function createHttpServer(service: JobService, options: HttpOptions): Server {
   const publicUrl = new URL(options.publicBaseUrl);
   if (!options.authenticator || !["http:", "https:"].includes(publicUrl.protocol) || publicUrl.username || publicUrl.password || publicUrl.search || publicUrl.hash || publicUrl.pathname !== "/") throw new Error("Invalid HTTP server configuration");
-  const hosts = new Set((options.allowedHosts ?? [publicUrl.host]).map(host => host.toLowerCase()));
+  const hosts = new Set((options.allowedHosts ?? publicHostForms(publicUrl)).map(host => host.toLowerCase()));
   const server = createServer(async (request, response) => {
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");

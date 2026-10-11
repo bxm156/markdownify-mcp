@@ -10,9 +10,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { errnoCode } from "./audit.js";
 import { WINDOWS_UNSUPPORTED_MESSAGE } from "./config.js";
 import { validatePrincipal, type Principal } from "./identity.js";
-import { DEFAULT_LOCK_STALE_AFTER_MS, LOCK_REMOVAL_HINT, LockHeldError, acquireLock, parseLockStaleAfterMs, readLock, reclaimHint, releaseLock, type LockOptions } from "./lock.js";
+import { DEFAULT_LOCK_STALE_AFTER_MS, LOCK_REMOVAL_HINT, LockHeldError, acquireLock, lockAge, parseLockStaleAfterMs, reclaimHint, releaseLock, type LockOptions } from "./lock.js";
 
 /** One owned job. bytes sums its directory's entries (null if unreadable); code is an errno-style code when deletion failed. */
 export type PurgedJob = { job_id: string; status: string; bytes: number | null; result: "listed" | "deleted" | "failed"; code?: string };
@@ -22,7 +23,6 @@ export type PurgeReport = { applied: boolean; tenant_id: string; agent_id: strin
 export class PurgeRefused extends Error {}
 /** Why an --apply run stopped early: another process reclaimed the lock (lock.ts fencing), so it no longer owns the volume. */
 export const LOCK_LOST_MESSAGE = "Purge aborted: another process took over MD_DATA_DIR/.lock while the purge was running, so some of the owner's jobs may remain. Stop every other user of the volume, then repeat the dry run and --apply.";
-const errorCode = (error: unknown) => { const code = (error as NodeJS.ErrnoException | null)?.code; return typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code) ? code : "UNKNOWN"; };
 /** Sum of the lstat sizes of a job directory's direct entries (job directories are flat; symlinks are not followed). */
 async function directoryBytes(directory: string) { let bytes = 0; for (const name of await fs.readdir(directory)) bytes += (await fs.lstat(path.join(directory, name))).size; return bytes; }
 
@@ -30,7 +30,9 @@ async function directoryBytes(directory: string) { let bytes = 0; for (const nam
  * Privileged operator maintenance for one data volume while the service is STOPPED: list (default) or remove every job
  * directory whose manifest names this tenant/agent. Reads manifests and file sizes only, never document contents or credentials.
  * Each job is handled independently, so the report always says which jobs were deleted, which failed and which were skipped.
- * A dry run is read-only (it refuses if a lock exists, but never creates one). --apply needs write access and holds the
+ * A dry run is read-only and never creates a lock. It refuses while a fresh lock exists; a lock older than
+ * `lock.staleAfterMs` (the reclaim threshold; 0 never counts as stale) is a dead holder's leftover, so the dry run proceeds
+ * and writes one plain-text note to `lock.log` (default stderr). --apply needs write access and holds the
  * service's lock for the whole run, so the service cannot start and load half-deleted directories meanwhile. `lock` is
  * passed to acquireLock (stale reclaim, heartbeat); if the lock is lost, the run stops before the next deletion and
  * throws PurgeRefused(LOCK_LOST_MESSAGE) after calling `lock.onLost`.
@@ -43,11 +45,19 @@ export async function purgeOwnerJobs(dataDir: string, owner: Principal, apply = 
   const candidates = entries.filter(entry => entry.isDirectory() && /^[0-9a-f-]{36}$/.test(entry.name)).map(entry => entry.name);
   const manifests = await Promise.all(candidates.map(name => fs.lstat(path.join(root, name, "job.json")).then(stat => stat.isFile(), () => false)));
   if (!entries.some(entry => entry.isFile() && entry.name === "audit.jsonl") && !manifests.some(Boolean)) throw new PurgeRefused("Not a markdownify data directory (no job manifests or audit.jsonl)");
-  const locked = new PurgeRefused(`A lock file exists (MD_DATA_DIR/.lock). Stop the service if it is running. ${LOCK_REMOVAL_HINT}`);
-  if (!apply) { if (await readLock(root)) throw locked; return scan(root, candidates, owner, false); }
+  const staleAfterMs = lock.staleAfterMs ?? DEFAULT_LOCK_STALE_AFTER_MS;
+  const locked = () => new PurgeRefused(`A lock file exists (MD_DATA_DIR/.lock). Stop the service if it is running. ${reclaimHint(staleAfterMs)} ${LOCK_REMOVAL_HINT}`);
+  if (!apply) {
+    const age = await lockAge(root, lock.now);
+    if (age !== undefined) {
+      if (staleAfterMs <= 0 || age <= staleAfterMs) throw locked();
+      (lock.log ?? (line => { console.error(line); }))(`Note: MD_DATA_DIR/.lock was last refreshed ${age} ms ago (older than MD_LOCK_STALE_AFTER_MS=${staleAfterMs}), so its holder is presumed dead; listing read-only. --apply reclaims it.`);
+    }
+    return scan(root, candidates, owner, false);
+  }
   let lost = false;
   try { await acquireLock(root, { ...lock, onLost: () => { lost = true; lock.onLost?.(); } }); }
-  catch (error) { if (error instanceof LockHeldError) throw new PurgeRefused(`A lock file exists (MD_DATA_DIR/.lock). Stop the service if it is running. ${reclaimHint(lock.staleAfterMs ?? DEFAULT_LOCK_STALE_AFTER_MS)} ${LOCK_REMOVAL_HINT}`); throw new PurgeRefused(`Cannot create MD_DATA_DIR/.lock (${errorCode(error)}); --apply needs write access to the data directory`); }
+  catch (error) { if (error instanceof LockHeldError) throw locked(); throw new PurgeRefused(`Cannot create MD_DATA_DIR/.lock (${errnoCode(error)}); --apply needs write access to the data directory`); }
   try { return await scan(root, candidates, owner, true, () => lost); } finally { await releaseLock(root); }
 }
 /** Reads each candidate manifest and lists, or when applying deletes, the directories owned by `owner`. */
@@ -59,7 +69,7 @@ async function scan(root: string, candidates: string[], owner: Principal, apply:
     try { job = JSON.parse(await fs.readFile(path.join(directory, "job.json"), "utf8")); }
     catch (error) {
       // The service removes manifest-less directories at startup but refuses unreadable manifests, so report those for review.
-      if (errorCode(error) === "ENOENT") report.skipped.push({ job_id: name, reason: "missing_manifest" }); else report.unreadable.push(name);
+      if (errnoCode(error) === "ENOENT") report.skipped.push({ job_id: name, reason: "missing_manifest" }); else report.unreadable.push(name);
       continue;
     }
     if (!job || typeof job !== "object") { report.unreadable.push(name); continue; }
@@ -69,7 +79,7 @@ async function scan(root: string, candidates: string[], owner: Principal, apply:
     if (job.tenant_id !== owner.tenantId || job.agent_id !== owner.agentId) continue;
     const entry: PurgedJob = { job_id: name, status: typeof job.status === "string" && /^[a-z_]{1,32}$/.test(job.status) ? job.status : "unknown", bytes: await directoryBytes(directory).catch(() => null), result: apply ? "deleted" : "listed" };
     if (lost()) throw new PurgeRefused(LOCK_LOST_MESSAGE);
-    if (apply) try { await fs.rm(directory, { recursive: true, force: true }); } catch (error) { entry.result = "failed"; entry.code = errorCode(error); }
+    if (apply) try { await fs.rm(directory, { recursive: true, force: true }); } catch (error) { entry.result = "failed"; entry.code = errnoCode(error); }
     report.jobs.push(entry);
   }
   if (lost()) throw new PurgeRefused(LOCK_LOST_MESSAGE);
@@ -98,6 +108,6 @@ if (isMain() && process.platform === "win32") {
       process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
       // Non-zero whenever the run is incomplete, so scripts never mistake a partial purge for success.
       if (report.unreadable.length || report.jobs.some(job => job.result === "failed")) process.exitCode = 1;
-    }, error => { console.error(error instanceof PurgeRefused ? error.message : `Purge failed: ${errorCode(error)}`); process.exitCode = 1; });
+    }, error => { console.error(error instanceof PurgeRefused ? error.message : `Purge failed: ${errnoCode(error)}`); process.exitCode = 1; });
   }
 }
