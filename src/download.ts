@@ -22,7 +22,12 @@ function readPackageVersion(): string {
 /** Sent on every download; some servers (e.g. api.github.com) reject requests without one. */
 export const USER_AGENT = `markdownify-mcp/${readPackageVersion()}`;
 
-/** Connection failures after which the next validated address is tried. */
+/**
+ * Connection failures after which the next validated address is tried. These
+ * only ever apply before an attempt has completed ('connect', or
+ * 'secureConnect' for https:); once a socket has won and carries the request,
+ * no error is retried.
+ */
 const TRY_NEXT_ADDRESS_ERRORS = new Set([
   "ECONNREFUSED",
   "EHOSTUNREACH",
@@ -31,7 +36,32 @@ const TRY_NEXT_ADDRESS_ERRORS = new Set([
   "EADDRNOTAVAIL",
   "EAFNOSUPPORT", // e.g. an IPv6 address on a host without IPv6
   "EINVAL", // Node: the address does not match the socket family it was given
+  // The connection was cut before it became usable, e.g. a server or
+  // middlebox that accepts TCP and then drops it mid-handshake. Node and Bun
+  // both report a close during the TLS handshake as ECONNRESET.
+  "ECONNRESET",
+  "EPIPE",
+  "ECONNABORTED",
 ]);
+
+/**
+ * Certificate and TLS verification failures. These say the server is not who
+ * the URL names (or cannot prove it), which another address of the same host
+ * will not change, so they always end the whole fetch at once. Checked before
+ * TRY_NEXT_ADDRESS_ERRORS so no code can ever be both.
+ */
+function isVerificationError(code: string): boolean {
+  return (
+    code.startsWith("ERR_TLS_") ||
+    code.startsWith("ERR_SSL_") ||
+    code.includes("CERT") || // CERT_HAS_EXPIRED, DEPTH_ZERO_SELF_SIGNED_CERT, SELF_SIGNED_CERT_IN_CHAIN, ...
+    code.startsWith("UNABLE_TO_") || // UNABLE_TO_VERIFY_LEAF_SIGNATURE, UNABLE_TO_GET_ISSUER_CERT_LOCALLY, ...
+    code === "HOSTNAME_MISMATCH" ||
+    code === "INVALID_CA" ||
+    code === "INVALID_PURPOSE" ||
+    code === "PATH_LENGTH_EXCEEDED"
+  );
+}
 
 const NO_BODY_STATUSES = [204, 205, 304];
 
@@ -41,9 +71,15 @@ const NO_BODY_STATUSES = [204, 205, 304];
  * address is started immediately. A route that silently drops packets (e.g.
  * a black-holed IPv6 path on a dual-stack host), or a server that accepts TCP
  * but never completes TLS, would otherwise stall until the caller's overall
- * deadline. Only attempts that have another address after them get this
- * budget; the last address may use whatever remains of the caller's
- * deadline, so a slow but reachable single-address host behaves as before.
+ * deadline.
+ *
+ * The budget only exists to make room for another address. Every attempt
+ * gets it, but as soon as an attempt is the last one still possible (no
+ * address left untried and no other attempt in flight) its budget is
+ * cancelled and it may use whatever remains of the caller's deadline. So a
+ * slow but reachable single-address host behaves as before, and the final
+ * survivor of a multi-address race is not cut off at the budget while the
+ * caller would still wait.
  */
 export const CONNECT_TIMEOUT_MS = 5_000;
 
@@ -102,13 +138,45 @@ function redactUrl(url: string): string {
   }
 }
 
+/** Most hostnames whose winning address family is remembered; see rememberWinner. */
+export const CONNECTION_MEMORY_LIMIT = 256;
+
+type FamilyName = "ipv4" | "ipv6";
+
+/**
+ * Per hostname, the address family that last won a race between both
+ * families. Insertion order doubles as recency: a win deletes and re-adds its
+ * entry, and the oldest entries are evicted beyond the limit.
+ */
+let familyMemory = new Map<string, FamilyName>();
+let familyMemoryLimit = CONNECTION_MEMORY_LIMIT;
+
+/** Forgets every remembered family; `limit` (for tests) bounds the new memory. */
+export function resetConnectionMemory(limit = CONNECTION_MEMORY_LIMIT): void {
+  familyMemory = new Map();
+  familyMemoryLimit = limit;
+}
+
+function rememberWinner(hostname: string, family: number): void {
+  familyMemory.delete(hostname);
+  familyMemory.set(hostname, family === 4 ? "ipv4" : "ipv6");
+  while (familyMemory.size > familyMemoryLimit) {
+    familyMemory.delete(familyMemory.keys().next().value as string);
+  }
+}
+
+/** The family to try first for `hostname`: IPv6, unless IPv4 won there last time. */
+function preferredFamily(hostname: string): number {
+  return familyMemory.get(hostname) === "ipv4" ? 4 : 6;
+}
+
 /**
  * Orders addresses so the two families alternate (RFC 8305 section 4),
- * starting with the family of the first address and keeping the resolver's
- * order within each family.
+ * starting with `preferred` (IPv6 by default) when that family is present,
+ * and keeping the resolver's order within each family.
  */
-export function interleaveFamilies(addresses: ResolvedAddress[]): ResolvedAddress[] {
-  const first = addresses[0]?.family;
+export function interleaveFamilies(addresses: ResolvedAddress[], preferred = 6): ResolvedAddress[] {
+  const first = addresses.some((entry) => entry.family === preferred) ? preferred : addresses[0]?.family;
   const primary = addresses.filter((entry) => entry.family === first);
   const secondary = addresses.filter((entry) => entry.family !== first);
   const ordered: ResolvedAddress[] = [];
@@ -207,7 +275,7 @@ function connectFirst(
   signal: AbortSignal,
   connectTimeoutMs: number,
   attemptDelayMs: number,
-  onWinner: (socket: net.Socket) => void,
+  onWinner: (socket: net.Socket, selected: ResolvedAddress) => void,
   onFailure: (error: unknown) => void,
 ): void {
   const readyEvent = target.secure ? "secureConnect" : "connect";
@@ -261,12 +329,26 @@ function connectFirst(
     onFailure(error);
   }
 
+  /** True when `attempt` is the only one left that could still succeed. */
+  const isLastPossible = (attempt: Attempt) =>
+    attempts.length === addresses.length &&
+    attempts.every((entry) => entry === attempt || entry.failure !== undefined);
+
+  /** Lifts the budget from the last possible attempt; see CONNECT_TIMEOUT_MS. */
+  const exemptLastPossible = () => {
+    const pending = attempts.find((entry) => entry.failure === undefined);
+    if (pending?.budget !== undefined && isLastPossible(pending)) {
+      clearTimeout(pending.budget);
+      pending.budget = undefined;
+    }
+  };
+
   const startNext = () => {
     if (staggerTimer !== undefined) clearTimeout(staggerTimer);
     staggerTimer = undefined;
     if (settled || signal.aborted || attempts.length >= addresses.length) return;
     const index = attempts.length;
-    const isLast = index === addresses.length - 1;
+    const isLastAddress = index === addresses.length - 1;
     const selected = addresses[index];
     let socket: net.Socket;
     try {
@@ -282,14 +364,14 @@ function connectFirst(
       onReady: () => {
         if (settled) return;
         settle(attempt);
-        onWinner(socket);
+        onWinner(socket, selected);
       },
       onError: (error: Error) => {
         if (settled) return;
         const code = (error as NodeJS.ErrnoException)?.code;
         attempt.failure = code ?? error?.name ?? "Error";
         release(attempt, true);
-        if (!code || !TRY_NEXT_ADDRESS_ERRORS.has(code)) {
+        if (!code || isVerificationError(code) || !TRY_NEXT_ADDRESS_ERRORS.has(code)) {
           // Not a reachability problem (e.g. a certificate error): stop.
           settle();
           onFailure(error);
@@ -298,22 +380,27 @@ function connectFirst(
         } else if (attempts.every((entry) => entry.failure !== undefined)) {
           settle();
           onFailure(combinedError("unknown"));
+        } else {
+          exemptLastPossible();
         }
       },
     };
     attempts.push(attempt);
     socket.once(readyEvent, attempt.onReady);
     socket.on("error", attempt.onError);
-    if (!isLast) {
-      attempt.budget = setTimeout(() => {
+    if (!isLastPossible(attempt)) {
+      const budget = setTimeout(() => {
+        // A timer that was already due when its budget was lifted must not fire.
+        if (attempt.budget !== budget) return;
         attempt.budget = undefined;
         attempt.onError(Object.assign(
           new Error(`Connecting to ${selected.address} timed out after ${connectTimeoutMs} ms`),
           { code: "ETIMEDOUT" },
         ));
       }, connectTimeoutMs);
-      staggerTimer = setTimeout(startNext, attemptDelayMs);
+      attempt.budget = budget;
     }
+    if (!isLastAddress) staggerTimer = setTimeout(startNext, attemptDelayMs);
   };
 
   signal.addEventListener("abort", onAbort, { once: true });
@@ -389,9 +476,13 @@ export const download = {
    * RFC 8305-style: families are interleaved, attempts start
    * `attemptDelayMs` (default ATTEMPT_DELAY_MS) apart, and the first socket
    * to connect (and finish TLS, for https:) carries the request while the
-   * others are destroyed. Every attempt but the last gets `connectTimeoutMs`
-   * (default CONNECT_TIMEOUT_MS). All attempts share `signal`, which stays
-   * the single overall deadline. Once a socket has won, the request is never
+   * others are destroyed. IPv6 goes first unless IPv4 won the last race for
+   * this hostname. Each attempt gets `connectTimeoutMs` (default
+   * CONNECT_TIMEOUT_MS) except the last one still possible, which runs until
+   * `signal` ends it. All attempts share `signal`, which stays the single
+   * overall deadline. A connection reset before an attempt completes falls
+   * through to the next address like a refusal; a certificate or TLS
+   * verification failure does not. Once a socket has won, the request is never
    * retried. When no address becomes usable the promise rejects with a
    * ConnectFailedError listing every address tried, including when the
    * deadline (an AbortSignal.timeout) passes first; any other abort rejects
@@ -409,15 +500,20 @@ export const download = {
     signal.throwIfAborted();
     if (addresses.length === 0) throw new Error("No validated address");
     const target = targetOf(url);
+    // Only a race between both families teaches anything about the host.
+    const dualStack = new Set(addresses.map((entry) => entry.family)).size > 1;
     return new Promise((resolve, reject) => {
       connectFirst(
         url,
         target,
-        interleaveFamilies(addresses),
+        interleaveFamilies(addresses, preferredFamily(target.hostname)),
         signal,
         connectTimeoutMs,
         attemptDelayMs,
-        (socket) => resolve(requestOver(url, socket, signal)),
+        (socket, selected) => {
+          if (dualStack) rememberWinner(target.hostname, selected.family);
+          resolve(requestOver(url, socket, signal));
+        },
         reject,
       );
     });
