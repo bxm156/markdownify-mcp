@@ -260,27 +260,87 @@ describe("read audit coalescing", () => {
     expect(reads(state.events, "read_markdown", id)).toEqual(["running", "completed"]);
   });
 
-  test("repeated reads of a completed result are sampled every Nth read; status polling and denials are not", async () => {
+  test("repeated read passes of a completed result are sampled every Nth pass; status polling and denials are not", async () => {
     const { state, sink } = recorder();
     const { instance } = await service({ audit: sink });
     const id = await uploaded(instance);
     await instance.startConversion(alice, id); await until(instance, id, "completed");
     expect(AUDIT_READ_REPEAT_EVERY).toBe(10);
-    for (let i = 0; i < 25; i++) await instance.getMarkdown(alice, id, { offset: i % 2, max_chars: 2 });
+    // Every read from offset 0 is not past the previous read's offset, so each starts a new pass.
+    for (let i = 0; i < 25; i++) await instance.getMarkdown(alice, id, { offset: 0, max_chars: 2 });
     for (let i = 0; i < 25; i++) await instance.getStatus(alice, id);
     expect(reads(state.events, "read_markdown", id)).toEqual(["completed"]);
-    // 24 reads followed the first record: the 10th and 20th each wrote one sampled record with the running count.
+    // Pass 1 is the first record; passes 10 and 20 each wrote one sampled record carrying the pass number.
     expect(state.events.filter(e => e.event === "read_markdown_repeat").map(e => [e.job_id, e.status, e.repeat_count])).toEqual([[id, "completed", 10], [id, "completed", 20]]);
     expect(state.events.filter(e => e.event === "read_status_repeat")).toHaveLength(0);
-    // Unsampled reads succeed while the sink fails; the sampled read fails closed and is written on its retry.
+    // Unsampled passes succeed while the sink fails; the sampled pass fails closed and is written on its retry.
     state.fail = true;
-    for (let i = 0; i < 5; i++) await instance.getMarkdown(alice, id); // Reads 25-29.
+    for (let i = 0; i < 4; i++) await instance.getMarkdown(alice, id); // Passes 26-29.
     await expect(instance.getMarkdown(alice, id)).rejects.toMatchObject({ statusCode: 503, code: "AUDIT_UNAVAILABLE" });
     state.fail = false;
     await instance.getMarkdown(alice, id);
     expect(state.events.filter(e => e.event === "read_markdown_repeat").map(e => e.repeat_count)).toEqual([10, 20, 30]);
     for (let i = 0; i < 3; i++) await expect(instance.getMarkdown(mallory, id)).rejects.toMatchObject({ statusCode: 404 });
     expect(state.events.filter(e => e.event === "authorization_denied")).toHaveLength(3);
+  });
+
+  describe("read passes", () => {
+    const PAGE = 4, LENGTH = 100; // 25 pages.
+    async function completed() {
+      const { state, sink } = recorder();
+      const { instance } = await service({ audit: sink, converter: async (_input, output) => { await fs.writeFile(output, "a".repeat(LENGTH)); } });
+      const id = await uploaded(instance);
+      await instance.startConversion(alice, id); await until(instance, id, "completed");
+      const read = (offset: number) => instance.getMarkdown(alice, id, { offset, max_chars: PAGE });
+      const repeats = () => state.events.filter(e => e.event === "read_markdown_repeat").map(e => e.repeat_count);
+      return { state, id, read, repeats };
+    }
+    /** Reads every page in order from `from`; returns the number of pages read. */
+    async function readThrough(read: (offset: number) => Promise<{ next_offset: number | null }>, from = 0) {
+      let offset: number | null = from, pages = 0;
+      while (offset !== null) { offset = (await read(offset)).next_offset; pages++; }
+      return pages;
+    }
+
+    test("a 25-page sequential read-through counts as one pass", async () => {
+      const { state, id, read, repeats } = await completed();
+      expect(await readThrough(read)).toBe(25);
+      expect(reads(state.events, "read_markdown", id)).toEqual(["completed"]);
+      expect(repeats()).toEqual([]);
+      // Had each page counted, the read-through alone would have crossed the sampling threshold twice. Passes 2-9
+      // (each a full read-through from offset 0) write nothing; pass 10 writes the first sampled record.
+      for (let pass = 2; pass < AUDIT_READ_REPEAT_EVERY; pass++) await readThrough(read);
+      expect(repeats()).toEqual([]);
+      await read(0);
+      expect(repeats()).toEqual([AUDIT_READ_REPEAT_EVERY]);
+    });
+
+    test("re-reading from offset 0 or jumping back to a lower or equal offset starts a new pass", async () => {
+      const { read, repeats } = await completed();
+      await read(0); await read(40); // Pass 1, then forward.
+      await read(0); // Pass 2: back to the start.
+      await read(60); await read(20); // Pass 3: back to a lower non-zero offset.
+      await read(20); // Pass 4: the same offset again.
+      await read(96); await read(48); // Pass 5.
+      for (let pass = 6; pass < AUDIT_READ_REPEAT_EVERY; pass++) { await read(80); await read(4); } // Passes 6-9: forward, then back to 4.
+      expect(repeats()).toEqual([]);
+      await read(8); await read(4); // Pass 10.
+      expect(repeats()).toEqual([10]);
+    });
+
+    test("forward reads never start a pass or write a sampled record", async () => {
+      const { state, read, repeats } = await completed();
+      for (let pass = 1; pass < AUDIT_READ_REPEAT_EVERY; pass++) await read(0); // Passes 1-9: the next pass would be sampled.
+      const before = state.events.length;
+      // Forward reads with gaps and single steps, including the last page, while the sink fails: none of them writes.
+      state.fail = true;
+      for (const offset of [4, 8, 40, 44, 96]) await read(offset);
+      state.fail = false;
+      expect(state.events.length).toBe(before);
+      expect(repeats()).toEqual([]);
+      await read(92); // Pass 10.
+      expect(repeats()).toEqual([10]);
+    });
   });
 
   test("authorization_denied is recorded on every attempt", async () => {
@@ -312,7 +372,7 @@ describe("read audit coalescing", () => {
     setSystemTime(new Date("2030-01-01T00:00:00Z"));
     const { state, sink } = recorder();
     const { instance } = await service({ audit: sink });
-    const tracked = () => (instance as unknown as { auditedReads: Map<string, Map<string, number>> }).auditedReads;
+    const tracked = () => (instance as unknown as { auditedReads: Map<string, unknown> }).auditedReads;
     const deleted = await uploaded(instance), expiring = await uploaded(instance);
     await instance.getStatus(alice, deleted); await instance.getStatus(alice, expiring);
     expect([...tracked().keys()].sort()).toEqual([deleted, expiring].sort());

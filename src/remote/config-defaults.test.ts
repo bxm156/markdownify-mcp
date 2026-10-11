@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import path from "node:path";
-import { loadConfig } from "./config.js";
+import fs from "node:fs/promises";
+import { loadConfig, SHUTDOWN_TIMEOUT_WARN_MS } from "./config.js";
 
 const MiB = 1024 * 1024;
 const env = { MD_API_KEY: "a".repeat(32) };
@@ -55,6 +56,15 @@ test("each default can be overridden independently through its environment varia
     const jobs = loadConfig({ ...env, [name]: String(value) }).jobs as Record<string, unknown>;
     expect(jobs[field], name).toBe(value);
     for (const other of Object.keys(jobs)) if (other !== field) expect(jobs[other], `${name} leaked into ${other}`).toEqual(defaults[other]);
+  }
+});
+test("the default shutdown deadline sits below the warning ceiling, which matches every bundled Compose stop_grace_period", async () => {
+  expect(loadConfig(env).shutdownTimeoutMs).toBeLessThan(SHUTDOWN_TIMEOUT_WARN_MS);
+  const root = path.resolve(import.meta.dir, "../..");
+  const files = ["compose.remote.yaml", "compose.jwt.yaml", "compose.multitenant.yaml"];
+  for (const file of files) {
+    const grace = [...(await fs.readFile(path.join(root, file), "utf8")).matchAll(/^\s*stop_grace_period:\s*(\d+)s\s*$/gm)].map(match => Number(match[1]) * 1000);
+    expect(grace, file).toEqual([SHUTDOWN_TIMEOUT_WARN_MS]);
   }
 });
 test("MD_SHUTDOWN_TIMEOUT_MS overrides only the shutdown deadline", () => {

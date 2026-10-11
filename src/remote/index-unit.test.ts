@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createServer, type Server } from "node:http";
 import net from "node:net";
 import type { JobService } from "./jobs.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, SHUTDOWN_TIMEOUT_WARN_MS } from "./config.js";
 import { startRemoteServer, type ProcessHandle, type RemoteConfig, type RemoteServer } from "./index.js";
 
 // Unit tests for startRemoteServer: every process-level side effect (exit, signal registration, logging) and the job
@@ -52,6 +52,24 @@ describe("startRemoteServer", () => {
     expect(started.server.headersTimeout).toBe(30000);
     expect([...started.proc.listeners.keys()].sort()).toEqual(["SIGHUP", "SIGINT", "SIGTERM"]);
     expect(started.proc.exits).toEqual([]);
+  });
+
+  test("warns once at startup when MD_SHUTDOWN_TIMEOUT_MS exceeds the stop-grace ceiling, and not at or below it", async () => {
+    expect(SHUTDOWN_TIMEOUT_WARN_MS).toBe(15_000);
+    const above = await start(makeConfig({ MD_PORT: String(await freePort()), MD_SHUTDOWN_TIMEOUT_MS: String(SHUTDOWN_TIMEOUT_WARN_MS + 1) }));
+    const warnings = above.logs.filter(line => line.startsWith("{"));
+    expect(warnings.map(line => JSON.parse(line))).toEqual([{ event: "shutdown_timeout_warning", shutdown_timeout_ms: SHUTDOWN_TIMEOUT_WARN_MS + 1, ceiling_ms: SHUTDOWN_TIMEOUT_WARN_MS }]);
+    expect(warnings[0]).not.toContain("\n");
+    // The warning does not stop startup, and nothing else repeats it.
+    expect(above.server.listening).toBe(true);
+    expect(above.logs).toHaveLength(2);
+    await above.shutdown();
+    expect(above.logs.filter(line => line.startsWith("{"))).toHaveLength(1);
+    for (const timeout of [SHUTDOWN_TIMEOUT_WARN_MS, SHUTDOWN_TIMEOUT_WARN_MS - 1, undefined]) {
+      const port = await freePort();
+      const quiet = await start(makeConfig({ MD_PORT: String(port), ...(timeout === undefined ? {} : { MD_SHUTDOWN_TIMEOUT_MS: String(timeout) }) }));
+      expect(quiet.logs, String(timeout)).toEqual([`Markdownify remote listening on 127.0.0.1:${port}`]);
+    }
   });
 
   test("a clean shutdown closes jobs and the server, never forces an exit, and leaves no pending deadline", async () => {

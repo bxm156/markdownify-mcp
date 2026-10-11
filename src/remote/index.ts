@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Server } from "node:http";
 import { fileURLToPath } from "node:url";
-import { loadConfig } from "./config.js";
+import { loadConfig, SHUTDOWN_TIMEOUT_WARN_MS } from "./config.js";
 import { createHttpServer } from "./http.js";
 import { JobService } from "./jobs.js";
 import { createAuditLogger } from "./audit.js";
@@ -40,6 +40,9 @@ export async function startRemoteServer(options: RemoteServerOptions): Promise<R
   const createServer = options.createServer ?? ((service: JobService, settings: RemoteConfig) => createHttpServer(service, settings));
   const processHandle = options.processHandle ?? defaultProcessHandle;
   const log = options.log ?? ((message: string) => { console.error(message); });
+  // A deadline longer than the container's stop grace period means SIGKILL arrives first (see SHUTDOWN_TIMEOUT_WARN_MS).
+  // Warn once, as a single-line JSON operator event, but still start: other runtimes may allow longer.
+  if (config.shutdownTimeoutMs > SHUTDOWN_TIMEOUT_WARN_MS) log(JSON.stringify({ event: "shutdown_timeout_warning", shutdown_timeout_ms: config.shutdownTimeoutMs, ceiling_ms: SHUTDOWN_TIMEOUT_WARN_MS }));
   const jobs = await createJobs(config);
   await jobs.init();
   const server = createServer(jobs, config);

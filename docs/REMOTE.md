@@ -35,6 +35,8 @@ Copy `.env.remote.example` to `.env.remote`, set `MD_API_KEY` to a random secret
 node --env-file=.env.remote dist/remote/index.js
 ```
 
+Always start the server with the full `dist/remote/index.js` path, as above, as `bun run start:remote` does and as the image's `CMD` does. The module only starts a server when it is the program being run. Node releases that provide `import.meta.main` (22.18 and later 22.x, 24.2 and later) and Bun detect that directly; older Node, including Node 24.0 and 24.1, compares the started script path with the module's own file. There, `node dist/remote/index` (no `.js`) or `node dist/remote` loads the module but never starts the server, and the process exits with status 0 and no output.
+
 Generate a key without storing it in the image:
 
 ```sh
@@ -113,7 +115,7 @@ For PowerShell use `$env:MCP_URL='...'` (and similarly for other variables) inst
 | `MD_UPLOAD_TTL_MS` | 900,000 (15 minutes) | Abandoned upload expiry |
 | `MD_CONVERSION_TIMEOUT_MS` | 120,000 (2 minutes) | Converter process deadline |
 | `MD_CONCURRENCY` | 2 | Maximum active converters |
-| `MD_SHUTDOWN_TIMEOUT_MS` | 10,000 (10 seconds) | Graceful shutdown deadline after SIGTERM, SIGINT or SIGHUP; when it passes the server closes every connection and exits 1. Keep the container `stop_grace_period` (15s in the bundled Compose files) above it |
+| `MD_SHUTDOWN_TIMEOUT_MS` | 10,000 (10 seconds) | Graceful shutdown deadline after SIGTERM, SIGINT or SIGHUP; when it passes the server closes every connection and exits 1. Keep the container `stop_grace_period` (15s in the bundled Compose files) above it. A value above 15,000 still starts, but logs one `{"event":"shutdown_timeout_warning","shutdown_timeout_ms":N,"ceiling_ms":15000}` line on stderr at startup |
 | `MD_QUOTA_OVERRIDES_FILE` | unset | Optional operator-managed per-principal agent caps; see [MULTITENANT.md](MULTITENANT.md#operator-quota-overrides) |
 
 Storage reservations are conservative: even a small file reserves the full configured Markdown output limit. Increase storage or lower output limits to accommodate more live jobs. JSON manifests and scratch buffers add overhead; the application budget is not a filesystem quota. Use a dedicated volume with adequate free space. Store it on an encrypted disk if document confidentiality requires it. Do not log upload authorization headers or whole `create_upload` results in agent traces.
