@@ -10,6 +10,11 @@ import {
   expandHome,
   validateUrl,
   validateRepoUrl,
+  validateGitRef,
+  gitRefProblem,
+  getAllowedGitHosts,
+  DEFAULT_GIT_HOSTS,
+  MAX_GIT_REF_LENGTH,
   isUnconvertedHtml,
   inferExtensionFromUrl,
   isMarkdownFile,
@@ -253,6 +258,17 @@ describe("isUnconvertedHtml", () => {
   test("returns false for plain text", () => {
     expect(isUnconvertedHtml("Just some plain text")).toBe(false);
   });
+  test("matches doctype and html tags in any letter case", () => {
+    expect(isUnconvertedHtml("<!doctype html><html></html>")).toBe(true);
+    expect(isUnconvertedHtml("<!DocType html>")).toBe(true);
+    expect(isUnconvertedHtml("<HTML><BODY>x</BODY></HTML>")).toBe(true);
+    expect(isUnconvertedHtml("\n  <Html lang='en'>")).toBe(true);
+  });
+
+  test("does not match Markdown that merely mentions html", () => {
+    expect(isUnconvertedHtml("html is a markup language")).toBe(false);
+    expect(isUnconvertedHtml("`<html>` starts a document")).toBe(false);
+  });
 });
 
 describe("inferExtensionFromUrl", () => {
@@ -264,12 +280,34 @@ describe("inferExtensionFromUrl", () => {
     expect(inferExtensionFromUrl("https://example.com/page")).toBe("html");
   });
 
+  test("ignores the query string and fragment", () => {
+    expect(inferExtensionFromUrl("https://example.com/doc.pdf?dl=1")).toBe("pdf");
+    expect(inferExtensionFromUrl("https://example.com/doc.pdf#page=2")).toBe("pdf");
+    expect(inferExtensionFromUrl("https://example.com/page?file=x.pdf")).toBe("html");
+    expect(inferExtensionFromUrl("https://example.com/page#x.pdf")).toBe("html");
+  });
+
+  test("matches .pdf in any letter case", () => {
+    expect(inferExtensionFromUrl("https://example.com/DOC.PDF")).toBe("pdf");
+    expect(inferExtensionFromUrl("https://example.com/doc.Pdf")).toBe("pdf");
+  });
+
+  test("returns html for a string that is not a URL", () => {
+    expect(inferExtensionFromUrl("not a url.pdf")).toBe("html");
+  });
+
   test("returns html for .html URLs", () => {
     expect(inferExtensionFromUrl("https://example.com/page.html")).toBe("html");
   });
 });
 
 describe("isMarkdownFile", () => {
+  test("accepts upper- and mixed-case extensions", () => {
+    expect(isMarkdownFile("/path/to/README.MD")).toBe(true);
+    expect(isMarkdownFile("/path/to/notes.Markdown")).toBe(true);
+    expect(isMarkdownFile("/path/to/notes.mD")).toBe(true);
+  });
+
   test("accepts .md files", () => {
     expect(isMarkdownFile("/path/to/file.md")).toBe(true);
   });
@@ -345,47 +383,266 @@ describe("isWithinDirectory", () => {
   });
 });
 
+describe("validateGitRef", () => {
+  const valid = [
+    "main",
+    "refs/heads/ok",
+    "feature/x-1",
+    "v1.2.3",
+    "release-2024.01",
+    "a1b2c3d",
+    "0123456789abcdef0123456789abcdef01234567",
+    "x".repeat(MAX_GIT_REF_LENGTH),
+  ];
+  for (const ref of valid) {
+    test(`accepts ${JSON.stringify(ref.length > 40 ? `${ref.slice(0, 20)}...` : ref)}`, () => {
+      expect(gitRefProblem(ref)).toBeNull();
+      expect(() => validateGitRef(ref)).not.toThrow();
+    });
+  }
+
+  const invalid: [string, string][] = [
+    ["--upload-pack=x", 'must not start with "-"'],
+    ["--upload-pack=touch /tmp/pwned", 'must not start with "-"'],
+    ["-x", 'must not start with "-"'],
+    ["a b", "spaces or control characters"],
+    ["a\tb", "spaces or control characters"],
+    ["a\nb", "spaces or control characters"],
+    ["a\x7fb", "spaces or control characters"],
+    ["a..b", '".."'],
+    ["a@{1}", '"@{"'],
+    ["@", 'must not be "@"'],
+    ["a\\b", '"\\"'],
+    ["a~1", '"~"'],
+    ["a^", '"^"'],
+    ["a:b", '":"'],
+    ["a?", '"?"'],
+    ["a*", '"*"'],
+    ["a[b", '"["'],
+    [".hidden", 'starting with "."'],
+    ["refs/.hidden", 'starting with "."'],
+    ["topic.lock", '".lock"'],
+    ["refs/x.lock/y", '".lock"'],
+    ["trailing/", 'must not end with "/"'],
+    ["trailing.", 'must not end with "."'],
+    ["a//b", '"//"'],
+    ["/abs", '"//" or start with "/"'],
+    ["", "must not be empty"],
+    ["x".repeat(MAX_GIT_REF_LENGTH + 1), `at most ${MAX_GIT_REF_LENGTH} characters`],
+  ];
+  for (const [ref, reason] of invalid) {
+    test(`rejects ${JSON.stringify(ref.length > 40 ? `${ref.slice(0, 20)}... (${ref.length} chars)` : ref)}`, () => {
+      expect(gitRefProblem(ref)).toContain(reason);
+      expect(() => validateGitRef(ref)).toThrow(`Invalid git ref: Branch ${gitRefProblem(ref)}`);
+    });
+  }
+});
+
 describe("validateRepoUrl", () => {
-  test("accepts GitHub shorthand", () => {
-    expect(() => validateRepoUrl("octocat/Hello-World")).not.toThrow();
+  const savedHosts = process.env.MD_GIT_HOSTS;
+  let lookupSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    delete process.env.MD_GIT_HOSTS;
+    // Offline: every name resolves to a public address unless a test says otherwise.
+    lookupSpy = spyOn(dns.promises, "lookup").mockResolvedValue([
+      { address: "140.82.112.3", family: 4 },
+    ] as any);
   });
 
-  test("accepts full GitHub URL", () => {
-    expect(() =>
+  afterEach(() => {
+    lookupSpy.mockRestore();
+    if (savedHosts === undefined) delete process.env.MD_GIT_HOSTS;
+    else process.env.MD_GIT_HOSTS = savedHosts;
+  });
+
+  test("accepts GitHub shorthand and checks github.com's addresses", async () => {
+    await expect(validateRepoUrl("octocat/Hello-World")).resolves.toBeUndefined();
+    expect(lookupSpy).toHaveBeenCalledWith("github.com", {
+      all: true,
+      verbatim: true,
+    });
+  });
+
+  test("accepts full GitHub URL", async () => {
+    await expect(
       validateRepoUrl("https://github.com/octocat/Hello-World"),
-    ).not.toThrow();
+    ).resolves.toBeUndefined();
   });
 
-  test("rejects empty string", () => {
-    expect(() => validateRepoUrl("")).toThrow("Repository URL is required");
+  test("accepts the other default hosts and their www. forms", async () => {
+    for (const url of [
+      "https://gitlab.com/group/sub/project",
+      "https://www.gitlab.com/group/project",
+      "https://bitbucket.org/team/repo",
+      "https://www.github.com/octocat/Hello-World",
+      "https://GitHub.com/octocat/Hello-World",
+    ]) {
+      await expect(validateRepoUrl(url)).resolves.toBeUndefined();
+    }
   });
 
-  test("rejects whitespace-only string", () => {
-    expect(() => validateRepoUrl("   ")).toThrow("Repository URL is required");
+  test("accepts an SSH address on an allowlisted host", async () => {
+    await expect(
+      validateRepoUrl("git@github.com:octocat/Hello-World.git"),
+    ).resolves.toBeUndefined();
+    expect(lookupSpy).toHaveBeenCalledWith("github.com", expect.anything());
   });
 
-  test("rejects shell metacharacters", () => {
-    expect(() => validateRepoUrl("owner/repo; rm -rf /")).toThrow(
+  test("rejects empty string", async () => {
+    await expect(validateRepoUrl("")).rejects.toThrow("Repository URL is required");
+  });
+
+  test("rejects whitespace-only string", async () => {
+    await expect(validateRepoUrl("   ")).rejects.toThrow("Repository URL is required");
+  });
+
+  test("rejects shell metacharacters", async () => {
+    await expect(validateRepoUrl("owner/repo; rm -rf /")).rejects.toThrow(
       "Invalid repository URL or shorthand",
     );
   });
 
-  test("rejects flag injection", () => {
-    expect(() => validateRepoUrl("--help")).toThrow(
+  test("rejects flag injection", async () => {
+    await expect(validateRepoUrl("--help")).rejects.toThrow(
       "Invalid repository URL or shorthand",
     );
   });
 
-  test("rejects file:// URLs", () => {
-    expect(() => validateRepoUrl("file:///etc/passwd")).toThrow(
+  test("rejects file:// URLs", async () => {
+    await expect(validateRepoUrl("file:///etc/passwd")).rejects.toThrow(
       "Only http: and https: repository URLs are allowed",
     );
   });
 
-  test("rejects ssh:// URLs", () => {
-    expect(() => validateRepoUrl("ssh://git@github.com/owner/repo")).toThrow(
+  test("rejects ssh:// and git:// URLs", async () => {
+    await expect(validateRepoUrl("ssh://git@github.com/owner/repo")).rejects.toThrow(
       "Only http: and https: repository URLs are allowed",
     );
+    await expect(validateRepoUrl("git://github.com/owner/repo")).rejects.toThrow(
+      "Only http: and https: repository URLs are allowed",
+    );
+  });
+
+  test("rejects an option smuggled in as the URL's branch", async () => {
+    for (const url of [
+      "https://github.com/a/b/tree/--upload-pack=x",
+      "https://github.com/a/b/tree/--upload-pack=touch%20x",
+      "https://github.com/a/b/blob/-x/README.md",
+    ]) {
+      await expect(validateRepoUrl(url)).rejects.toThrow(
+        'Invalid git ref: The ref in the repository URL must not start with "-"',
+      );
+    }
+    expect(lookupSpy).not.toHaveBeenCalled();
+  });
+
+  test("accepts a valid branch embedded in the URL", async () => {
+    await expect(
+      validateRepoUrl("https://github.com/a/b/tree/main/src"),
+    ).resolves.toBeUndefined();
+  });
+
+  test("rejects the cloud metadata address", async () => {
+    await expect(
+      validateRepoUrl("https://169.254.169.254/latest/meta-data"),
+    ).rejects.toThrow('Repository host "169.254.169.254" is not allowed');
+    process.env.MD_GIT_HOSTS = "*";
+    await expect(
+      validateRepoUrl("https://169.254.169.254/latest/meta-data"),
+    ).rejects.toThrow('Repository host "169.254.169.254" resolves to a loopback, private');
+    expect(lookupSpy).not.toHaveBeenCalled();
+  });
+
+  test("rejects loopback addresses", async () => {
+    await expect(validateRepoUrl("http://127.0.0.1/a/b")).rejects.toThrow(
+      'Repository host "127.0.0.1" is not allowed',
+    );
+    process.env.MD_GIT_HOSTS = "*";
+    for (const url of ["http://127.0.0.1/a/b", "https://[::1]/a/b", "http://localhost/a/b"]) {
+      await expect(validateRepoUrl(url)).rejects.toThrow("resolves to a loopback, private");
+    }
+  });
+
+  test("rejects a host that is not on the allowlist", async () => {
+    await expect(validateRepoUrl("https://git.example.com/a/b")).rejects.toThrow(
+      'Repository host "git.example.com" is not allowed. Allowed hosts: github.com, www.github.com',
+    );
+    await expect(validateRepoUrl("git@10.0.0.1:a/b.git")).rejects.toThrow(
+      'Repository host "10.0.0.1" is not allowed',
+    );
+    // A subdomain of an allowed host is a different host.
+    await expect(validateRepoUrl("https://evil.github.com/a/b")).rejects.toThrow(
+      'Repository host "evil.github.com" is not allowed',
+    );
+    expect(lookupSpy).not.toHaveBeenCalled();
+  });
+
+  test("checks the host a URL really names, not text before an @", async () => {
+    await expect(
+      validateRepoUrl("https://github.com@git.example.com/a/b"),
+    ).rejects.toThrow('Repository host "git.example.com" is not allowed');
+  });
+
+  test("rejects an allowlisted host that resolves to a private address", async () => {
+    lookupSpy.mockResolvedValue([
+      { address: "140.82.112.3", family: 4 },
+      { address: "10.0.0.5", family: 4 },
+    ] as any);
+    await expect(validateRepoUrl("octocat/Hello-World")).rejects.toThrow(
+      'Repository host "github.com" resolves to a loopback, private, link-local or metadata address',
+    );
+  });
+
+  test("rejects an allowlisted host whose lookup fails", async () => {
+    lookupSpy.mockRejectedValue(Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" }));
+    await expect(validateRepoUrl("octocat/Hello-World")).rejects.toThrow(
+      "could not be resolved",
+    );
+  });
+
+  test("MD_GIT_HOSTS replaces the default allowlist", async () => {
+    process.env.MD_GIT_HOSTS = " git.example.com , Code.Example.org. ";
+    expect(getAllowedGitHosts()).toEqual(["git.example.com", "code.example.org"]);
+    await expect(
+      validateRepoUrl("https://git.example.com/team/repo"),
+    ).resolves.toBeUndefined();
+    await expect(
+      validateRepoUrl("https://CODE.example.org/team/repo"),
+    ).resolves.toBeUndefined();
+    await expect(validateRepoUrl("git@git.example.com:team/repo.git")).resolves.toBeUndefined();
+    await expect(validateRepoUrl("octocat/Hello-World")).rejects.toThrow(
+      'Repository host "github.com" is not allowed. Allowed hosts: git.example.com, code.example.org',
+    );
+  });
+
+  test("an empty MD_GIT_HOSTS means the defaults", () => {
+    process.env.MD_GIT_HOSTS = "  , ";
+    expect(getAllowedGitHosts()).toEqual(DEFAULT_GIT_HOSTS);
+  });
+
+  test('"*" allows any public http(s) host but no SSH addresses', async () => {
+    process.env.MD_GIT_HOSTS = "*";
+    expect(getAllowedGitHosts()).toBe("*");
+    await expect(
+      validateRepoUrl("https://git.example.com/team/repo"),
+    ).resolves.toBeUndefined();
+    await expect(validateRepoUrl("https://8.8.8.8/team/repo")).resolves.toBeUndefined();
+    await expect(validateRepoUrl("git@git.example.com:team/repo.git")).rejects.toThrow(
+      "SSH repository addresses (git@host:path) are allowed only for hosts listed in MD_GIT_HOSTS",
+    );
+    lookupSpy.mockResolvedValue([{ address: "192.168.1.10", family: 4 }] as any);
+    await expect(
+      validateRepoUrl("https://git.internal.example/team/repo"),
+    ).rejects.toThrow('Repository host "git.internal.example" resolves to a loopback, private');
+  });
+
+  test("stops waiting for DNS when the signal aborts", async () => {
+    lookupSpy.mockImplementation(() => new Promise(() => {}));
+    const controller = new AbortController();
+    const pending = validateRepoUrl("octocat/Hello-World", controller.signal);
+    controller.abort(new Error("deadline"));
+    await expect(pending).rejects.toThrow("deadline");
   });
 });
 
@@ -486,6 +743,29 @@ describe("getAllowedPaths / assertPathAllowed", () => {
   test("falls back to MD_SHARE_DIR for backward compatibility", () => {
     process.env.MD_SHARE_DIR = "/tmp/legacy";
     expect(getAllowedPaths()).toEqual([path.resolve("/tmp/legacy")]);
+  });
+
+  test("an empty MD_ALLOWED_PATHS counts as unset and falls back to MD_SHARE_DIR", () => {
+    process.env.MD_SHARE_DIR = "/tmp/legacy";
+    for (const value of ["", "  ", path.delimiter, ` ${path.delimiter} `]) {
+      process.env.MD_ALLOWED_PATHS = value;
+      expect(getAllowedPaths()).toEqual([path.resolve("/tmp/legacy")]);
+    }
+  });
+
+  test("an empty MD_ALLOWED_PATHS without MD_SHARE_DIR means no allowlist", () => {
+    for (const value of ["", "  "]) {
+      process.env.MD_ALLOWED_PATHS = value;
+      expect(getAllowedPaths()).toBeNull();
+    }
+  });
+
+  test("an empty MD_ALLOWED_PATHS does not let a path escape MD_SHARE_DIR", () => {
+    process.env.MD_SHARE_DIR = "/tmp/legacy";
+    process.env.MD_ALLOWED_PATHS = "";
+    expect(() => assertPathAllowed("/etc/passwd")).toThrow(
+      "outside the allowed directories",
+    );
   });
 
   test("MD_ALLOWED_PATHS takes precedence over MD_SHARE_DIR", () => {

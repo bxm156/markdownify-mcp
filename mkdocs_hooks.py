@@ -214,12 +214,17 @@ def _self_check() -> None:
         "lines [x](../LICENSE)` is code.",
         "",
     ])
+    # Explicit checks rather than assert, which ``python -O`` would strip.
     actual = rewrite_links(source, ctx)
-    assert actual == expected, f"unexpected rewrite:\n{actual}"
-    # The same fixture with CRLF line endings (several source docs use CRLF).
+    if actual != expected:
+        raise AssertionError(f"unexpected rewrite:\n{actual}")
+    # The same fixture with CRLF line endings. The docs are stored with LF
+    # (.gitattributes), but a CRLF working copy (e.g. an editor or a checkout
+    # with different settings) must still be rewritten correctly.
     actual_crlf = rewrite_links(source.replace("\n", "\r\n"), ctx)
     expected_crlf = expected.replace("\n", "\r\n")
-    assert actual_crlf == expected_crlf, f"unexpected CRLF rewrite:\n{actual_crlf!r}"
+    if actual_crlf != expected_crlf:
+        raise AssertionError(f"unexpected CRLF rewrite:\n{actual_crlf!r}")
     print("mkdocs_hooks self-check passed")
 
 

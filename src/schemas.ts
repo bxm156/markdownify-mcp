@@ -8,6 +8,7 @@
  */
 import { z } from "zod";
 import * as tools from "./tools.js";
+import { gitRefProblem } from "./utils.js";
 
 /**
  * Per-tool argument schemas. They are strict (unknown keys are rejected) and
@@ -16,9 +17,22 @@ import * as tools from "./tools.js";
  */
 const urlArgs = z.strictObject({ url: z.string().min(1) });
 const filepathArgs = z.strictObject({ filepath: z.string().min(1) });
+/**
+ * A git branch, tag or commit (see gitRefProblem in utils.ts). Checked here
+ * so a value such as `--upload-pack=<cmd>` is refused as invalid arguments
+ * before anything runs; Markdownify.fromRepo checks it again. An empty
+ * string is kept as "no branch" (the repository's default), as before.
+ */
+const gitRef = z.string().superRefine((value, ctx) => {
+  if (value === "") return;
+  const problem = gitRefProblem(value);
+  if (problem) {
+    ctx.addIssue({ code: "custom", message: `not a valid git ref: ${problem}` });
+  }
+});
 const gitRepoArgs = z.strictObject({
   url: z.string().min(1),
-  branch: z.string().optional(),
+  branch: gitRef.optional(),
   compress: z.boolean().optional(),
 });
 

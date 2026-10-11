@@ -12,7 +12,10 @@
  * - Temporary files live in a per-call mkdtemp directory that is removed
  *   when the call settles, whether it succeeds or fails.
  * - External tools run through execFile (no shell), so arguments are never
- *   shell-interpreted.
+ *   shell-interpreted, and each run is killed (SIGKILL) after
+ *   converterTimeoutMs().
+ * - git-repo-to-markdown arguments reach repomix only after validateGitRef
+ *   (branch) and validateRepoUrl (host allowlist + address pre-check).
  * Must run under Node and Bun.
  */
 import { execFile } from "child_process";
@@ -27,6 +30,7 @@ import {
   redactUrl,
   resolvePublicAddresses,
   validateRepoUrl,
+  validateGitRef,
   isUnconvertedHtml,
   inferExtensionFromUrl,
   isMarkdownFile,
@@ -47,6 +51,53 @@ const FETCH_TIMEOUT_MS = 30_000;
 // URL downloads and local files share one input budget (50 MiB).
 const MAX_DOWNLOAD_BYTES = MAX_LOCAL_FILE_BYTES;
 
+/** Default limit on one markitdown or repomix run (5 minutes). */
+export const CONVERTER_TIMEOUT_MS = 5 * 60_000;
+
+/**
+ * Deadline for the DNS pre-check of a git-repo-to-markdown host
+ * (validateRepoUrl), separate from the repomix run itself.
+ */
+const REPO_HOST_CHECK_TIMEOUT_MS = 30_000;
+
+/**
+ * The limit on one markitdown or repomix run: MD_CONVERTER_TIMEOUT_MS when it
+ * is a positive number of milliseconds, else CONVERTER_TIMEOUT_MS. Read on
+ * every call.
+ */
+export function converterTimeoutMs(): number {
+  const configured = Number(process.env.MD_CONVERTER_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : CONVERTER_TIMEOUT_MS;
+}
+
+/** execFile options shared by markitdown and repomix runs. */
+function execOptions(maxBuffer: number, timeoutMs: number) {
+  return { maxBuffer, timeout: timeoutMs, killSignal: "SIGKILL" as const };
+}
+
+/**
+ * True when execFile killed the child because `timeout` expired. A maxBuffer
+ * overflow also kills the child, but carries its own error code.
+ */
+function isTimeoutKill(err: NodeJS.ErrnoException & { killed?: boolean }): boolean {
+  return (
+    err?.killed === true &&
+    (err.code as unknown) !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
+  );
+}
+
+/** The markitdown that setup.sh, setup.bat and the Dockerfile install. */
+const MARKITDOWN_REQUIREMENT = "markitdown[all]==0.1.5";
+
+/** The command that installs the pinned markitdown into the project's .venv. */
+function markitdownSetupCommand(): string {
+  return process.platform === "win32"
+    ? `python -m venv .venv && .venv\\Scripts\\pip install "${MARKITDOWN_REQUIREMENT}"`
+    : `python3 -m venv .venv && .venv/bin/pip install "${MARKITDOWN_REQUIREMENT}"`;
+}
+
 /**
  * Result of a tool call: the Markdown text and, for get-markdown-file only,
  * the path as the caller gave it (server.ts reports it as "Output file: ...").
@@ -62,14 +113,17 @@ export class Markdownify {
    * Runs markitdown on `filePath` and returns its stdout.
    *
    * The 50 MB maxBuffer bounds the Markdown kept in memory; larger output
-   * rejects with Node's maxBuffer error. No timeout is set. A missing
-   * executable becomes an actionable "markitdown executable not found"
-   * error, and output that is still an HTML document (see isUnconvertedHtml)
-   * becomes a "Conversion failed" error instead of being returned as Markdown.
+   * rejects with Node's maxBuffer error. A run longer than `timeoutMs` is
+   * killed with SIGKILL and reported as "markitdown timed out" (only the
+   * markitdown process itself is killed). A missing executable becomes an
+   * actionable "markitdown executable not found" error, and output that is
+   * still an HTML document (see isUnconvertedHtml) becomes a "Conversion
+   * failed" error instead of being returned as Markdown.
    */
   private static async _markitdown(
     filePath: string,
     projectRoot: string,
+    timeoutMs = converterTimeoutMs(),
   ): Promise<string> {
     const markitdownPath = resolveMarkitdownPath(projectRoot);
 
@@ -78,17 +132,24 @@ export class Markdownify {
       // execFile resolves bare command names against PATH (POSIX execvp / Windows search).
       // Non-zero exit codes reject; stderr alone does not (markitdown emits non-fatal
       // warnings from onnxruntime/pydub/etc. on a successful run).
-      ({ stdout } = await execFileAsync(markitdownPath, [filePath], {
-        maxBuffer: 50 * 1024 * 1024, // 50 MB
-      }));
+      ({ stdout } = await execFileAsync(
+        markitdownPath,
+        [filePath],
+        execOptions(50 * 1024 * 1024, timeoutMs), // 50 MB
+      ));
     } catch (e: unknown) {
       const err = e as NodeJS.ErrnoException;
       if (err?.code === "ENOENT") {
         throw new Error(
           `markitdown executable not found (looked up "${markitdownPath}"). ` +
-            `Set MARKITDOWN_PATH to its absolute location, install it on PATH (e.g. \`pipx install "markitdown[pdf]"\`), ` +
+            `Set MARKITDOWN_PATH to its absolute location, install it on PATH (e.g. \`pipx install "${MARKITDOWN_REQUIREMENT}"\`), ` +
             `or run setup in the project root (${projectRoot}): ` +
-            `python3 -m venv .venv && .venv/bin/pip install "markitdown[pdf]>=0.1.5".`,
+            `${markitdownSetupCommand()}.`,
+        );
+      }
+      if (isTimeoutKill(err)) {
+        throw new Error(
+          `markitdown timed out after ${timeoutMs} ms and was stopped (MD_CONVERTER_TIMEOUT_MS sets the limit).`,
         );
       }
       throw e;
@@ -264,18 +325,21 @@ export class Markdownify {
    * opened and checked by openLocalFile (allowlist, regular file, size cap)
    * and copied through its handle; the comment in the body explains why.
    * Every failure is rethrown as an Error whose message starts with
-   * "Error processing to Markdown: " (server.ts then adds "Error: ").
+   * "Processing to Markdown failed: " (server.ts then adds "Error: ").
    * `projectRoot`, the package root by default, is where a bundled `.venv`
-   * markitdown is looked for.
+   * markitdown is looked for; `timeoutMs` limits the markitdown run (default
+   * converterTimeoutMs()).
    */
   static async toMarkdown({
     filePath,
     url,
     projectRoot = path.resolve(__dirname, ".."),
+    timeoutMs = converterTimeoutMs(),
   }: {
     filePath?: string;
     url?: string;
     projectRoot?: string;
+    timeoutMs?: number;
   }): Promise<MarkdownResult> {
     try {
       if (url) {
@@ -288,7 +352,7 @@ export class Markdownify {
         const text = await this.withStagingDir(async (stagingDir) => {
           const inputPath = path.join(stagingDir, `input.${extension}`);
           await fs.promises.writeFile(inputPath, content);
-          return this._markitdown(inputPath, projectRoot);
+          return this._markitdown(inputPath, projectRoot, timeoutMs);
         });
         return { text };
       }
@@ -318,7 +382,7 @@ export class Markdownify {
               expanded,
               stagingDir,
             );
-            return this._markitdown(stagedPath, projectRoot);
+            return this._markitdown(stagedPath, projectRoot, timeoutMs);
           });
           return { text };
         } finally {
@@ -329,33 +393,50 @@ export class Markdownify {
       throw new Error("Either filePath or url must be provided");
     } catch (e: unknown) {
       if (e instanceof Error) {
-        throw new Error(`Error processing to Markdown: ${e.message}`);
+        throw new Error(`Processing to Markdown failed: ${e.message}`);
       } else {
-        throw new Error("Error processing to Markdown: Unknown error occurred");
+        throw new Error("Processing to Markdown failed: Unknown error occurred");
       }
     }
   }
 
   /**
    * Packs a remote repository into one Markdown document with
-   * `repomix --remote`. repomix and git do the network access themselves, so
-   * only validateRepoUrl's checks apply, not the address pinning used for URL
-   * conversions. `branch` is passed on as `--remote-branch`. The 100 MB
-   * maxBuffer bounds the output kept in memory; no timeout is set. Errors are
-   * not wrapped as in toMarkdown: a missing executable becomes "repomix
-   * executable not found", empty output "repomix produced no output", and
-   * anything else propagates from execFile.
+   * `repomix --remote`.
+   *
+   * Before repomix starts, a non-empty `branch` must pass validateGitRef
+   * (repomix hands it to `git fetch` without `--`, so a value such as
+   * `--upload-pack=<cmd>` would otherwise run a command), and `repoUrl` must
+   * pass validateRepoUrl: host allowlist (MD_GIT_HOSTS) plus a DNS pre-check
+   * that the host has only public addresses. repomix and git then do the
+   * network access themselves, resolving again and following redirects, so
+   * the address check is a pre-check, not the pinning used for URL
+   * conversions. An empty `branch` means the default branch.
+   *
+   * The 100 MB maxBuffer bounds the output kept in memory, and a run longer
+   * than `timeoutMs` is killed with SIGKILL ("repomix timed out"); git
+   * processes repomix started may outlive it. Errors are not wrapped as in
+   * toMarkdown: a missing executable becomes "repomix executable not found",
+   * empty output "repomix produced no output", and anything else propagates
+   * from execFile.
    */
   static async fromRepo({
     repoUrl,
     branch,
     compress,
+    timeoutMs = converterTimeoutMs(),
   }: {
     repoUrl: string;
     branch?: string;
     compress?: boolean;
+    timeoutMs?: number;
   }): Promise<MarkdownResult> {
-    validateRepoUrl(repoUrl);
+    // Defensive: server.ts already validated the branch in its schema.
+    if (branch) validateGitRef(branch);
+    await validateRepoUrl(
+      repoUrl,
+      AbortSignal.timeout(REPO_HOST_CHECK_TIMEOUT_MS),
+    );
 
     const projectRoot = path.resolve(__dirname, "..");
     const repomixPath = resolveRepomixPath(projectRoot);
@@ -380,15 +461,22 @@ export class Markdownify {
     let stdout: string;
     let stderr: string;
     try {
-      ({ stdout, stderr } = await execFileAsync(repomixPath, args, {
-        maxBuffer: 100 * 1024 * 1024, // 100 MB
-      }));
+      ({ stdout, stderr } = await execFileAsync(
+        repomixPath,
+        args,
+        execOptions(100 * 1024 * 1024, timeoutMs), // 100 MB
+      ));
     } catch (e: unknown) {
       const err = e as NodeJS.ErrnoException;
       if (err?.code === "ENOENT") {
         throw new Error(
           `repomix executable not found (looked up "${repomixPath}"). ` +
             `Set REPOMIX_PATH or install it on PATH (\`bun add -g repomix\`).`,
+        );
+      }
+      if (isTimeoutKill(err)) {
+        throw new Error(
+          `repomix timed out after ${timeoutMs} ms and was stopped (MD_CONVERTER_TIMEOUT_MS sets the limit).`,
         );
       }
       throw e;
@@ -406,7 +494,7 @@ export class Markdownify {
   /**
    * Returns a local Markdown file's contents verbatim (invalid UTF-8 is
    * replaced, not rejected), with `path` set to the path as given. Only
-   * `.md` and `.markdown` are accepted, case-sensitively ("Required file is
+   * `.md` and `.markdown` are accepted, in any letter case ("Required file is
    * not a Markdown file."); a missing file is reported as "File does not
    * exist". The read honours MD_ALLOWED_PATHS and MAX_LOCAL_FILE_BYTES.
    */
