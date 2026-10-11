@@ -7,6 +7,7 @@ import { AUDIT_PROBE_BASE_MS, AUDIT_PROBE_MAX_MS, AUDIT_READ_REPEAT_EVERY, JobSe
 import { AuditRecordError, createAuditLogger } from "./audit.js";
 import { createHttpServer } from "./http.js";
 import { createAuthenticator, hashToken } from "./auth.js";
+import { waitFor } from "./test-helpers.js";
 
 const alice = { tenantId: "tenant-a", agentId: "agent-a" };
 const mallory = { tenantId: "tenant-a", agentId: "agent-m" };
@@ -33,14 +34,9 @@ async function uploaded(instance: JobService, owner = alice, body = "test") {
   await instance.upload(owner, created.upload_id, created.upload_token, Readable.from([body]));
   return created.upload_id;
 }
-/** Condition-based wait: polls status (yielding to the event loop, no fixed delay) until it reaches `status`. */
-async function until(instance: JobService, id: string, status: string) {
-  for (let tries = 0; tries < 10_000; tries++) {
-    if ((await instance.getStatus(alice, id)).status === status) return;
-    await new Promise(resolve => setImmediate(resolve));
-  }
-  throw new Error(`Job never became ${status}`);
-}
+/** Condition-based wait: polls status against a wall-clock deadline (not an iteration count) until it reaches `status`. */
+const until = (instance: JobService, id: string, status: string) =>
+  waitFor(async () => (await instance.getStatus(alice, id)).status === status, { timeoutMs: 10_000, label: `job ${id} to become ${status}` });
 const reads = (events: AuditEvent[], event: string, id?: string) => events.filter(e => e.event === event && (id === undefined || e.job_id === id)).map(e => e.status);
 /** Captures console.error; `events()` returns the single-line JSON operator events (other log lines are ignored). */
 function stderr() {
@@ -96,7 +92,7 @@ describe("readiness reflects audit sink availability", () => {
     await instance.startConversion(alice, id);
     gate.resolve();
     // Wait on the readiness verdict itself; the conversion still completes although its audit record failed.
-    for (let tries = 0; (await instance.health()).checks.audit.available; tries++) { if (tries > 10_000) throw new Error("audit never failed"); await new Promise(resolve => setImmediate(resolve)); }
+    await waitFor(async () => !(await instance.health()).checks.audit.available, { timeoutMs: 10_000, label: "the conversion_completed audit failure to turn readiness off" });
     expect((await instance.health()).ready).toBe(false);
     expect(logged).toHaveBeenCalledWith("Job audit unavailable", "conversion_completed", id);
     state.fail = false;
