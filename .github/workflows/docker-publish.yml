@@ -36,6 +36,16 @@ jobs:
           bun scripts/jwt-http-smoke.ts
           python -m pip install 'litellm[mcp]==1.104.0'
           python scripts/litellm-health-smoke.py
+      # The same script checks remote-mvp.yml runs, so a publish from main cannot skip them.
+      - name: Lint shell scripts with shellcheck
+        shell: bash
+        run: shellcheck -x scripts/*.sh setup.sh
+      - name: Test the stdio smoke test's response waiting (no Docker needed)
+        run: bash scripts/docker-smoke-test.test.sh
+      - name: Test the Office fixture generator (real DOCX, XLSX and PPTX files)
+        run: |
+          python scripts/create_remote_fixtures_test.py
+          python -O scripts/create_remote_fixtures_test.py
       - uses: docker/setup-buildx-action@v4
       - name: Build candidate without registry credentials
         uses: docker/build-push-action@v7
