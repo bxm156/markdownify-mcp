@@ -118,7 +118,7 @@ describe("durable single tenant jobs", () => {
     expect(reason).toMatchObject({ code: "CONVERSION_CANCELLED" });
     await expect(fs.stat(path.join(options.dataDir, job.upload_id))).rejects.toMatchObject({ code: "ENOENT" });
   });
-  test("after lock loss, close() stops the converter but leaves the manifests to the new owner", async () => {
+  test("after lock loss, close() stops the converter, and an in-flight upload, a sweep and deletion leave the volume to the new owner", async () => {
     let reason: unknown, lost = 0;
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-jobs-test-")); directories.push(dataDir);
     const instance = new JobService({ dataDir, maxUploadBytes: 100, maxStorageBytes: 10_000, maxJobs: 10, retentionMs: 60_000, uploadTtlMs: 60_000, conversionTimeoutMs: 60_000, maxOutputBytes: 1000, concurrency: 1,
@@ -129,15 +129,32 @@ describe("durable single tenant jobs", () => {
     const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
     await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"]));
     await instance.startConversion(principal, job.upload_id); await jobStatus(instance, job.upload_id, "running");
+    // An uploaded job that will be past retention, and a PUT that is still streaming when the lock goes.
+    const kept = await instance.createUpload(principal, { filename: "k.txt", size_bytes: 1 });
+    await instance.upload(principal, kept.upload_id, kept.upload_token, Readable.from(["k"]));
+    const pending = await instance.createUpload(principal, { filename: "p.txt", size_bytes: 1 });
+    const pendingFiles = path.join(dataDir, pending.upload_id), pendingManifest = await fs.readFile(path.join(pendingFiles, "job.json"), "utf8");
+    const streaming = instance.upload(principal, pending.upload_id, pending.upload_token, new PassThrough()).catch(error => error);
+    await waitFor(() => exists(path.join(pendingFiles, "input.part")), { label: "upload to open its partial file" });
     const manifest = path.join(dataDir, job.upload_id, "job.json"), before = await fs.readFile(manifest, "utf8");
+    const keptInput = path.join(dataDir, kept.upload_id, "input.txt"), keptManifest = await fs.readFile(path.join(dataDir, kept.upload_id, "job.json"), "utf8");
     // Another process reclaims the volume.
     const foreign = "4242\n00000000-0000-0000-0000-000000000000\n";
-    await fs.writeFile(path.join(dataDir, ".lock"), foreign);
-    await waitFor(() => lost === 1, { label: "lock loss" });
+    // Written until noticed: a heartbeat already in flight may rename its own copy over the first write.
+    await waitFor(async () => { if (lost === 0) await fs.writeFile(path.join(dataDir, ".lock"), foreign); return lost === 1; }, { label: "lock loss" });
     expect(lines.map(line => JSON.parse(line))).toEqual([{ event: "lock_lost" }]);
     // No new work is accepted once the volume is gone.
     await expect(instance.createUpload(principal, { filename: "b.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 503, code: "SERVICE_UNAVAILABLE" });
+    // Retention passes, but a sweep after the loss expires and removes nothing; neither does deleting the job.
+    setSystemTime(new Date(Date.now() + 120_000)); await instance.cleanup();
+    await expect(instance.deleteJob(principal, kept.upload_id)).rejects.toMatchObject({ statusCode: 503, code: "SERVICE_UNAVAILABLE" });
+    expect(await exists(keptInput)).toBe(true);
+    expect(await fs.readFile(path.join(dataDir, kept.upload_id, "job.json"), "utf8")).toBe(keptManifest);
+    // Aborting the streaming PUT (shutdown) fails it as usual, but its partial file is not the new owner's to remove.
     await instance.close();
+    expect(await streaming).toMatchObject({ statusCode: 408, code: "UPLOAD_INTERRUPTED" });
+    expect(await exists(path.join(pendingFiles, "input.part"))).toBe(true);
+    expect(await fs.readFile(path.join(pendingFiles, "job.json"), "utf8")).toBe(pendingManifest);
     expect(reason).toMatchObject({ code: "CONVERSION_INTERRUPTED" });
     expect(await fs.readFile(manifest, "utf8")).toBe(before);
     expect(JSON.parse(before).status).toBe("running");

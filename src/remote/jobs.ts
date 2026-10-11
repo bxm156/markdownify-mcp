@@ -98,7 +98,7 @@ export class JobService {
   private closing = false;
   /**
    * Set when the data-directory lock is lost (lock.ts fencing): the volume belongs to another process, so this one stops
-   * accepting work and writes no manifest again; close() only stops its converters.
+   * accepting work and touches nothing on the volume again (assertOwned, rm); close() only stops its converters.
    */
   private lost = false;
   private initialized = false;
@@ -298,16 +298,31 @@ export class JobService {
   private available(job: Job) {
     if (job.status === "expired" || (job.status !== "running" && Date.parse(job.expires_at) <= Date.now())) throw new ServiceError(410, "Job expired");
   }
+  /**
+   * The one gate for writing to the data volume (create, write, rename, remove): after lock loss (lost) the volume is
+   * another process's, so every such call site runs this first, or uses rm(). Only in-memory state and child processes may
+   * still change. Throws 503 SERVICE_UNAVAILABLE.
+   */
+  private assertOwned() { if (this.lost) throw new ServiceError(503, "Service closing", "SERVICE_UNAVAILABLE"); }
+  /**
+   * Removes a file, or a directory with `recursive`, through the gate. `bestEffort` is for cleanup on an error path: after
+   * lock loss it skips the removal instead of throwing, so the original error is not masked.
+   */
+  private async rm(target: string, { recursive = false, bestEffort = false } = {}) {
+    if (this.lost && bestEffort) return;
+    this.assertOwned();
+    await fs.rm(target, { recursive, force: true });
+  }
   /** Atomically replaces job.json: a mode 0o600 temp file renamed over it, removed if anything fails. */
   private async save(job: Job) {
-    // After lock loss another process owns the manifests (lost).
-    if (this.lost) throw new Error("Data directory lock lost");
+    this.assertOwned();
     const target = path.join(this.dir(job.id), "job.json");
     const temporary = `${target}.${randomUUID()}.tmp`;
     try {
       await fs.writeFile(temporary, JSON.stringify(job), { mode: 0o600 });
+      this.assertOwned();
       await fs.rename(temporary, target);
-    } finally { await fs.rm(temporary, { force: true }); }
+    } finally { await this.rm(temporary, { bestEffort: true }); }
   }
   /**
    * Creates or tightens the data directory (0o700), takes its lock, loads and recovers the manifests, then starts the
@@ -362,12 +377,12 @@ export class JobService {
       if (legacy) await this.save(job);
       this.jobs.set(job.id, job);
       for (const filename of await fs.readdir(this.dir(job.id))) {
-        if (/^job\.json\.[0-9a-f-]{36}\.tmp$/.test(filename)) await fs.rm(path.join(this.dir(job.id), filename), { force: true });
+        if (/^job\.json\.[0-9a-f-]{36}\.tmp$/.test(filename)) await this.rm(path.join(this.dir(job.id), filename));
       }
       // An interrupted upload is retriable; never treat its partial bytes as input.
-      await fs.rm(path.join(this.dir(job.id), "input.part"), { force: true });
-      await fs.rm(path.join(this.dir(job.id), "output.part"), { force: true });
-      if (job.status === "awaiting_upload") await fs.rm(this.input(job), { force: true });
+      await this.rm(path.join(this.dir(job.id), "input.part"));
+      await this.rm(path.join(this.dir(job.id), "output.part"));
+      if (job.status === "awaiting_upload") await this.rm(this.input(job));
       if (job.status === "running") {
         job.status = "failed";
         job.error = "Conversion interrupted by server restart";
@@ -377,7 +392,7 @@ export class JobService {
         await this.save(job);
       }
     }
-    for (const id of orphans) await fs.rm(this.dir(id), { recursive: true, force: true });
+    for (const id of orphans) await this.rm(this.dir(id), { recursive: true });
     await this.cleanup();
   }
   /**
@@ -394,7 +409,7 @@ export class JobService {
       // Tombstones hold no reservation, so a failed removal is skipped here; the sweep reports and retries it.
       for (const expired of [...this.jobs.values()].filter(job => job.status === "expired")) {
         await this.locked(expired.id, async () => {
-          await fs.rm(this.dir(expired.id), { recursive: true, force: true });
+          await this.rm(this.dir(expired.id), { recursive: true });
           this.forget(expired.id);
         }).catch(() => undefined);
       }
@@ -429,8 +444,9 @@ export class JobService {
       // how long that standalone bearer grant can be used.
       const job: Job = { tenant_id: principal.tenantId, agent_id: principal.agentId, id, filename, extension, size_bytes, token_hash: tokenHash(principal, id, hash(token)), status: "awaiting_upload", created_at: new Date().toISOString(), expires_at: new Date(Date.now() + (issueUploadCredential ? Math.min(this.options.uploadTtlMs, 300000) : this.options.uploadTtlMs)).toISOString() };
       if (uploadCredential) job.upload_auth_hash = tokenHash(principal, id, hash(uploadCredential));
+      this.assertOwned();
       await fs.mkdir(this.dir(id), { mode: 0o700 });
-      try { await this.save(job); } catch (error) { await fs.rm(this.dir(id), { recursive: true, force: true }); throw error; }
+      try { await this.save(job); } catch (error) { await this.rm(this.dir(id), { recursive: true, bestEffort: true }); throw error; }
       this.jobs.set(id, job);
       await this.internalAudit("create_upload_completed", job);
       return { upload_id: id, upload_token: token, expires_at: job.expires_at, ...(uploadCredential ? { upload_auth_token: uploadCredential } : {}) };
@@ -478,19 +494,21 @@ export class JobService {
       controller.signal.addEventListener("abort", abortSource, { once: true });
       try {
         controller.signal.throwIfAborted();
+        this.assertOwned();
         await pipeline(source, limit, createWriteStream(part, { flags: "wx", mode: 0o600 }), { signal: controller.signal });
         if (bytes !== job.size_bytes) throw new ServiceError(400, "Upload size does not match declared size", "UPLOAD_SIZE_MISMATCH", { limit_bytes: job.size_bytes, requested_bytes: bytes });
         this.available(job);
+        this.assertOwned();
         await fs.rename(part, this.input(job));
         const uploaded: Job = { ...job, status: "uploaded", expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() };
         delete uploaded.token_hash;
         delete uploaded.upload_auth_hash;
-        try { await this.save(uploaded); } catch (error) { await fs.rm(this.input(job), { force: true }); throw error; }
+        try { await this.save(uploaded); } catch (error) { await this.rm(this.input(job), { bestEffort: true }); throw error; }
         this.jobs.set(id, uploaded);
         await this.internalAudit("upload_completed", uploaded);
         return { upload_id: id, status: uploaded.status };
       } catch (error) {
-        await fs.rm(part, { force: true });
+        await this.rm(part, { bestEffort: true });
         await this.internalAudit("upload_failed", job);
         if (controller.signal.aborted) throw new ServiceError(408, "Upload cancelled or timed out");
         throw error;
@@ -590,7 +608,9 @@ export class JobService {
       controller.signal.throwIfAborted();
       if ((await fs.stat(part)).size > this.options.maxOutputBytes) throw new ServiceError(413, "Converted Markdown exceeds output limit", "OUTPUT_LIMIT_EXCEEDED", { limit_bytes: this.options.maxOutputBytes });
       await this.locked(id, async () => {
+        this.assertOwned();
         await fs.rename(part, path.join(this.dir(id), "output.md"));
+        this.assertOwned();
         await prepareMarkdownIndex(path.join(this.dir(id), "output.md"));
         const completed: Job = { ...job!, status: "completed", expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() };
         await this.save(completed); this.jobs.set(id, completed); await this.internalAudit("conversion_completed", completed);
@@ -610,7 +630,7 @@ export class JobService {
         });
       }
       if (job) await this.locked(id, async () => {
-        await fs.rm(part, { force: true });
+        await this.rm(part, { bestEffort: true });
         // An aborted job is classified by the abort reason (timeout, shutdown or cancellation), whatever the converter threw.
         const info = controller.signal.aborted ? errorInfo(abortError(controller.signal))
           : error instanceof ServiceError && (error.code === "OUTPUT_LIMIT_EXCEEDED" || error.code === "CONVERSION_FAILED") ? errorInfo(error) : lookupError("INTERNAL_ERROR");
@@ -631,7 +651,7 @@ export class JobService {
     if (worker) { worker.controller.abort(conversionAbort.cancelled()); await worker.promise; }
     return this.locked(id, async () => {
       await this.owned(principal, id);
-      await fs.rm(this.dir(id), { recursive: true, force: true }); this.forget(id);
+      await this.rm(this.dir(id), { recursive: true }); this.forget(id);
       return { job_id: id, deleted: true };
     });
   }
@@ -660,14 +680,16 @@ export class JobService {
       try { await this.locked(id, async () => {
         const job = this.jobs.get(id);
         if (!job || this.active.has(id) || Date.parse(job.expires_at) > Date.now()) return;
-        if (job.status === "expired") { await fs.rm(this.dir(id), { recursive: true, force: true }); this.forget(id); return; }
-        await fs.rm(this.input(job), { force: true });
-        await fs.rm(path.join(this.dir(id), "output.md"), { force: true });
-        await fs.rm(path.join(this.dir(id), "output.md.index.json"), { force: true });
+        if (job.status === "expired") { await this.rm(this.dir(id), { recursive: true }); this.forget(id); return; }
+        await this.rm(this.input(job));
+        await this.rm(path.join(this.dir(id), "output.md"));
+        await this.rm(path.join(this.dir(id), "output.md.index.json"));
         const expired: Job = { ...job, status: "expired", expires_at: new Date(Date.now() + this.options.retentionMs).toISOString() }; delete expired.token_hash;
         delete expired.upload_auth_hash;
         await this.save(expired); this.jobs.set(id, expired); this.cleanupPending.delete(id); await this.internalAudit("job_expired", expired);
       }); } catch (error) {
+        // Lock lost mid-sweep: the volume is another process's; this is not a cleanup failure to report or retry.
+        if (this.lost) break;
         // Sanitized: event, job ID, status and an errno-style code only; never paths, messages or stacks.
         const code = errnoCode(error);
         failed.add(id); this.cleanupPending.add(id); stats.failures_total++; stats.last_error_code = code;
