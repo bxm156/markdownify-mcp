@@ -54,8 +54,7 @@ jobs:
       - name: Reject assert statements in Python scripts (python -O strips them)
         run: |
           # Same check as remote-mvp.yml: parses each file, so the word in comments and strings is not flagged.
-          # TODO(#70): add mkdocs_hooks.py once its self-check uses explicit raises instead of assert.
-          python - scripts/*.py <<'PY'
+          python - scripts/*.py mkdocs_hooks.py <<'PY'
           import ast, sys
           found = [f"{path}:{node.lineno}" for path in sys.argv[1:]
                    for node in ast.walk(ast.parse(open(path, encoding="utf-8").read(), path))
@@ -120,9 +119,18 @@ jobs:
           # The documented streaming helper against the same multitenant container, as agent "a".
           # MD_TEST_AGENT_KEYS (JSON, masked) was exported by the registry step through GITHUB_ENV.
           example_output="$RUNNER_TEMP/upload-and-convert.md"
-          MCP_TOKEN="$(jq -r .a <<<"$MD_TEST_AGENT_KEYS")" CONVERSION_DEADLINE_MS=120000 \
+          agent_a_token="$(jq -r .a <<<"$MD_TEST_AGENT_KEYS")"
+          MCP_TOKEN="$agent_a_token" CONVERSION_DEADLINE_MS=120000 \
             bun examples/upload-and-convert.ts src/sample-data/test.pdf "$example_output"
           grep -q 'Test PDF content' "$example_output"
+          # The same helper under plain Node (no Bun, no src/), then the compiled copy inside the image.
+          node_output="$RUNNER_TEMP/upload-and-convert-node.md"
+          MCP_TOKEN="$agent_a_token" CONVERSION_DEADLINE_MS=120000 \
+            node --experimental-strip-types --no-warnings examples/upload-and-convert.ts src/sample-data/test.pdf "$node_output"
+          grep -q 'Test PDF content' "$node_output"
+          MCP_TOKEN="$agent_a_token" docker run --rm --network container:markdownify-publish-test -e MCP_TOKEN -e CONVERSION_DEADLINE_MS=120000 \
+            -v "$PWD/src/sample-data:/in:ro" markdownify-remote:publish-candidate \
+            sh -c 'node examples/upload-and-convert.js /in/test.pdf /tmp/image-example.md && grep -q "Test PDF content" /tmp/image-example.md'
       - name: Check publication configuration
         id: publication
         shell: bash

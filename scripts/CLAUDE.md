@@ -38,7 +38,7 @@ Local: `bun scripts/create-test-agent-registry.ts /tmp/agents.json /tmp/env.txt`
 
 ## Rules for this folder
 
-- Python must survive `python -O`: no `assert` statements (CI parses `scripts/*.py` with `ast` and fails on any `Assert` node, in any form; the word in comments and strings is fine). Use an explicit `raise` or the local `check()` helper. `mkdocs_hooks.py` is not yet covered (TODO #70).
+- Python must survive `python -O`: no `assert` statements (CI parses `scripts/*.py` and `mkdocs_hooks.py` with `ast` and fails on any `Assert` node, in any form; the word in comments and strings is fine). Use an explicit `raise` or the local `check()` helper.
 - Shell scripts must pass `bash -n` and `shellcheck -x` (CI covers `scripts/*.sh` and `setup.sh`). Keep them sourceable-safe (`main` guarded by `BASH_SOURCE`) if they have a Docker-free test.
 - TypeScript is run with `bun` and type-checked by `bun run typecheck` (`tsconfig.check.json` includes `src`, `scripts`, `examples`). Run it after any edit.
 - Never print secrets: no tokens, `Authorization` headers, `create_upload` results or env dumps. CI tokens are masked with `::add-mask::` before use. Credential files are written 0600 with exclusive create.
