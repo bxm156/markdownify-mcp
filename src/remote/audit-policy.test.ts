@@ -3,8 +3,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { JobService, type AuditEvent, type AuditSink, type JobServiceOptions } from "./jobs.js";
-import { createAuditLogger } from "./audit.js";
+import { AUDIT_PROBE_BASE_MS, AUDIT_PROBE_MAX_MS, AUDIT_READ_REPEAT_EVERY, JobService, type AuditEvent, type AuditSink, type JobServiceOptions } from "./jobs.js";
+import { AuditRecordError, createAuditLogger } from "./audit.js";
 import { createHttpServer } from "./http.js";
 import { createAuthenticator, hashToken } from "./auth.js";
 
@@ -42,6 +42,13 @@ async function until(instance: JobService, id: string, status: string) {
   throw new Error(`Job never became ${status}`);
 }
 const reads = (events: AuditEvent[], event: string, id?: string) => events.filter(e => e.event === event && (id === undefined || e.job_id === id)).map(e => e.status);
+/** Captures console.error; `events()` returns the single-line JSON operator events (other log lines are ignored). */
+function stderr() {
+  const spy = spyOn(console, "error").mockImplementation(() => undefined);
+  cleanup.push(async () => spy.mockRestore());
+  const lines = () => spy.mock.calls.filter(call => call.length === 1 && typeof call[0] === "string" && call[0].startsWith("{")).map(call => call[0] as string);
+  return { spy, lines, events: () => lines().map(line => JSON.parse(line)) };
+}
 
 describe("readiness reflects audit sink availability", () => {
   test("a failed audit write makes readiness false until the next successful write, and health probes write nothing", async () => {
@@ -97,8 +104,9 @@ describe("readiness reflects audit sink availability", () => {
     expect((await instance.health()).ready).toBe(true);
   });
 
-  test("the file logger's probe restores readiness without writing a record, at most once per two seconds", async () => {
+  test("the file logger's probe restores readiness without writing a record, after two passes with backoff", async () => {
     setSystemTime(new Date("2030-01-01T00:00:00Z"));
+    const log = stderr();
     const auditDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-audit-policy-log-"));
     cleanup.push(() => fs.rm(auditDir, { recursive: true, force: true }));
     const audit = await createAuditLogger(auditDir);
@@ -108,15 +116,97 @@ describe("readiness reflects audit sink availability", () => {
     // A directory at the log path makes appends fail with EISDIR, without mocking the filesystem.
     await fs.rename(target, saved); await fs.mkdir(target);
     await expect(instance.createUpload(alice, { filename: "b.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 503 });
-    expect((await instance.publicHealth()).checks.audit.available).toBe(false); // The probe ran and also failed.
+    expect((await instance.publicHealth()).checks.audit.available).toBe(false); // The first probe ran at once and also failed.
     await fs.rmdir(target); await fs.rename(saved, target);
     const before = await fs.readFile(target, "utf8");
     expect((await instance.publicHealth()).checks.audit.available).toBe(false); // Within two seconds of the last probe: not re-run.
     setSystemTime(new Date(Date.now() + 2100));
+    expect((await instance.health(alice)).checks.audit).toEqual({ available: false }); // First pass: one more is required.
+    setSystemTime(new Date(Date.now() + 2 * AUDIT_PROBE_BASE_MS - 100));
+    expect((await instance.publicHealth()).checks.audit.available).toBe(false); // The wait doubled to four seconds.
+    setSystemTime(new Date(Date.now() + 200));
     const health = await instance.health(alice);
     expect(health.checks.audit).toEqual({ available: true }); expect(health.ready).toBe(true);
-    expect(await fs.readFile(target, "utf8")).toBe(before); // The probe wrote nothing.
+    expect(await fs.readFile(target, "utf8")).toBe(before); // The probes wrote nothing.
     expect(before.trim().split("\n").map(line => JSON.parse(line).event)).toEqual(["create_upload", "create_upload_completed"]);
+    // One event per transition, carrying only an errno-style code: never the log path.
+    expect(log.events()).toEqual([{ event: "audit_sink_unavailable", code: expect.stringMatching(/^(EISDIR|EPERM|EACCES)$/) }, { event: "audit_sink_recovered", via: "probe" }]);
+    expect(log.lines().some(line => line.includes(auditDir))).toBe(false);
+  });
+
+  test("probe backoff doubles to the cap, survives relapses, and only a successful write resets it", async () => {
+    setSystemTime(new Date("2030-01-01T00:00:00Z"));
+    const log = stderr();
+    const state = { write: false, probe: false, probes: [] as number[] };
+    const sink: AuditSink = Object.assign((_event: AuditEvent) => { if (!state.write) throw Object.assign(new Error("/var/audit/audit.jsonl: I/O error"), { code: "EIO" }); },
+      { probe: async () => { state.probes.push(Date.now()); if (!state.probe) throw new Error("down"); } });
+    const { instance } = await service({ audit: sink });
+    const start = Date.now();
+    const at = async (ms: number) => { setSystemTime(new Date(start + ms)); return (await instance.health()).checks.audit.available; };
+    const probed = () => state.probes.map(time => time - start);
+    for (let i = 0; i < 3; i++) await expect(instance.createUpload(alice, { filename: "a.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 503, code: "AUDIT_UNAVAILABLE" });
+    // While the probe fails, the wait after each probe doubles from 2 s and is capped at 60 s.
+    const expected = [0, 2000, 6000, 14_000, 30_000, 62_000, 122_000, 182_000];
+    for (const time of expected) {
+      if (time > 0) expect(await at(time - 1)).toBe(false);
+      expect(await at(time)).toBe(false);
+    }
+    expect(probed()).toEqual(expected);
+    expect(AUDIT_PROBE_MAX_MS).toBe(60_000);
+    // The sink recovers; readiness needs two consecutive passes, a full (capped) interval apart.
+    state.probe = true;
+    expect(await at(242_000)).toBe(false);
+    expect(await at(302_000 - 1)).toBe(false);
+    expect(await at(302_000)).toBe(true);
+    // A write-time failure the probe cannot see: readiness drops again, and the backoff is not reset by probe passes.
+    await expect(instance.createUpload(alice, { filename: "a.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 503 });
+    expect(await at(302_001)).toBe(false);
+    expect(await at(362_000 - 1)).toBe(false);
+    expect(await at(362_000)).toBe(false); // First pass after the relapse, 60 s later.
+    expect(probed().slice(expected.length)).toEqual([242_000, 302_000, 362_000]);
+    // A real successful write restores readiness at once and resets the backoff: the next failure probes at once, then after 2 s.
+    state.write = true; await instance.createUpload(alice, { filename: "a.txt", size_bytes: 1 });
+    expect(await at(362_001)).toBe(true);
+    state.write = false; state.probe = false;
+    await expect(instance.createUpload(alice, { filename: "a.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 503 });
+    expect(await at(362_002)).toBe(false);
+    expect(await at(364_001)).toBe(false);
+    expect(await at(364_002)).toBe(false);
+    expect(probed().slice(expected.length + 3)).toEqual([362_002, 364_002]);
+    // One sanitized event per transition, not per failed write or failed probe.
+    expect(log.events()).toEqual([
+      { event: "audit_sink_unavailable", code: "EIO" }, { event: "audit_sink_recovered", via: "probe" },
+      { event: "audit_sink_unavailable", code: "EIO" }, { event: "audit_sink_recovered", via: "write" },
+      { event: "audit_sink_unavailable", code: "EIO" },
+    ]);
+    expect(log.lines().some(line => line.includes("/var/audit") || line.includes("I/O error"))).toBe(false);
+  });
+
+  test("a rejected audit record fails the operation without failing readiness and is logged once per message", async () => {
+    const log = stderr();
+    const auditDir = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-audit-policy-log-"));
+    cleanup.push(() => fs.rm(auditDir, { recursive: true, force: true }));
+    const logger = await createAuditLogger(auditDir);
+    const mode = { invalid: false, custom: false };
+    // Corrupts one record so the real logger rejects it before touching storage, as a metadata bug would.
+    const sink: AuditSink = Object.assign((event: AuditEvent) => {
+      if (mode.custom) throw new AuditRecordError("record for tenant-a/agent-a rejected");
+      return logger(mode.invalid && event.event === "create_upload" ? { ...event, reason: "private document title" } : event);
+    }, { probe: logger.probe });
+    const { instance } = await service({ audit: sink });
+    mode.invalid = true;
+    for (let i = 0; i < 3; i++) await expect(instance.createUpload(alice, { filename: "a.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 503, code: "AUDIT_UNAVAILABLE" });
+    const health = await instance.health(alice);
+    expect(health.checks.audit).toEqual({ available: true }); expect(health.ready).toBe(true);
+    mode.custom = true;
+    for (let i = 0; i < 2; i++) await expect(instance.createUpload(alice, { filename: "a.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 503 });
+    expect((await instance.publicHealth()).ready).toBe(true);
+    // Messages that are not plain fixed strings are replaced; metadata values never reach stderr.
+    expect(log.events()).toEqual([{ event: "audit_record_rejected", message: "Invalid audit metadata" }, { event: "audit_record_rejected", message: "Invalid audit record" }]);
+    expect(log.lines().some(line => line.includes("private") || line.includes("tenant-a"))).toBe(false);
+    mode.invalid = false; mode.custom = false;
+    await instance.createUpload(alice, { filename: "a.txt", size_bytes: 1 });
+    expect((await fs.readFile(path.join(auditDir, "audit.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line).event)).toEqual(["create_upload", "create_upload_completed"]);
   });
 
   test("a hung probe is shared and bounded by the health timeout", async () => {
@@ -174,6 +264,29 @@ describe("read audit coalescing", () => {
     expect(reads(state.events, "read_markdown", id)).toEqual(["running", "completed"]);
   });
 
+  test("repeated reads of a completed result are sampled every Nth read; status polling and denials are not", async () => {
+    const { state, sink } = recorder();
+    const { instance } = await service({ audit: sink });
+    const id = await uploaded(instance);
+    await instance.startConversion(alice, id); await until(instance, id, "completed");
+    expect(AUDIT_READ_REPEAT_EVERY).toBe(10);
+    for (let i = 0; i < 25; i++) await instance.getMarkdown(alice, id, { offset: i % 2, max_chars: 2 });
+    for (let i = 0; i < 25; i++) await instance.getStatus(alice, id);
+    expect(reads(state.events, "read_markdown", id)).toEqual(["completed"]);
+    // 24 reads followed the first record: the 10th and 20th each wrote one sampled record with the running count.
+    expect(state.events.filter(e => e.event === "read_markdown_repeat").map(e => [e.job_id, e.status, e.repeat_count])).toEqual([[id, "completed", 10], [id, "completed", 20]]);
+    expect(state.events.filter(e => e.event === "read_status_repeat")).toHaveLength(0);
+    // Unsampled reads succeed while the sink fails; the sampled read fails closed and is written on its retry.
+    state.fail = true;
+    for (let i = 0; i < 5; i++) await instance.getMarkdown(alice, id); // Reads 25-29.
+    await expect(instance.getMarkdown(alice, id)).rejects.toMatchObject({ statusCode: 503, code: "AUDIT_UNAVAILABLE" });
+    state.fail = false;
+    await instance.getMarkdown(alice, id);
+    expect(state.events.filter(e => e.event === "read_markdown_repeat").map(e => e.repeat_count)).toEqual([10, 20, 30]);
+    for (let i = 0; i < 3; i++) await expect(instance.getMarkdown(mallory, id)).rejects.toMatchObject({ statusCode: 404 });
+    expect(state.events.filter(e => e.event === "authorization_denied")).toHaveLength(3);
+  });
+
   test("authorization_denied is recorded on every attempt", async () => {
     const { state, sink } = recorder();
     const { instance } = await service({ audit: sink });
@@ -203,7 +316,7 @@ describe("read audit coalescing", () => {
     setSystemTime(new Date("2030-01-01T00:00:00Z"));
     const { state, sink } = recorder();
     const { instance } = await service({ audit: sink });
-    const tracked = () => (instance as unknown as { auditedReads: Map<string, Set<string>> }).auditedReads;
+    const tracked = () => (instance as unknown as { auditedReads: Map<string, Map<string, number>> }).auditedReads;
     const deleted = await uploaded(instance), expiring = await uploaded(instance);
     await instance.getStatus(alice, deleted); await instance.getStatus(alice, expiring);
     expect([...tracked().keys()].sort()).toEqual([deleted, expiring].sort());

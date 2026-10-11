@@ -145,7 +145,8 @@ describe("retention cleanup resilience", () => {
     try {
       advance(120_000); await instance.cleanup();
       expect(await files(options.dataDir, id)).toEqual(["job.json"]); expect((await manifest(options.dataDir, id)).status).toBe("expired");
-      expect(logged).toHaveBeenCalledTimes(1); expect(logged.mock.calls[0][0]).toBe("Job audit unavailable");
+      // The failed write logs the readiness transition once, then the lifecycle event it could not record.
+      expect(logged.mock.calls.map(call => call[0])).toEqual([JSON.stringify({ event: "audit_sink_unavailable", code: "UNKNOWN" }), "Job audit unavailable"]);
       expect((await health(instance)).cleanup).toMatchObject({ own_jobs_failed_last_sweep: 0, own_jobs_pending_retry: 0 });
     } finally { logged.mockRestore(); setSystemTime(); }
   });

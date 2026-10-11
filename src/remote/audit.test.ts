@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createAuditLogger, type AuditEvent } from "./audit.js";
+import { AuditRecordError, createAuditLogger, type AuditEvent } from "./audit.js";
 
 const directories: string[] = [];
 async function directory() { const value = await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-audit-")); directories.push(value); return value; }
@@ -46,4 +46,15 @@ test("filesystem audit failure rejects the event and later writes recover withou
   await audit({ event: "read_markdown", tenant_id: "tenantA", agent_id: "agentA" });
   const records = (await fs.readFile(target, "utf8")).trim().split("\n").map(line => JSON.parse(line));
   expect(records.map(record => record.event)).toEqual(["upload_created", "read_markdown"]);
+});
+
+test("records rejected before storage throw AuditRecordError; repeat_count is validated and kept", async () => {
+  const dir = await directory(), audit = await createAuditLogger(dir);
+  for (const event of [{ event: "x", tenant_id: "tenantA", agent_id: "agentA", reason: "free text" }, { event: "x", tenant_id: "../t", agent_id: "agentA" }, { event: "x", tenant_id: "tenantA", agent_id: "agentA", repeat_count: 0 }, { event: "x", tenant_id: "tenantA", agent_id: "agentA", repeat_count: 1.5 }]) {
+    const error = await audit(event).catch(caught => caught);
+    expect(error).toBeInstanceOf(AuditRecordError); expect(error.message).toBe("Invalid audit metadata");
+  }
+  await audit({ event: "read_markdown_repeat", tenant_id: "tenantA", agent_id: "agentA", status: "completed", repeat_count: 10 });
+  const records = (await fs.readFile(path.join(dir, "audit.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  expect(records).toMatchObject([{ event: "read_markdown_repeat", status: "completed", repeat_count: 10 }]);
 });
