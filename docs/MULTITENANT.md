@@ -118,7 +118,7 @@ Global limits from [REMOTE.md](REMOTE.md) still apply. The following additional 
 | `MD_MAX_AGENT_CONCURRENCY` | 1 | Active conversions for one agent |
 | `MD_QUOTA_OVERRIDES_FILE` | unset | Optional per-principal agent caps; see [operator quota overrides](#operator-quota-overrides) |
 
-Every value must be a positive safe integer. A reservation must fit global, tenant, and agent budgets. Even a tiny upload reserves the configured maximum output size, so storage limits can bind before job-count limits. Queue scheduling skips owners that have reached their concurrency cap, allowing another eligible owner to run; global concurrency still bounds total converters. These are admission and scheduling limits, not filesystem quotas or a distributed queue.
+Every value must be a positive safe integer. They get the same startup checks as [override entries](#operator-quota-overrides): a value set above its global cap (`MD_MAX_JOBS`, `MD_MAX_STORAGE_BYTES`, `MD_CONCURRENCY`) is rejected, and every storage budget, global, tenant and agent, must be at least `1 + MD_MAX_OUTPUT_BYTES`, or no upload could ever be admitted. An unset tenant or agent cap is lowered to its global cap instead of rejected, since the tightest scope applies anyway; an unset storage default that is still below the floor (for example with a 200 MiB `MD_MAX_OUTPUT_BYTES`) stops startup and names the variable to set. A reservation must fit global, tenant, and agent budgets. Even a tiny upload reserves the configured maximum output size, so storage limits can bind before job-count limits. Queue scheduling skips owners that have reached their concurrency cap, allowing another eligible owner to run; global concurrency still bounds total converters. These are admission and scheduling limits, not filesystem quotas or a distributed queue.
 
 In [JWT mode](JWT.md#effective-per-user-limits) the tenant and agent ID are both the LiteLLM user ID, so one user is bound by both scopes and the effective cap is the minimum of the global, tenant and agent limits. `get_service_health` reports that minimum for the caller as `limits.effective`.
 
@@ -183,7 +183,7 @@ Each record's `status` is the job's state when the event happened. Events writte
 | `read_markdown_repeat` | Every 10th read pass over a completed result; paging forward within a pass does not count (below) | `job_id`, `status: completed`, `repeat_count` (the pass number) |
 | `delete_job` | `delete_job`, before work is cancelled and files are removed | `job_id` |
 
-Lifecycle events are written after the state change has been committed. A failed write is logged to stderr as `Job audit unavailable` with the event and job ID and does not roll the change back:
+Lifecycle events are written after the state change has been committed. A failed write is logged to stderr as a `job_audit_unavailable` [operator event](#operator-stderr-events) with the event and job ID and does not roll the change back:
 
 | Event | When |
 | --- | --- |
@@ -200,14 +200,22 @@ Readiness reports the audit sink. After a failed audit write, from a caller's op
 
 A record the audit logger rejects before touching storage (for example `Invalid audit metadata`, which indicates a bug, not a disk problem) still refuses the operation with `AUDIT_UNAVAILABLE`, but does not mark the sink unavailable or affect readiness. Each distinct rejection message is logged once.
 
-Readiness transitions, rejected records and rotation failures are logged to stderr as single-line JSON for operator alerting. They carry no paths, error messages or metadata values:
+### Operator stderr events
 
-| Event | When | Fields |
+Every operator event is one line of JSON on stderr (one object per line, always with an `event` field), so a log pipeline can parse and alert on it. Events carry no paths, filenames, error messages, secrets, document contents or audit metadata values. A `code` is an errno-style code (`EIO`, `ENOSPC`, `EACCES`, ...) or `UNKNOWN`. The startup line `Markdownify remote listening on <host>:<port>` and fatal startup errors are plain text.
+
+| Event | When | Fields besides `event` |
 | --- | --- | --- |
-| `audit_sink_unavailable` | The first failed write after the sink was available (not repeated per failed write or probe) | `code`: errno-style code such as `EIO`, `ENOSPC`, `EACCES`, or `UNKNOWN` |
+| `audit_sink_unavailable` | The first failed write after the sink was available (not repeated per failed write or probe) | `code` |
 | `audit_sink_recovered` | The sink became available again | `via`: `write` (a write succeeded) or `probe` (two consecutive probes passed) |
 | `audit_record_rejected` | The logger rejected a record before writing; once per distinct message per process | `message`: a fixed string such as `Invalid audit metadata` |
-| `audit_rotation_failed` | A step of log rotation failed, so the triggering record was refused; once until a rotation succeeds | `code`: errno-style code such as `EBUSY`, `EACCES`, or `UNKNOWN` |
+| `audit_rotation_failed` | A step of log rotation failed, so the triggering record was refused; once until a rotation succeeds | `code` |
+| `job_audit_unavailable` | A lifecycle event's audit write failed after its change committed (the change stands; `audit_sink_unavailable` reports the sink) | `audit_event` (for example `job_expired`), `job_id` |
+| `job_cleanup_failed` | Retention cleanup failed for one job; once per failed job per sweep | `job_id`, `status` (the job's committed state), `code` |
+| `job_cleanup_sweep_failed` | A sweep finished with at least one failed job; once per such sweep. Alert on this one | `jobs_failed`, `failures_total`, `consecutive_failed_sweeps`, `last_error_code`, `duration_ms` |
+| `job_cleanup_sweep_aborted` | A periodic sweep failed as a whole rather than per job | `code` |
+| `shutdown_timeout_warning` | At startup, when `MD_SHUTDOWN_TIMEOUT_MS` exceeds the 15 s Compose `stop_grace_period` | `shutdown_timeout_ms`, `ceiling_ms` |
+| `stale_lock_reclaimed`, `lock_lost` | Data-directory lock events; see the `.lock` notes under [inspecting and purging](#inspecting-and-purging-a-retired-users-artifacts) | Added with the lock changes |
 
 This milestone supplies application-level file isolation for distinct credentials, bounded resources, and restart-safe ownership. The converter subprocess is not a security sandbox against malicious document parser exploits. Use trusted document sources or additional parser isolation for hostile uploads. Multiple service replicas, distributed storage/queues, and a credential-management UI remain separate work.
 
@@ -215,7 +223,7 @@ This milestone supplies application-level file isolation for distinct credential
 
 Retention cleanup runs at startup and periodically. Once a job's `expires_at` passes (`MD_RETENTION_MS` after upload or completion, `MD_UPLOAD_TTL_MS` for an abandoned upload), it erases the input, `output.md` and its index, and leaves a metadata-only tombstone that is removed one retention period later. Running conversions are skipped until they finish. Each job is cleaned independently: a failure on one job is logged and retried on the next sweep while other jobs continue, and an overrunning sweep is never started twice. A job whose cleanup fails stays inaccessible to its owner (`Job expired`) and keeps its quota reservation until the tombstone is committed.
 
-Operators see cleanup failures on stderr. Each sweep with failures logs one line per failed job, for example `Job cleanup failed { event: "job_cleanup_failed", job_id: "…", status: "completed", code: "EACCES" }`, and one summary line, `Job cleanup sweep incomplete { event: "job_cleanup_sweep_failed", jobs_failed, failures_total, consecutive_failed_sweeps, last_error_code, duration_ms }`. Neither contains paths, filenames, error messages or document contents. Alert on the `job_cleanup_sweep_failed` event. Agents see only their own jobs' cleanup state through `get_service_health` (see [HEALTH.md](HEALTH.md)), never service-wide totals.
+Operators see cleanup failures on stderr as [operator events](#operator-stderr-events). Each sweep with failures logs one line per failed job, for example `{"event":"job_cleanup_failed","job_id":"…","status":"completed","code":"EACCES"}`, and one summary line, `{"event":"job_cleanup_sweep_failed","jobs_failed":1,"failures_total":3,"consecutive_failed_sweeps":2,"last_error_code":"EACCES","duration_ms":4}`. Neither contains paths, filenames, error messages or document contents. Alert on the `job_cleanup_sweep_failed` event. Agents see only their own jobs' cleanup state through `get_service_health` (see [HEALTH.md](HEALTH.md)), never service-wide totals.
 
 A common cause is a volume restored or copied with the wrong owner. The Compose service runs as UID/GID 10001 with all capabilities dropped, so it cannot repair ownership itself, and neither can the purge tool below when run the same way. Fix it once as root with the service stopped:
 

@@ -94,7 +94,7 @@ describe("readiness reflects audit sink availability", () => {
     // Wait on the readiness verdict itself; the conversion still completes although its audit record failed.
     await waitFor(async () => !(await instance.health()).checks.audit.available, { timeoutMs: 10_000, label: "the conversion_completed audit failure to turn readiness off" });
     expect((await instance.health()).ready).toBe(false);
-    expect(logged).toHaveBeenCalledWith("Job audit unavailable", "conversion_completed", id);
+    expect(logged).toHaveBeenCalledWith(JSON.stringify({ event: "job_audit_unavailable", audit_event: "conversion_completed", job_id: id }));
     state.fail = false;
     expect((await instance.getStatus(alice, id)).status).toBe("completed");
     expect((await instance.health()).ready).toBe(true);

@@ -28,7 +28,7 @@ export interface RemoteServerOptions {
   config: RemoteConfig;
   /** Builds the job service; `init()` is called by `startRemoteServer`. Defaults to a JobService with the audit logger from `config.jobs.dataDir`. */
   createJobs?: (config: RemoteConfig) => JobService | Promise<JobService>;
-  /** Builds the HTTP server (default: createHttpServer). Its request and header timeouts are overwritten after it is built. */
+  /** Builds the HTTP server (default: createHttpServer, which sets the request and header timeouts). */
   createServer?: (jobs: JobService, config: RemoteConfig) => Server;
   /** Signal registration and exit; defaults to the real process. */
   processHandle?: ProcessHandle;
@@ -39,14 +39,6 @@ export interface RemoteServerOptions {
 }
 /** A listening server. `shutdown` is idempotent and is what SIGINT, SIGTERM and SIGHUP invoke. */
 export interface RemoteServer { server: Server; jobs: JobService; shutdown: () => Promise<void> }
-
-/** Headers and request body deadlines applied to every remote server. */
-export const REQUEST_TIMEOUT_MS = 5 * 60_000;
-/**
- * Deadline for a client to send the complete request headers. Both values replace the shorter defaults that
- * createHttpServer sets (60 s and 15 s); the longer request deadline leaves room for large upload PUTs.
- */
-export const HEADERS_TIMEOUT_MS = 30_000;
 
 const defaultProcessHandle: ProcessHandle = { once: (signal, listener) => process.once(signal, listener), exit: code => process.exit(code) };
 const defaultLog = (message: string) => { console.error(message); };
@@ -71,7 +63,7 @@ async function defaultCreateJobs(config: RemoteConfig) {
  *
  * Startup: refuse Windows; warn (but continue) when the shutdown deadline exceeds SHUTDOWN_TIMEOUT_WARN_MS; build the
  * job service and init() it, which takes the data-directory lock, loads and recovers manifests and runs a first
- * cleanup sweep; build the HTTP server and apply REQUEST_TIMEOUT_MS and HEADERS_TIMEOUT_MS; listen. If listening fails
+ * cleanup sweep; build the HTTP server (createHttpServer sets its timeouts, see http.ts); listen. If listening fails
  * the job service is closed, releasing the lock, and the error is rethrown.
  *
  * Shutdown (the first call acts; later calls return at once without waiting): arm a `shutdownTimeoutMs` deadline that
@@ -93,8 +85,6 @@ export async function startRemoteServer(options: RemoteServerOptions): Promise<R
   const jobs = await createJobs(config);
   await jobs.init();
   const server = createServer(jobs, config);
-  server.requestTimeout = REQUEST_TIMEOUT_MS;
-  server.headersTimeout = HEADERS_TIMEOUT_MS;
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);

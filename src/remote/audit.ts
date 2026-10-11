@@ -12,7 +12,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { validatePrincipal } from "./identity.js";
 
-/** One audit record as submitted; createAuditLogger adds the timestamp and drops any field not listed here. */
+/**
+ * One audit record as submitted (the single declaration; jobs.ts imports it). createAuditLogger validates it, adds the
+ * timestamp and drops any field not listed here.
+ */
 export interface AuditEvent {
   event: string;
   tenant_id: string;
@@ -20,7 +23,7 @@ export interface AuditEvent {
   job_id?: string;
   status?: string;
   reason?: string;
-  /** read_markdown_repeat only: how many reads of the completed result followed the first recorded one. */
+  /** read_markdown_repeat only: the read pass number over the completed result (a multiple of AUDIT_READ_REPEAT_EVERY; see jobs.ts auditRead), not a count of reads. */
   repeat_count?: number;
 }
 
@@ -41,8 +44,8 @@ export class AuditRecordError extends Error {
  */
 export type AuditLogger = ((event: AuditEvent) => Promise<void>) & { probe: () => Promise<void> };
 
-/** An errno-style code safe for logs: never a path or message. */
-function errnoCode(error: unknown) {
+/** An errno-style code safe for operator logs (`/^[A-Z0-9_]{1,32}$/`, else "UNKNOWN"): never a path, message or stack. Shared with jobs.ts. */
+export function errnoCode(error: unknown) {
   const raw = (error as NodeJS.ErrnoException | null)?.code;
   return typeof raw === "string" && /^[A-Z0-9_]{1,32}$/.test(raw) ? raw : "UNKNOWN";
 }

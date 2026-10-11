@@ -4,6 +4,7 @@ import net from "node:net";
 import type { JobService } from "./jobs.js";
 import { loadConfig, SHUTDOWN_TIMEOUT_WARN_MS, WINDOWS_UNSUPPORTED_MESSAGE } from "./config.js";
 import { startRemoteServer, type ProcessHandle, type RemoteConfig, type RemoteServer } from "./index.js";
+import { HEADERS_TIMEOUT_MS, REQUEST_TIMEOUT_MS } from "./http.js";
 
 // Unit tests for startRemoteServer: every process-level side effect (exit, signal registration, logging) and the job
 // service are injected, so shutdown deadlines, server timeouts and listen-error cleanup run in-process.
@@ -66,8 +67,10 @@ describe("startRemoteServer", () => {
     expect(started.calls).toEqual({ init: 1, close: 0 });
     expect(started.server.listening).toBe(true);
     expect(started.logs).toEqual([`Markdownify remote listening on 127.0.0.1:${port}`]);
-    expect(started.server.requestTimeout).toBe(300000);
-    expect(started.server.headersTimeout).toBe(30000);
+    // http.ts is the single source of both deadlines; startRemoteServer does not override them.
+    expect([REQUEST_TIMEOUT_MS, HEADERS_TIMEOUT_MS]).toEqual([300_000, 30_000]);
+    expect(started.server.requestTimeout).toBe(REQUEST_TIMEOUT_MS);
+    expect(started.server.headersTimeout).toBe(HEADERS_TIMEOUT_MS);
     expect([...started.proc.listeners.keys()].sort()).toEqual(["SIGHUP", "SIGINT", "SIGTERM"]);
     expect(started.proc.exits).toEqual([]);
   });

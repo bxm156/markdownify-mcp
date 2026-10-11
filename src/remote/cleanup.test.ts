@@ -37,7 +37,16 @@ const manifest = async (dataDir: string, id: string) => JSON.parse(await fs.read
 const files = async (dataDir: string, id: string) => (await fs.readdir(path.join(dataDir, id))).sort();
 const health = async (instance: JobService, actor = alice) => await instance.health(actor) as any;
 const advance = (ms: number) => setSystemTime(new Date(Date.now() + ms));
-const lines = (spy: { mock: { calls: unknown[][] } }, message: string) => spy.mock.calls.filter(call => call[0] === message);
+/**
+ * Every stderr call as a parsed operator event. Asserts the contract on each one: a single string argument that is one
+ * line of JSON with an `event` name and no data-directory path.
+ */
+const events = (spy: { mock: { calls: unknown[][] } }, dataDir?: string) => spy.mock.calls.map(call => {
+  expect(call).toHaveLength(1); expect(typeof call[0]).toBe("string");
+  const line = call[0] as string; expect(line).not.toContain("\n"); if (dataDir) expect(line).not.toContain(dataDir);
+  const parsed = JSON.parse(line); expect(parsed.event).toMatch(/^[a-z_]+$/); return parsed as Record<string, unknown>;
+});
+const lines = (spy: { mock: { calls: unknown[][] } }, event: string, dataDir?: string) => events(spy, dataDir).filter(entry => entry.event === event);
 const deadPid = () => spawnSync(process.execPath, ["-e", ""]).pid!;
 afterEach(async () => {
   setSystemTime();
@@ -69,15 +78,15 @@ describe("retention cleanup resilience", () => {
         expect(foreign.cleanup).toMatchObject({ own_jobs_failed_last_sweep: 0, own_jobs_pending_retry: 0 });
         expect(JSON.stringify(foreign)).not.toContain("EACCES"); expect(JSON.stringify(foreign)).not.toContain(failing);
       }
-      expect(lines(logged, "Job cleanup failed")).toHaveLength(1); expect(lines(logged, "Job cleanup sweep incomplete")).toHaveLength(1);
-      expect(lines(logged, "Job cleanup sweep incomplete")[0][1]).toMatchObject({ jobs_failed: 1, failures_total: 1, consecutive_failed_sweeps: 1, last_error_code: "EACCES" });
+      expect(lines(logged, "job_cleanup_failed", options.dataDir)).toEqual([{ event: "job_cleanup_failed", job_id: failing, status: "completed", code: "EACCES" }]);
+      expect(lines(logged, "job_cleanup_sweep_failed", options.dataDir)).toEqual([{ event: "job_cleanup_sweep_failed", jobs_failed: 1, failures_total: 1, consecutive_failed_sweeps: 1, last_error_code: "EACCES", duration_ms: expect.any(Number) }]);
       const log = JSON.stringify(logged.mock.calls);
       expect(log).toContain(failing); expect(log).toContain("EACCES"); expect(log).not.toContain(options.dataDir); expect(log).not.toContain("permission denied");
       // Repeated sweeps keep retrying the failed job and still remove the other tenant's expired tombstone.
       advance(120_000); await instance.cleanup();
       await expect(fs.stat(path.join(options.dataDir, other))).rejects.toMatchObject({ code: "ENOENT" });
-      expect(lines(logged, "Job cleanup failed")).toHaveLength(2);
-      expect(lines(logged, "Job cleanup sweep incomplete")[1][1]).toMatchObject({ failures_total: 2, consecutive_failed_sweeps: 2 });
+      expect(lines(logged, "job_cleanup_failed", options.dataDir)).toHaveLength(2);
+      expect(lines(logged, "job_cleanup_sweep_failed")[1]).toMatchObject({ failures_total: 2, consecutive_failed_sweeps: 2 });
       rm.mockRestore(); await instance.cleanup();
       expect(await files(options.dataDir, failing)).toEqual(["job.json"]);
       expect((await manifest(options.dataDir, failing)).status).toBe("expired");
@@ -108,7 +117,7 @@ describe("retention cleanup resilience", () => {
       expect(pending.cleanup).toMatchObject({ own_jobs_failed_last_sweep: 1, own_jobs_pending_retry: 1 });
       // The reservation is not released before the tombstone commit succeeds.
       await expect(instance.createUpload(alice, { filename: "next.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 507 });
-      expect(lines(logged, "Job cleanup failed")).toHaveLength(1); expect(JSON.stringify(logged.mock.calls)).not.toContain(options.dataDir);
+      expect(lines(logged, "job_cleanup_failed", options.dataDir)).toHaveLength(1); expect(JSON.stringify(logged.mock.calls)).not.toContain(options.dataDir);
       spy.mockRestore(); await instance.cleanup();
       const tombstone = await manifest(options.dataDir, failing);
       expect(tombstone.status).toBe("expired"); expect(tombstone).not.toHaveProperty("token_hash"); expect(tombstone).not.toHaveProperty("upload_auth_hash");
@@ -130,7 +139,7 @@ describe("retention cleanup resilience", () => {
       // Once the tombstone itself expires, the sweep reports the failure once and keeps the tombstone for the next attempt.
       advance(120_000); await instance.cleanup();
       expect((await manifest(options.dataDir, expired)).status).toBe("expired");
-      expect(lines(logged, "Job cleanup failed")).toHaveLength(1); expect(lines(logged, "Job cleanup failed")[0][1]).toMatchObject({ status: "expired", code: "EACCES" });
+      expect(lines(logged, "job_cleanup_failed")).toHaveLength(1); expect(lines(logged, "job_cleanup_failed", options.dataDir)[0]).toMatchObject({ status: "expired", code: "EACCES" });
       expect((await health(instance, bob)).cleanup).toMatchObject({ own_jobs_failed_last_sweep: 1, own_jobs_pending_retry: 1 });
       expect((await health(instance, bob)).own_jobs.expired).toBe(1);
       rm.mockRestore(); await instance.cleanup();
@@ -147,9 +156,20 @@ describe("retention cleanup resilience", () => {
       advance(120_000); await instance.cleanup();
       expect(await files(options.dataDir, id)).toEqual(["job.json"]); expect((await manifest(options.dataDir, id)).status).toBe("expired");
       // The failed write logs the readiness transition once, then the lifecycle event it could not record.
-      expect(logged.mock.calls.map(call => call[0])).toEqual([JSON.stringify({ event: "audit_sink_unavailable", code: "UNKNOWN" }), "Job audit unavailable"]);
+      expect(events(logged, options.dataDir)).toEqual([{ event: "audit_sink_unavailable", code: "UNKNOWN" }, { event: "job_audit_unavailable", audit_event: "job_expired", job_id: id }]);
       expect((await health(instance)).cleanup).toMatchObject({ own_jobs_failed_last_sweep: 0, own_jobs_pending_retry: 0 });
     } finally { logged.mockRestore(); setSystemTime(); }
+  });
+
+  test("a sweep that fails as a whole logs one job_cleanup_sweep_aborted line with only an errno-style code", async () => {
+    const { instance, options } = await service();
+    const sweep = spyOn(instance as any, "sweepOnce").mockImplementation(() => Promise.reject(Object.assign(new Error(`EIO: i/o error, scandir '${options.dataDir}'`), { code: "EIO", path: options.dataDir })));
+    const logged = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      (instance as any).tick();
+      await waitFor(() => logged.mock.calls.length > 0, { label: "the aborted sweep event" });
+      expect(events(logged, options.dataDir)).toEqual([{ event: "job_cleanup_sweep_aborted", code: "EIO" }]);
+    } finally { sweep.mockRestore(); logged.mockRestore(); }
   });
 
   test("concurrent cleanup calls and timer ticks share one in-flight sweep that never overlaps itself", async () => {
@@ -165,7 +185,7 @@ describe("retention cleanup resilience", () => {
       return realRm(target, opts);
     }) as typeof fs.rm);
     const logged = spyOn(console, "error").mockImplementation(() => undefined);
-    const passes = () => lines(logged, "Job cleanup failed").length;
+    const passes = () => lines(logged, "job_cleanup_failed").length;
     let first: Promise<void> | undefined;
     try {
       advance(120_000); first = instance.cleanup(); await reached;
