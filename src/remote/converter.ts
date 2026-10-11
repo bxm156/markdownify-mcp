@@ -4,6 +4,7 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { resolveMarkitdownPath } from "../utils.js";
 import { ServiceError } from "./errors.js";
+import { resolveConverterExecutable } from "./health.js";
 
 export type Converter = (inputPath: string, outputPath: string, signal: AbortSignal) => Promise<void>;
 
@@ -23,12 +24,19 @@ export function abortError(signal: AbortSignal): ServiceError {
   return reason instanceof ServiceError && abortCodes.has(reason.code) ? reason : conversionAbort.cancelled();
 }
 
-/** No shell is involved; stdout is streamed and bounded, including during conversion. */
+/** No shell is involved, so on win32 only `.exe`/`.com` converters run (see resolveConverterExecutable); stdout is
+ * streamed and bounded, including during conversion. */
 export function createConverter(options: { maxOutputBytes: number; projectRoot?: string; executable?: string }): Converter {
   return async (inputPath, outputPath, signal) => {
     if (signal.aborted) throw abortError(signal);
-    const executable = options.executable ?? resolveMarkitdownPath(options.projectRoot ?? process.cwd());
-    const child = spawn(executable, [inputPath], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const requested = options.executable ?? resolveMarkitdownPath(options.projectRoot ?? process.cwd());
+    // Spawn the file the health check reports, never a different search result. On POSIX an unresolved name is still
+    // handed to spawn so its error (ENOENT, EACCES) surfaces as before. On win32 spawn would search the working directory
+    // first and could pick a file health never saw, so an unresolved name fails here instead.
+    const executable = await resolveConverterExecutable(requested);
+    if (signal.aborted) throw abortError(signal);
+    if (executable === undefined && process.platform === "win32") throw Object.assign(new Error("Converter executable not found"), { code: "ENOENT" });
+    const child = spawn(executable ?? requested, [inputPath], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let bytes = 0;
     // Drain stderr without retaining document contents or exposing server paths to clients.
     child.stderr.resume();

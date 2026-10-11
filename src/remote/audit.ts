@@ -30,6 +30,12 @@ export class AuditRecordError extends Error {
  */
 export type AuditLogger = ((event: AuditEvent) => Promise<void>) & { probe: () => Promise<void> };
 
+/** An errno-style code safe for logs: never a path or message. */
+function errnoCode(error: unknown) {
+  const raw = (error as NodeJS.ErrnoException | null)?.code;
+  return typeof raw === "string" && /^[A-Z0-9_]{1,32}$/.test(raw) ? raw : "UNKNOWN";
+}
+
 /** Metadata only. Serialize writes and cap local history with bounded rotation. */
 export async function createAuditLogger(directory: string, options: { maxBytes?: number; archives?: number } = {}): Promise<AuditLogger> {
   const maxBytes = options.maxBytes ?? 4 * 1024 * 1024;
@@ -42,6 +48,23 @@ export async function createAuditLogger(directory: string, options: { maxBytes?:
   await fs.chmod(target, 0o600);
   let size = (await fs.stat(target)).size;
   let pending: Promise<void> = Promise.resolve();
+  let rotationFailing = false;
+  const exists = async (file: string) => {
+    try { await fs.lstat(file); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+  };
+  // Resumable rotation. Archives shift only into the lowest free slot (`.1` newest, `.${archives}` oldest), and the oldest
+  // archive is deleted only when `.1`..`.${archives}` all exist. A shift interrupted part-way leaves exactly such a gap, so
+  // retrying re-attempts only the renames that did not happen and no generation is dropped early. History never exceeds
+  // the live file plus `archives` files.
+  const rotate = async () => {
+    let gap = 1;
+    while (gap <= archives && await exists(`${target}.${gap}`)) gap++;
+    if (gap > archives) { gap = archives; await fs.rm(`${target}.${archives}`, { force: true }); }
+    for (let index = gap - 1; index >= 1; index--) await fs.rename(`${target}.${index}`, `${target}.${index + 1}`);
+    try { await fs.rename(target, `${target}.1`); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; } // Nothing live to archive.
+  };
   const write = (event: AuditEvent) => {
     const operation = pending.catch(() => undefined).then(async () => {
       let principal: ReturnType<typeof validatePrincipal>;
@@ -60,12 +83,14 @@ export async function createAuditLogger(directory: string, options: { maxBytes?:
       const bytes = Buffer.byteLength(line);
       if (bytes > maxBytes) throw new AuditRecordError("Audit record exceeds capacity");
       if (size + bytes > maxBytes) {
-        await fs.rm(`${target}.${archives}`, { force: true });
-        for (let index = archives - 1; index >= 1; index--) {
-          try { await fs.rename(`${target}.${index}`, `${target}.${index + 1}`); }
-          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        try { await rotate(); }
+        catch (error) {
+          // The triggering record is rejected and `size` stays stale, so the next write resumes the rotation.
+          if (!rotationFailing) console.error(JSON.stringify({ event: "audit_rotation_failed", code: errnoCode(error) }));
+          rotationFailing = true;
+          throw error;
         }
-        await fs.rename(target, `${target}.1`);
+        rotationFailing = false;
         size = 0;
       }
       await fs.appendFile(target, line, { mode: 0o600 });
