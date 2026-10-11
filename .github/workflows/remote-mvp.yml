@@ -35,6 +35,10 @@ jobs:
         run: bun test
         env:
           MD_TEST_NETWORK: "1"
+      - name: Test the Office fixture generator (real DOCX, XLSX and PPTX files)
+        run: |
+          python scripts/create_remote_fixtures_test.py
+          python -O scripts/create_remote_fixtures_test.py
       - run: bun scripts/remote-converter-smoke.ts
       - name: Verify compiled Node JWT authentication and scoped uploads
         run: bun scripts/jwt-http-smoke.ts
@@ -83,6 +87,11 @@ jobs:
       - name: Check shell script syntax
         shell: bash
         run: for f in scripts/*.sh setup.sh; do bash -n "$f"; done
+      - name: Lint shell scripts with shellcheck
+        shell: bash
+        run: shellcheck -x scripts/*.sh setup.sh
+      - name: Test the stdio smoke test's response waiting (no Docker needed)
+        run: bash scripts/docker-smoke-test.test.sh
       - name: Validate compose files
         shell: bash
         run: |

@@ -1,32 +1,28 @@
-# Base stage will contain python dependencies
-FROM oven/bun:debian AS base
+# Build stage: compile TypeScript. Lifecycle scripts are skipped because the
+# package's preinstall hook (setup.sh) would install MarkItDown a second time.
+FROM oven/bun:1.4.2-debian AS builder
 WORKDIR /app
-
-# Install dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv bash git && rm -rf /var/lib/apt/lists/*
-
-# Copy the source code
-COPY . .
-# Remove the python version, otherwise it won't find python
-RUN rm .python-version
-
-# Install Python dependencies
-RUN python3 -m venv .venv && .venv/bin/pip install "markitdown[pdf]>=0.1.5"
-
-# Use a separate stage for building to save space
-FROM base AS builder
-
-# Install dependencies
-RUN bun install
-
-# Build the project
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --ignore-scripts
+COPY tsconfig.json ./
+COPY src ./src
 RUN bun run build
 
-# Final stage for the image (doing the build separately saves about 100MB)
-FROM base AS runner
+# Runtime stage: Bun + Python venv with MarkItDown installed exactly once.
+# [all] matches what setup.sh (the preinstall hook) provides for local installs,
+# including OCR/audio extras; the version matches the pin used in CI.
+FROM oven/bun:1.4.2-debian AS runner
+WORKDIR /app
 
-# Install production dependencies
-RUN bun install --production
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv bash git \
+    && rm -rf /var/lib/apt/lists/*
+
+# The runtime finds this via resolveMarkitdownPath: MARKITDOWN_PATH, then ./.venv/bin/markitdown, then PATH.
+RUN python3 -m venv .venv && .venv/bin/pip install --no-cache-dir "markitdown[all]==0.1.5"
+
+# Production dependencies only; no lifecycle scripts (see builder stage).
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --ignore-scripts --production
 
 # Copy the built application
 COPY --from=builder /app/dist ./dist
