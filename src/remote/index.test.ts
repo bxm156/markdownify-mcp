@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { closedPort, waitFor } from "./test-helpers.js";
 
 // These tests run the real entry point (src/remote/index.ts) as a child process, so startup failure handling,
 // listen-error cleanup and signal-driven shutdown are exercised exactly as an orchestrator would see them.
@@ -17,22 +18,8 @@ const TEST_TIMEOUT = 25_000;
 type Server = { child: ChildProcess; port: number; dataDir: string; output: () => { stdout: string; stderr: string }; exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }> };
 const children: ChildProcess[] = [], directories: string[] = [], pidFiles: string[] = [], listeners: net.Server[] = [];
 
-async function until<T>(check: () => Promise<T> | T, accept: (value: T) => boolean, label: string, timeoutMs = 10_000): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
-  let last: T | undefined;
-  while (Date.now() < deadline) {
-    try { last = await check(); if (accept(last)) return last; } catch { /* keep polling until the deadline */ }
-    await new Promise(resolve => setTimeout(resolve, 20));
-  }
-  throw new Error(`Timed out waiting for ${label}`);
-}
-async function freePort(): Promise<number> {
-  const probe = net.createServer();
-  await new Promise<void>((resolve, reject) => { probe.once("error", reject); probe.listen(0, "127.0.0.1", resolve); });
-  const { port } = probe.address() as net.AddressInfo;
-  await new Promise<void>(resolve => probe.close(() => resolve()));
-  return port;
-}
+const freePort = closedPort;
+const until = <T>(predicate: () => T | Promise<T>, label: string) => waitFor(predicate, { timeoutMs: 10_000, intervalMs: 10, label });
 async function tempDir(prefix: string) { const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix)); directories.push(dir); return dir; }
 /** A converter stub that records its pid, then blocks until it is killed. */
 async function hangingConverter(dir: string) {
@@ -41,14 +28,14 @@ async function hangingConverter(dir: string) {
   pidFiles.push(pidFile);
   return { script, pidFile };
 }
-function start(options: { port: number; dataDir: string; env?: Record<string, string | undefined>; converter?: string }): Server {
+function start(options: { port: number; dataDir: string; env?: Record<string, string | undefined>; converter?: string; track?: boolean }): Server {
   // Inherit only what the runtime needs so ambient MD_* / MARKITDOWN_PATH values can never leak into a test.
   const env: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(process.env)) if (!name.startsWith("MD_") && name !== "MARKITDOWN_PATH") env[name] = value;
   Object.assign(env, { MD_API_KEY: API_KEY, MD_HOST: "127.0.0.1", MD_PORT: String(options.port), MD_PUBLIC_BASE_URL: `http://127.0.0.1:${options.port}`, MD_DATA_DIR: options.dataDir, MARKITDOWN_PATH: options.converter ?? "/bin/true" }, options.env);
   for (const [name, value] of Object.entries(env)) if (value === undefined) delete env[name];
   const child = spawn(process.execPath, [entry], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-  children.push(child);
+  if (options.track !== false) children.push(child);
   let stdout = "", stderr = "";
   child.stdout!.on("data", chunk => { stdout += chunk.toString(); });
   child.stderr!.on("data", chunk => { stderr += chunk.toString(); });
@@ -57,7 +44,8 @@ function start(options: { port: number; dataDir: string; env?: Record<string, st
 }
 const readyz = (server: Server) => fetch(`http://127.0.0.1:${server.port}/readyz`, { signal: AbortSignal.timeout(2000) });
 async function ready(server: Server) {
-  const response = await until(() => readyz(server), value => value.status === 200, `readiness (stderr: ${server.output().stderr})`);
+  const response = await until(async () => { const value = await readyz(server); return value.status === 200 && value; }, "readiness")
+    .catch(error => { throw new Error(`${error.message} (stderr: ${server.output().stderr})`); });
   expect(await response.json()).toMatchObject({ ready: true });
 }
 async function terminated(server: Server, timeoutMs = 8000) {
@@ -83,8 +71,8 @@ async function startRunningJob(server: Server, pidFile: string) {
     expect(put.status).toBe(204);
     await call("start_conversion", { upload_id: upload.upload_id });
     // The converter has been spawned only once the job is running; its pid file proves the stub is really blocking.
-    await until(async () => (await readJob(server, upload.upload_id)).status, status => status === "running", "job to be running");
-    await until(() => fs.readFile(pidFile, "utf8"), pid => Number(pid) > 0, "converter process to start");
+    await until(async () => (await readJob(server, upload.upload_id)).status === "running", "job to be running");
+    await until(async () => Number(await fs.readFile(pidFile, "utf8")) > 0, "converter process to start");
     return upload.upload_id;
   } finally { await client.close(); }
 }
@@ -143,32 +131,38 @@ describe("remote entry point", () => {
     expect((await terminated(retry)).code).toBe(0);
   }, TEST_TIMEOUT);
 
-  test("a second instance on the same port exits nonzero while the first keeps serving", async () => {
-    const port = await freePort();
-    const first = start({ port, dataDir: await tempDir("markdownify-index-") });
-    await ready(first);
-    const second = start({ port, dataDir: await tempDir("markdownify-index-") });
-    const { code } = await terminated(second);
-    expect(code).toBe(1);
-    expect(second.output().stderr).toMatch(/EADDRINUSE|port \d+ in use/);
-    expect(second.output().stderr).not.toContain(API_KEY);
-    expect((await readyz(first)).status).toBe(200);
-    first.child.kill("SIGTERM");
-    expect((await terminated(first)).code).toBe(0);
-  }, TEST_TIMEOUT);
+  // The two scenarios below only read from a running instance, so they share one server spawned for the group.
+  // It is deliberately untracked by the per-test cleanup (which kills every tracked child) and shut down gracefully in afterAll.
+  describe("a second instance next to a running one", () => {
+    let first: Server;
+    beforeAll(async () => {
+      first = start({ port: await freePort(), dataDir: await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-index-shared-")), track: false });
+      await ready(first);
+    }, TEST_TIMEOUT);
+    afterAll(async () => {
+      if (first.child.exitCode === null && first.child.signalCode === null) { first.child.kill("SIGTERM"); await terminated(first).catch(() => first.child.kill("SIGKILL")); }
+      await fs.rm(first.dataDir, { recursive: true, force: true });
+    });
 
-  test("a second instance on the same data directory is refused and leaves the first instance's lock alone", async () => {
-    const dataDir = await tempDir("markdownify-index-");
-    const first = start({ port: await freePort(), dataDir });
-    await ready(first);
-    const second = start({ port: await freePort(), dataDir });
-    expect((await terminated(second)).code).toBe(1);
-    expect(second.output().stderr).toContain("Data directory is in use");
-    expect((await readyz(first)).status).toBe(200);
-    expect(await fs.stat(path.join(dataDir, ".lock"))).toBeTruthy();
-    first.child.kill("SIGTERM");
-    expect((await terminated(first)).code).toBe(0);
-  }, TEST_TIMEOUT);
+    test("on the same port exits nonzero while the first keeps serving", async () => {
+      const second = start({ port: first.port, dataDir: await tempDir("markdownify-index-") });
+      const { code } = await terminated(second);
+      expect(code).toBe(1);
+      expect(second.output().stderr).toMatch(/EADDRINUSE|port \d+ in use/);
+      expect(second.output().stderr).not.toContain(API_KEY);
+      expect((await readyz(first)).status).toBe(200);
+      expect(first.child.exitCode).toBeNull();
+    }, TEST_TIMEOUT);
+
+    test("on the same data directory is refused and leaves the first instance's lock alone", async () => {
+      const second = start({ port: await freePort(), dataDir: first.dataDir });
+      expect((await terminated(second)).code).toBe(1);
+      expect(second.output().stderr).toContain("Data directory is in use");
+      expect((await readyz(first)).status).toBe(200);
+      expect(await fs.stat(path.join(first.dataDir, ".lock"))).toBeTruthy();
+      expect(first.child.exitCode).toBeNull();
+    }, TEST_TIMEOUT);
+  });
 
   describe("invalid configuration", () => {
     const secret = "short-but-secret-value";
@@ -211,7 +205,7 @@ describe("remote entry point", () => {
     const persisted = await readJob(first, id);
     expect(persisted).toMatchObject({ status: "failed", error_code: "CONVERSION_INTERRUPTED" });
     await expect(fs.stat(path.join(dataDir, id, "output.part"))).rejects.toMatchObject({ code: "ENOENT" });
-    await until(() => { try { process.kill(Number(readFileSync(pidFile, "utf8")), 0); return true; } catch { return false; } }, alive => !alive, "converter to be killed");
+    await until(() => { try { process.kill(Number(readFileSync(pidFile, "utf8")), 0); return false; } catch { return true; } }, "converter to be killed");
 
     const second = start({ port: await freePort(), dataDir, converter: script });
     await ready(second);

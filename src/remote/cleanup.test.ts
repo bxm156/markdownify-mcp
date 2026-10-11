@@ -10,6 +10,7 @@ import { JobService, type JobServiceOptions } from "./jobs.js";
 import { purgeOwnerJobs } from "./purge-owner.js";
 import { acquireLock, readLock, releaseLock } from "./lock.js";
 import type { Principal } from "./identity.js";
+import { waitFor } from "./test-helpers.js";
 
 const alice: Principal = { tenantId: "team", agentId: "alice" }, bob: Principal = { tenantId: "team", agentId: "bob" }, carol: Principal = { tenantId: "other", agentId: "carol" };
 const services: JobService[] = [], directories: string[] = [];
@@ -27,10 +28,10 @@ async function uploaded(instance: JobService, actor: Principal, content = "x") {
   const job = await instance.createUpload(actor, { filename: "file.txt", size_bytes: Buffer.byteLength(content) });
   await instance.upload(actor, job.upload_id, job.upload_token, Readable.from([content])); return job.upload_id;
 }
-async function until(instance: JobService, actor: Principal, id: string, desired: string) {
-  for (let tries = 0; tries < 400; tries++) { if ((await instance.getStatus(actor, id)).status === desired) return; await new Promise(resolve => setTimeout(resolve, 5)); }
-  throw new Error(`Job never became ${desired}`);
-}
+const until = (instance: JobService, actor: Principal, id: string, desired: string) =>
+  waitFor(async () => (await instance.getStatus(actor, id)).status === desired, { timeoutMs: 5000, label: `job ${id} to become ${desired}` });
+/** Let already-scheduled I/O callbacks and promise continuations run, so "nothing happened" checks see a settled state. */
+const settle = async (turns = 5) => { for (let turn = 0; turn < turns; turn++) await new Promise(resolve => setImmediate(resolve)); };
 async function completed(instance: JobService, actor: Principal) { const id = await uploaded(instance, actor); await instance.startConversion(actor, id); await until(instance, actor, id, "completed"); return id; }
 const manifest = async (dataDir: string, id: string) => JSON.parse(await fs.readFile(path.join(dataDir, id, "job.json"), "utf8"));
 const files = async (dataDir: string, id: string) => (await fs.readdir(path.join(dataDir, id))).sort();
@@ -170,7 +171,7 @@ describe("retention cleanup resilience", () => {
       advance(120_000); first = instance.cleanup(); await reached;
       // Periodic ticks during a long sweep are skipped: they neither start a sweep nor queue another pass.
       for (let index = 0; index < 3; index++) (instance as any).tick();
-      await new Promise(resolve => setTimeout(resolve, 20));
+      await settle();
       expect(passes()).toBe(0); expect(slowCalls).toBe(1); expect((await manifest(options.dataDir, other)).status).toBe("uploaded");
       release(); await first;
       expect(passes()).toBe(1);
@@ -195,7 +196,7 @@ describe("retention cleanup resilience", () => {
     try {
       advance(120_000); const sweep = instance.cleanup(); await reached;
       let closed = false; const closing = instance.close().then(() => { closed = true; });
-      await new Promise(resolve => setTimeout(resolve, 20)); expect(closed).toBe(false);
+      await settle(); expect(closed).toBe(false);
       release(); await closing;
       expect((instance as any).sweep).toBeUndefined(); await sweep;
       expect((await manifest(options.dataDir, slow)).status).toBe("expired");
@@ -441,7 +442,7 @@ describe.skipIf(!node)("compiled entry points under node", () => {
       try {
         let stdout = ""; child.stdout!.on("data", chunk => { stdout += chunk; });
         const exited = new Promise<number | null>(resolve => child.once("exit", code => resolve(code)));
-        for (let tries = 0; tries < 400 && !stdout.includes("gated"); tries++) { if (child.exitCode !== null) break; await new Promise(resolve => setTimeout(resolve, 10)); }
+        await waitFor(() => stdout.includes("gated") || child.exitCode !== null, { timeoutMs: 10_000, intervalMs: 5, label: "purge to reach the gated removal" });
         expect(stdout).toContain("gated"); expect((await fs.readFile(path.join(options.dataDir, ".lock"), "utf8")).split("\n")[0]).toBe(String(child.pid));
         child.kill(signal);
         expect(await exited).toBe(128 + number);
@@ -469,14 +470,10 @@ describe.skipIf(!node)("compiled entry points under node", () => {
     const { port, release } = await reservePort(), lock = path.join(dataDir, ".lock");
     const env = { ...process.env, MD_API_KEY: "k".repeat(40), MD_DATA_DIR: dataDir, MD_HOST: "127.0.0.1", MD_PORT: String(port), MD_PUBLIC_BASE_URL: `http://127.0.0.1:${port}`, MARKITDOWN_PATH: node! };
     const start = () => { const child = spawn(node!, [path.join(root, "dist/remote/index.js")], { env, stdio: ["ignore", "ignore", "pipe"] }); let stderr = ""; child.stderr!.on("data", chunk => { stderr += chunk; }); const exited = new Promise<number | null>(resolve => child.once("exit", code => resolve(code))); return { child, exited, stderr: () => stderr }; };
-    const ready = async (server: ReturnType<typeof start>) => {
-      for (let tries = 0; tries < 200; tries++) {
-        if (server.child.exitCode !== null) throw new Error(`server exited: ${server.stderr()}`);
-        const ok = await fetch(`http://127.0.0.1:${port}/readyz`, { headers: { Host: `127.0.0.1:${port}` } }).then(response => response.ok, () => false);
-        if (ok) return; await new Promise(resolve => setTimeout(resolve, 25));
-      }
-      throw new Error("server never became ready");
-    };
+    const ready = (server: ReturnType<typeof start>) => waitFor(async () => {
+      if (server.child.exitCode !== null) throw new Error(`server exited: ${server.stderr()}`);
+      return await fetch(`http://127.0.0.1:${port}/readyz`, { headers: { Host: `127.0.0.1:${port}` } }).then(response => response.ok, () => false);
+    }, { timeoutMs: 10_000, intervalMs: 10, label: "server readiness" });
     await release(); const first = start();
     try { await ready(first); expect((await fs.readFile(lock, "utf8")).split("\n")[0]).toBe(String(first.child.pid)); first.child.kill("SIGKILL"); await first.exited; }
     finally { if (first.child.exitCode === null) first.child.kill("SIGKILL"); }

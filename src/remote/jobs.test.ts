@@ -136,19 +136,19 @@ describe("durable single tenant jobs", () => {
   test("stalled uploads time out and close and deletion abort pending streams", async () => {
     const { instance, options } = await service({ uploadTtlMs: 30 });
     const stalled = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
-    await expect(instance.upload(principal, stalled.upload_id, stalled.upload_token, new PassThrough())).rejects.toMatchObject({ statusCode: 408 });
+    await expect(instance.upload(principal, stalled.upload_id, stalled.upload_token, new PassThrough())).rejects.toMatchObject({ statusCode: 408, code: "UPLOAD_INTERRUPTED" });
     expect(await fs.readdir(path.join(options.dataDir, stalled.upload_id))).toEqual(["job.json"]);
     const { instance: deletable, options: deletableOptions } = await service();
     const pending = await deletable.createUpload(principal, { filename: "b.txt", size_bytes: 1 });
     const upload = deletable.upload(principal, pending.upload_id, pending.upload_token, new PassThrough());
     const rejected = upload.catch(error => error);
-    await deletable.deleteJob(principal, pending.upload_id); expect(await rejected).toMatchObject({ statusCode: 408 });
+    await deletable.deleteJob(principal, pending.upload_id); expect(await rejected).toMatchObject({ statusCode: 408, code: "UPLOAD_INTERRUPTED" });
     const closing = await deletable.createUpload(principal, { filename: "c.txt", size_bytes: 1 });
     const closeUpload = deletable.upload(principal, closing.upload_id, closing.upload_token, new PassThrough());
     // Wait until the upload holds its lock and has opened its partial file before closing.
     await waitFor(() => exists(path.join(deletableOptions.dataDir, closing.upload_id, "input.part")), { label: "upload to open its partial file" });
     const closeRejected = closeUpload.catch(error => error);
-    await deletable.close(); expect(await closeRejected).toMatchObject({ statusCode: 408 });
+    await deletable.close(); expect(await closeRejected).toMatchObject({ statusCode: 408, code: "UPLOAD_INTERRUPTED" });
   });
   test("expired tombstones are bounded under repeated uploads", async () => {
     const { instance, options } = await service({ maxJobs: 1, retentionMs: 20 });
