@@ -330,6 +330,22 @@ CI tests every push and PR, including real PDF/Office conversions, Docker builds
 
 The upstream local stdio entry point remains `dist/index.js` (`bun start`) with local-path and web conversion tools. It is separate from the remote `dist/remote/index.js` service and its seven remote tools. Local mode needs its own Python/dependency setup; the original `Dockerfile` builds stdio mode, while `Dockerfile.remote` builds the service documented here.
 
+The stdio server exposes eleven tools. Arguments are validated per tool against a strict schema: missing, mistyped or unknown arguments return an error result without running a conversion.
+
+| Tool | Arguments | Description |
+| --- | --- | --- |
+| `youtube-to-markdown` | `url` | Convert a YouTube video to markdown, including transcript if available |
+| `bing-search-to-markdown` | `url` | Convert a Bing search results page to markdown |
+| `webpage-to-markdown` | `url` | Convert a webpage to markdown |
+| `pdf-to-markdown` | `filepath` | Convert a PDF file to markdown |
+| `image-to-markdown` | `filepath` | Convert an image to markdown, including metadata and description |
+| `audio-to-markdown` | `filepath` | Convert an audio file to markdown, including transcription if possible |
+| `docx-to-markdown` | `filepath` | Convert a DOCX file to markdown |
+| `xlsx-to-markdown` | `filepath` | Convert an XLSX file to markdown |
+| `pptx-to-markdown` | `filepath` | Convert a PPTX file to markdown |
+| `git-repo-to-markdown` | `url`, optional `branch`, optional `compress` | Convert a git repository into a single markdown document containing the file tree and source code; accepts GitHub URLs and `owner/repo` shorthand |
+| `get-markdown-file` | `filepath` | Get a markdown file by absolute file path |
+
 URL conversion in stdio mode (`webpage-to-markdown` and the other URL tools) accepts only `http:`/`https:` URLs without embedded credentials. It resolves the hostname and refuses loopback, private, link-local, unique-local and cloud-metadata addresses, then connects only to the addresses it checked (re-checking every redirect hop, up to 10). Each download has a 30-second deadline covering DNS, redirects and the body, and a 50 MiB cap on the decompressed body. Because the connection is pinned to the checked address, **`HTTPS_PROXY`/`HTTP_PROXY` are not used** for these downloads; the server prints a one-line note on stderr at startup when they are set. Run it where the target sites are directly reachable.
 
 Local-path tools in stdio mode can read any file the server process can read unless `MD_ALLOWED_PATHS` (or the older `MD_SHARE_DIR`) lists the permitted directories, separated by `:` (`;` on Windows). With an allowlist, the server resolves the path, opens the result itself with `O_NOFOLLOW`, checks where the *opened* file really is, then converts a private copy of exactly those bytes (Markdown reads go through the same opened handle). The converted bytes are therefore those of a file that was inside an allowed directory when it was opened and checked; swapping a symlink or a parent directory afterwards cannot substitute a file from outside. The copy lives in a per-call temporary directory that is removed after every conversion, success or failure, and files over 50 MiB are refused. Only regular files are accepted; directories, FIFOs and devices are rejected. The allowlist does not vouch for content: anyone who can write inside an allowed directory can still place arbitrary bytes there, including hard links to files they can read. On Linux the opened file's location comes from `/proc/self/fd`; other platforms (and Linux without `/proc`) re-resolve the path after opening and require the same device and inode, which rejects any swap still in place but cannot rule out an attacker swapping a directory twice in that short gap. Windows has no `O_NOFOLLOW` and relies on that comparison alone.
