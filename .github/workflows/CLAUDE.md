@@ -1,10 +1,16 @@
 # CLAUDE.md (.github/workflows/)
 
 Guidance for agents editing CI. GitHub only runs `*.yml`/`*.yaml` here; this
-file is documentation. Pinned everywhere: Bun 1.4.2, Node 22, Python 3.12,
+file is documentation. Pinned everywhere: Bun 1.4.2, Node 24, Python 3.12,
 markitdown 0.1.5 (`markitdown[pdf,docx,xlsx,pptx]==0.1.5`), LiteLLM 1.104.0
-(`litellm[mcp]==1.104.0`). `Dockerfile.remote` pins
-Node 22, Python 3.12 and `markitdown[pdf,docx,xlsx,pptx]==0.1.5`. The stdio
+(`litellm[mcp]==1.104.0`). `Dockerfile.remote` takes the Node image from
+`ARG NODE_IMAGE` (default `node:24-bookworm-slim`) and pins Python 3.12 and
+`markitdown[pdf,docx,xlsx,pptx]==0.1.5`. Node 22 is still tested: remote-mvp.yml's
+`remote` job runs a `node: [22, 24]` matrix (and builds the image with the matching
+`NODE_IMAGE`) until a cleanup PR drops 22 at its end of life; `engines.node` stays
+`>=22` until then. docker-publish.yml and cross-platform.yml use Node 24 only.
+Actions: `actions/checkout@v5`, `actions/setup-node@v5`, `actions/setup-python@v6`
+(all Node 24 runtimes). The stdio
 `Dockerfile` pins Bun 1.4.2 and `markitdown[all]==0.1.5` (audio/OCR tools) and uses
 the base image's Debian `python3` (`oven/bun:1.4.2-debian` is trixie, so 3.13) plus
 ffmpeg, deliberately without a second Python toolchain. Change a pin in every
@@ -15,7 +21,9 @@ workflows use `permissions: contents: read` unless stated.
 
 Triggers: every `push` and `pull_request`. No secrets.
 
-- Job `remote` (15 min): `bun install --frozen-lockfile --ignore-scripts`;
+- Job `remote` (15 min, matrix `node: [22, 24]`, `fail-fast: false`): first checks that
+  `node --version` on PATH is the leg's major (Node-only tests would otherwise skip
+  silently); `bun install --frozen-lockfile --ignore-scripts`;
   `bun run typecheck` (tests, scripts, examples); `bun scripts/check-env-docs.ts`
   (every `MD_*` in `src/remote` is in the `docs/REMOTE.md` table); an `ast`-based guard that
   fails on any `assert` statement in `scripts/*.py` and `mkdocs_hooks.py` (`python -O`
@@ -23,10 +31,13 @@ Triggers: every `push` and `pull_request`. No secrets.
   `bun run build:remote`; `bun test src/remote`; install markitdown; `bun run
   build`; full `bun test` with `MD_TEST_NETWORK=1`; fixture generator test
   (`create_remote_fixtures_test.py`, also under `-O`); `remote-converter-smoke.ts`
-  and `jwt-http-smoke.ts` against the compiled Node server; LiteLLM 1.104
+  and `jwt-http-smoke.ts` against the compiled Node server, then the JWT smoke again
+  with `NODE_OPTIONS=--throw-deprecation` (inherited by the spawned server); LiteLLM 1.104
   anonymous health smoke (`litellm-health-smoke.py`, also under `-O`) and
   `litellm_health_smoke_test.py` under `-O` (rejects 403, 500, timeout,
-  unexpected success). Then `docker build -f Dockerfile.remote`, and two
+  unexpected success). Then `docker build -f Dockerfile.remote --build-arg
+  NODE_IMAGE=node:<leg>-bookworm-slim`, a check that `node -p process.version` in the
+  image is the leg's major and `ldd /usr/local/bin/node` has no `not found`, and two
   containers: single-key (`remote-http-smoke.ts` plus `examples/upload-and-convert.ts`
   on `src/sample-data/test.pdf`) and a disposable three-agent registry
   (`create-test-agent-registry.ts`, `multitenant-http-smoke.ts`, the example as agent "a").
@@ -46,13 +57,15 @@ Triggers: `push` to `main` and `workflow_dispatch`; job guarded by
 cancelled. Job `test-and-publish`, 25 min.
 
 - Re-runs the cheap or image-relevant source checks (typecheck, env docs check,
-  assert guard, build, `MD_TEST_NETWORK=1 bun test`, converter/JWT/LiteLLM smokes,
+  assert guard, build, `MD_TEST_NETWORK=1 bun test`, converter/JWT/LiteLLM smokes
+  (JWT also with `NODE_OPTIONS=--throw-deprecation`),
   `bash -n`, shellcheck, the stdio smoke's Docker-free test, fixture test, `docker compose config -q`
   for the three compose files). It relies on remote-mvp.yml for `docker-smoke-test.sh`
   (a second image build of the unpublished stdio Dockerfile), the single-key container
   smoke, and the LiteLLM `-O` run and negative-path harness. Then it builds
   `Dockerfile.remote` (linux/amd64, `VCS_REF=$GITHUB_SHA`, `load: true`,
-  `push: false`) without registry credentials, and tests that image with three
+  `push: false`) without registry credentials, checks that its `node` is 24.x and
+  `ldd /usr/local/bin/node` has no `not found`, and tests that image with three
   disposable agents: the multitenant smoke, then `examples/upload-and-convert.ts` as
   agent "a" under Bun, under Node (`--experimental-strip-types`) and the compiled
   `examples/upload-and-convert.js` inside the image (`--network container:<name>`),
