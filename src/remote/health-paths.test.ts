@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { constants } from "node:fs";
+import { accessSync, constants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createConverter } from "./converter.js";
-import { checkRuntime, converterAccessMode, converterCandidates, resolveConverterExecutable } from "./health.js";
+import { ServiceError } from "./errors.js";
+import { DEFAULT_PATH, checkRuntime, converterAccessMode, converterCandidates, resolveConverterExecutable } from "./health.js";
 
 const directories: string[] = [], restores: (() => void)[] = [];
 async function tempDir(prefix: string) { const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix)); directories.push(dir); return dir; }
@@ -44,8 +45,10 @@ describe.skipIf(process.platform === "win32")("converter search on PATH", () => 
     expect((await checkRuntime(data, false)).converter).toEqual({ available: true, check: "executable" });
     process.env.PATH = [empty, nonExecutable, directory].join(path.delimiter);
     expect((await checkRuntime(data, false)).converter).toEqual({ available: false, check: "executable" });
+    // Unset PATH searches DEFAULT_PATH, so the verdict depends only on whether this host has markitdown there.
     delete process.env.PATH;
-    expect((await checkRuntime(data, false)).converter).toEqual({ available: false, check: "executable" });
+    const inDefaultPath = DEFAULT_PATH.split(":").some(dir => { try { accessSync(path.join(dir, "markitdown"), constants.X_OK); return true; } catch { return false; } });
+    expect((await checkRuntime(data, false)).converter).toEqual({ available: inDefaultPath, check: "executable" });
   });
 
   test("a bare MARKITDOWN_PATH name is searched in PATH order and the result never names a directory", async () => {
@@ -63,7 +66,12 @@ describe.skipIf(process.platform === "win32")("converter search on PATH", () => 
 describe("converter candidate list", () => {
   test("POSIX: PATH entries in order, empty entries skipped, PATHEXT ignored", () => {
     expect(converterCandidates("markitdown", { PATH: "/usr/local/bin::/opt/md/bin:", PATHEXT: ".EXE" }, "linux")).toEqual(["/usr/local/bin/markitdown", "/opt/md/bin/markitdown"]);
-    expect(converterCandidates("markitdown", {}, "linux")).toEqual([]);
+    // Unset PATH falls back to the default list; an explicitly empty PATH has no entries at all.
+    expect(DEFAULT_PATH).toBe("/usr/local/bin:/usr/bin:/bin");
+    expect(converterCandidates("markitdown", {}, "linux")).toEqual(["/usr/local/bin/markitdown", "/usr/bin/markitdown", "/bin/markitdown"]);
+    expect(converterCandidates("markitdown", {}, "linux", "/x:/y")).toEqual(["/x/markitdown", "/y/markitdown"]);
+    expect(converterCandidates("markitdown", { PATH: "" }, "linux")).toEqual([]);
+    expect(converterCandidates("markitdown", { PATH: "::" }, "linux")).toEqual([]);
     expect(converterCandidates("/srv/.venv/bin/markitdown", { PATH: "/usr/bin" }, "linux")).toEqual(["/srv/.venv/bin/markitdown"]);
     expect(converterCandidates("bin/markitdown", { PATH: "/usr/bin" }, "linux")).toEqual(["bin/markitdown"]);
   });
@@ -135,6 +143,46 @@ describe("shared converter resolution", () => {
     let checks = 0;
     expect(await resolveConverterExecutable("markitdown", { PATH: "C:\\a;C:\\b" }, "win32", () => ++checks > 1)).toBeUndefined();
     expect(checks).toBe(2);
+  });
+
+  test.skipIf(process.platform === "win32")("POSIX: an unset PATH searches the default list, in order", async () => {
+    const root = await tempDir("markdownify-defpath-"), local = path.join(root, "usr-local-bin"), usr = path.join(root, "usr-bin");
+    await fs.mkdir(local); await fs.mkdir(usr);
+    const defaults = [local, usr].join(path.delimiter);
+    expect(await resolveConverterExecutable("markitdown", {}, "linux", () => false, defaults)).toBeUndefined();
+    await fs.writeFile(path.join(usr, "markitdown"), "#!/bin/sh\n", { mode: 0o755 });
+    expect(await resolveConverterExecutable("markitdown", {}, "linux", () => false, defaults)).toBe(path.join(usr, "markitdown"));
+    await fs.writeFile(path.join(local, "markitdown"), "#!/bin/sh\n", { mode: 0o755 });
+    expect(await resolveConverterExecutable("markitdown", {}, "linux", () => false, defaults)).toBe(path.join(local, "markitdown"));
+    // A set PATH, even an empty one, never falls back to the defaults.
+    expect(await resolveConverterExecutable("markitdown", { PATH: "" }, "linux", () => false, defaults)).toBeUndefined();
+  });
+
+  test.skipIf(process.platform === "win32")("POSIX: the converter spawns the resolved path, not a bare name", async () => {
+    const cwd = await tempDir("markdownify-path-cwd-"), bin = await tempDir("markdownify-path-bin-"), output = path.join(cwd, "out.part"), self = path.join(bin, "markitdown");
+    await fs.writeFile(self, '#!/bin/sh\nprintf "%s\\n" "$0"\n', { mode: 0o755 });
+    const previousCwd = process.cwd();
+    process.chdir(cwd); restores.push(() => process.chdir(previousCwd));
+    setEnv({ MARKITDOWN_PATH: undefined, PATH: bin });
+    await createConverter({ maxOutputBytes: 1000, projectRoot: cwd })(path.join(cwd, "input.txt"), output, new AbortController().signal);
+    expect(await fs.readFile(output, "utf8")).toBe(self + "\n");
+  });
+
+  test.skipIf(process.platform === "win32")("POSIX: a miss fails closed with ENOENT; an empty PATH entry never runs a stub in the working directory", async () => {
+    const cwd = await tempDir("markdownify-path-cwd-"), [empty] = await decoys(), marker = path.join(cwd, "ran");
+    await fs.writeFile(path.join(cwd, "markitdown"), `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nprintf '# from cwd\\n'\n`, { mode: 0o755 });
+    const previousCwd = process.cwd();
+    process.chdir(cwd); restores.push(() => process.chdir(previousCwd));
+    for (const PATH of [["", empty].join(path.delimiter), "", [empty, ""].join(path.delimiter)]) {
+      setEnv({ MARKITDOWN_PATH: undefined, PATH });
+      expect(await resolveConverterExecutable("markitdown")).toBeUndefined();
+      expect((await checkRuntime(cwd, false)).converter.available).toBe(false);
+      const error = await createConverter({ maxOutputBytes: 1000, projectRoot: cwd })(path.join(cwd, "input.txt"), path.join(cwd, "out.part"), new AbortController().signal).catch(value => value);
+      expect(error).not.toBeInstanceOf(ServiceError);
+      expect(error).toMatchObject({ code: "ENOENT", message: "Converter executable not found" });
+    }
+    expect(await fs.stat(marker).then(() => true, () => false)).toBe(false);
+    expect(await fs.stat(path.join(cwd, "out.part")).then(() => true, () => false)).toBe(false);
   });
 
   test.skipIf(process.platform === "win32")("POSIX: health and the converter pick the same file on PATH", async () => {

@@ -13,11 +13,15 @@ export const MAX_TIMER_MS = 2 ** 31 - 1;
 const WIN32_RUNNABLE = new Set([".com", ".exe"]);
 /** Windows' own order when PATHEXT is unset, restricted to directly runnable extensions. */
 const WIN32_DEFAULT_PATHEXT = ".COM;.EXE";
-/** Paths probed for the converter executable, in order. POSIX: a path is used as given; a bare name is looked up on PATH.
+/** The POSIX search list used when PATH is unset (not when it is empty), close to what libc's execvp falls back to.
+ * A container started without PATH therefore still finds /usr/bin/markitdown. win32 has no such fallback. */
+export const DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin";
+/** Paths probed for the converter executable, in order. POSIX: a path is used as given; a bare name is looked up on PATH
+ * (`defaultPath` when PATH is unset), and empty PATH entries are skipped so the working directory is never searched.
  * win32: only `.com`/`.exe` files qualify. A name without an extension gets each runnable PATHEXT suffix (empty and
  * shell-only entries such as `.CMD`/`.BAT` are dropped), a name with another extension has no candidates, and a bare name
- * is looked up on PATH. `env` and `platform` are parameters so both platforms' rules are testable anywhere. */
-export function converterCandidates(exe: string, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string[] {
+ * is looked up on PATH. `env`, `platform` and `defaultPath` are parameters so both platforms' rules are testable anywhere. */
+export function converterCandidates(exe: string, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform, defaultPath: string = DEFAULT_PATH): string[] {
   const paths = platform === "win32" ? path.win32 : path.posix;
   let names = [exe];
   if (platform === "win32") {
@@ -26,7 +30,7 @@ export function converterCandidates(exe: string, env: NodeJS.ProcessEnv = proces
       : (env.PATHEXT ?? WIN32_DEFAULT_PATHEXT).split(";").filter(suffix => WIN32_RUNNABLE.has(suffix.toLowerCase())).map(suffix => exe + suffix);
   }
   if (paths.isAbsolute(exe) || /[\\/]/.test(exe)) return names;
-  return (env.PATH ?? "").split(paths.delimiter).filter(Boolean).flatMap(dir => names.map(name => paths.join(dir, name)));
+  return (env.PATH ?? (platform === "win32" ? "" : defaultPath)).split(paths.delimiter).filter(Boolean).flatMap(dir => names.map(name => paths.join(dir, name)));
 }
 /** The access check a converter candidate must pass: execute permission on POSIX; existence on win32, which has no
  * execute bit (runnability there comes from the extension filter in converterCandidates). */
@@ -36,9 +40,9 @@ export function converterAccessMode(platform: NodeJS.Platform = process.platform
 /** The first candidate that is a regular file passing converterAccessMode, or undefined. Health reports the converter
  * available exactly when this finds one, and the converter spawns the path it returns, so both name the same file.
  * `stop` is checked before each candidate so an abandoned health check stops touching the filesystem. */
-export async function resolveConverterExecutable(exe: string, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform, stop: () => boolean = () => false): Promise<string | undefined> {
+export async function resolveConverterExecutable(exe: string, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform, stop: () => boolean = () => false, defaultPath: string = DEFAULT_PATH): Promise<string | undefined> {
   const mode = converterAccessMode(platform);
-  for (const candidate of converterCandidates(exe, env, platform)) {
+  for (const candidate of converterCandidates(exe, env, platform, defaultPath)) {
     if (stop()) return undefined;
     try { if (!(await fs.stat(candidate)).isFile()) continue; await fs.access(candidate, mode); return candidate; } catch {}
   }

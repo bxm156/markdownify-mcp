@@ -30,13 +30,13 @@ export function createConverter(options: { maxOutputBytes: number; projectRoot?:
   return async (inputPath, outputPath, signal) => {
     if (signal.aborted) throw abortError(signal);
     const requested = options.executable ?? resolveMarkitdownPath(options.projectRoot ?? process.cwd());
-    // Spawn the file the health check reports, never a different search result. On POSIX an unresolved name is still
-    // handed to spawn so its error (ENOENT, EACCES) surfaces as before. On win32 spawn would search the working directory
-    // first and could pick a file health never saw, so an unresolved name fails here instead.
+    // Spawn exactly the file the health check reports, never a different search result. A miss fails closed: spawn would
+    // search its own way (an unset or empty PATH, the working directory on win32) and could run a file health never saw.
+    // The code is ENOENT, which the job service maps to INTERNAL_ERROR.
     const executable = await resolveConverterExecutable(requested);
     if (signal.aborted) throw abortError(signal);
-    if (executable === undefined && process.platform === "win32") throw Object.assign(new Error("Converter executable not found"), { code: "ENOENT" });
-    const child = spawn(executable ?? requested, [inputPath], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    if (executable === undefined) throw Object.assign(new Error("Converter executable not found"), { code: "ENOENT" });
+    const child = spawn(executable, [inputPath], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let bytes = 0;
     // Drain stderr without retaining document contents or exposing server paths to clients.
     child.stderr.resume();

@@ -41,7 +41,7 @@ Generate a key without storing it in the image:
 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-`MARKITDOWN_PATH` can point to an installed executable when it is not on PATH or in the project `.venv`. The `/livez` endpoint (alias `/healthz`) is a liveness probe and `/readyz` checks storage and converter presence; neither proves a document can be converted; run the fixture smoke test below for converter validation.
+`MARKITDOWN_PATH` can point to an installed executable when it is not on PATH or in the project `.venv`. A bare name (the default, `markitdown`) is searched on PATH; empty PATH entries are skipped, so the working directory is never searched, and when PATH is unset the search list is `/usr/local/bin:/usr/bin:/bin`. If nothing is found the conversion fails and `/readyz` reports not ready; the server never falls back to a different lookup. The `/livez` endpoint (alias `/healthz`) is a liveness probe and `/readyz` checks storage and converter presence; neither proves a document can be converted; run the fixture smoke test below for converter validation.
 
 ## Docker deployment
 
