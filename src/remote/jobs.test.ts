@@ -104,9 +104,9 @@ describe("durable single tenant jobs", () => {
     await instance.createUpload(principal, { filename: "b.txt", size_bytes: 1 });
   });
   test("running jobs are retained beyond retention and deletion waits for converter termination", async () => {
-    let stopped = false;
+    let stopped = false, reason: unknown;
     const { instance, options } = await service({ retentionMs: 1000, conversionTimeoutMs: 5000, converter: async (_input, _output, signal) => {
-      await new Promise<void>(resolve => signal.addEventListener("abort", () => setTimeout(() => { stopped = true; resolve(); }, 20), { once: true }));
+      await new Promise<void>(resolve => signal.addEventListener("abort", () => { reason = signal.reason; setTimeout(() => { stopped = true; resolve(); }, 20); }, { once: true }));
     } });
     const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
     await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"]));
@@ -114,6 +114,8 @@ describe("durable single tenant jobs", () => {
     setSystemTime(new Date(Date.parse(running.expires_at) + 10)); await instance.cleanup();
     expect((await instance.getStatus(principal, job.upload_id)).status).toBe("running");
     await instance.deleteJob(principal, job.upload_id); expect(stopped).toBe(true);
+    // delete_job is the explicit cancellation path.
+    expect(reason).toMatchObject({ code: "CONVERSION_CANCELLED" });
     await expect(fs.stat(path.join(options.dataDir, job.upload_id))).rejects.toMatchObject({ code: "ENOENT" });
   });
   test("output cap and timeout become readable failure states", async () => {
@@ -127,7 +129,9 @@ describe("durable single tenant jobs", () => {
     } });
     const slow = await timed.createUpload(principal, { filename: "slow.txt", size_bytes: 1 });
     await timed.upload(principal, slow.upload_id, slow.upload_token, Readable.from(["a"])); await timed.startConversion(principal, slow.upload_id);
-    expect((await jobStatus(timed, slow.upload_id, "failed")).error_info).toMatchObject({ code: "CONVERSION_TIMEOUT" });
+    const timedOut = await jobStatus(timed, slow.upload_id, "failed");
+    expect(timedOut.error).toBe("Conversion timed out");
+    expect(timedOut.error_info).toMatchObject({ code: "CONVERSION_TIMEOUT", message: "Conversion timed out", retryable: false, details: { timeout_ms: 20 } });
   });
   test("stalled uploads time out and close and deletion abort pending streams", async () => {
     const { instance, options } = await service({ uploadTtlMs: 30 });
@@ -170,7 +174,7 @@ describe("durable single tenant jobs", () => {
     // Abort only once the child is really running, then require it to be gone.
     const pid = Number(await waitFor(async () => (await fs.readFile(started, "utf8").catch(() => "")).trim(), { label: "hanging converter to start" }));
     abort.abort();
-    expect(await rejection).toMatchObject({ statusCode: 422, code: "CONVERSION_FAILED" });
+    expect(await rejection).toMatchObject({ statusCode: 409, code: "CONVERSION_CANCELLED" });
     expect(() => process.kill(pid, 0)).toThrow();
     const nonzero = path.join(directory, "nonzero.js");
     const failedOutput = path.join(directory, "nonzero.md");

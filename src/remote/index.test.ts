@@ -197,7 +197,7 @@ describe("remote entry point", () => {
     }, TEST_TIMEOUT);
   });
 
-  test("SIGTERM during an in-flight conversion fails the job as cancelled, exits 0, and the next start serves that state", async () => {
+  test("SIGTERM during an in-flight conversion fails the job as CONVERSION_INTERRUPTED, exits 0, and the next start serves that state", async () => {
     const scratch = await tempDir("markdownify-index-scratch-"), dataDir = await tempDir("markdownify-index-");
     const { script, pidFile } = await hangingConverter(scratch);
     const first = start({ port: await freePort(), dataDir, converter: script });
@@ -206,8 +206,9 @@ describe("remote entry point", () => {
     first.child.kill("SIGTERM");
     expect(await terminated(first)).toEqual({ code: 0, signal: null });
     // The in-flight worker is aborted by jobs.close(); its converter is killed and the outcome is persisted before exit.
+    // A graceful restart leaves the same retryable code as crash recovery.
     const persisted = await readJob(first, id);
-    expect(persisted).toMatchObject({ status: "failed", error_code: "CONVERSION_CANCELLED" });
+    expect(persisted).toMatchObject({ status: "failed", error_code: "CONVERSION_INTERRUPTED" });
     await expect(fs.stat(path.join(dataDir, id, "output.part"))).rejects.toMatchObject({ code: "ENOENT" });
     await until(() => { try { process.kill(Number(readFileSync(pidFile, "utf8")), 0); return true; } catch { return false; } }, alive => !alive, "converter to be killed");
 
@@ -216,8 +217,7 @@ describe("remote entry point", () => {
     const { client, call } = await connect(second);
     try {
       const status = await call<{ status: string; error_info: { code: string; retryable: boolean } }>("get_conversion_status", { job_id: id });
-      expect(status.status).toBe("failed");
-      expect(status.error_info.code).toBe("CONVERSION_CANCELLED");
+      expect(status).toMatchObject({ status: "failed", error_info: { code: "CONVERSION_INTERRUPTED", retryable: true } });
     } finally { await client.close(); }
     second.child.kill("SIGTERM");
     expect((await terminated(second)).code).toBe(0);

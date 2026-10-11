@@ -153,7 +153,7 @@ For the direct-ownership model, also confirm in the live deployment:
 - The signer's generated tool scopes allow list and call for the real agents, and a token without the needed scope returns `AUTH_SCOPE_REQUIRED`.
 - Identity refresh and signing-key rotation: a fresh token for the same user ID still reaches that user's jobs, and after rotating the key (new key published, old key removed from the JWKS) tokens signed by the old key are rejected once the JWKS cache refreshes.
 - Through the real gateway, convert real PDF and Office files (upload, `start_conversion`, finite status polling, paginated `get_markdown` retrieval). With a second user, foreign status, read, `start_conversion` and delete calls all return JOB_NOT_FOUND.
-- Queued, interrupted and completed jobs across a Markdownify restart: queued jobs resume, running jobs become `failed` with `CONVERSION_INTERRUPTED` (`init()` in `src/remote/jobs.ts`), completed results stay retrievable, and retention cleanup runs.
+- Queued, interrupted and completed jobs across a Markdownify restart: queued jobs resume, running jobs become `failed` with `CONVERSION_INTERRUPTED` (`close()` on graceful shutdown, `init()` after a crash, in `src/remote/jobs.ts`), completed results stay retrievable, and retention cleanup runs.
 - Record the Markdownify and LiteLLM versions, the image identity and sanitized evidence of these checks.
 
 Client syntax references: [Codex](https://learn.chatgpt.com/docs/extend/mcp?surface=cli), [Claude Code](https://code.claude.com/docs/en/mcp), [Cursor](https://cursor.com/docs/mcp). See [LiteLLM's auth matrix](https://docs.litellm.ai/docs/mcp_config_reference) for the separate gateway and upstream authentication layers.
