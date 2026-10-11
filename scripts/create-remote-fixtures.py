@@ -5,9 +5,14 @@ Usage: python scripts/create-remote-fixtures.py DESTINATION_DIR
 Writes test.docx, test.xlsx and test.pptx into DESTINATION_DIR (created if
 needed). Each holds "Test <EXT> content" and "Office parser verification",
 which remote-converter-smoke.ts expects after conversion. Requires openpyxl
-and python-pptx; a missing argument raises IndexError.
+and python-pptx. A missing argument prints the usage line and exits 2.
 """
 import sys
+
+if len(sys.argv) != 2:
+    print("usage: python scripts/create-remote-fixtures.py DESTINATION_DIR", file=sys.stderr)
+    sys.exit(2)
+
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 from openpyxl import Workbook

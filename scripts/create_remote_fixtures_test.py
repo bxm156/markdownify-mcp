@@ -65,7 +65,8 @@ def main():
 
         # Missing argument must fail loudly rather than write somewhere unexpected.
         bare = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True, timeout=60)
-        check(bare.returncode != 0, "running without a destination argument should fail")
+        check(bare.returncode == 2, f"running without a destination should exit 2, got {bare.returncode}")
+        check("usage:" in bare.stderr, f"missing usage line on stderr: {bare.stderr!r}")
 
     print("create-remote-fixtures.py generated valid DOCX, XLSX and PPTX files")
 

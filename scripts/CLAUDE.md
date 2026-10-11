@@ -11,7 +11,9 @@ Operator tools, CI fixtures and smoke tests for the remote server. Run everythin
 `bun scripts/create-test-agent-registry.ts "$RUNNER_TEMP/markdownify-agents.json" "$GITHUB_ENV"`. Test: `bun test scripts/create-test-agent-registry.test.ts` (also picked up by root `bun test`). Needs only Bun. CI: remote-mvp.yml "Prepare disposable agent registry"; docker-publish.yml "Prepare disposable agent credentials".
 
 **create-remote-fixtures.py** (+ `create_remote_fixtures_test.py`). Writes real OOXML `test.docx/xlsx/pptx` into a directory (created if missing). Needs `openpyxl` and `python-pptx` (from `markitdown[pdf,docx,xlsx,pptx]==0.1.5`). Called by remote-converter-smoke.ts.
-`python scripts/create-remote-fixtures.py /tmp/fixtures`; test: `python scripts/create_remote_fixtures_test.py` and `python -O scripts/create_remote_fixtures_test.py`. CI: remote-mvp.yml "Test the Office fixture generator"; docker-publish.yml same step.
+`python scripts/create-remote-fixtures.py /tmp/fixtures`; with no argument it prints a usage line to stderr and exits 2; test: `python scripts/create_remote_fixtures_test.py` and `python -O scripts/create_remote_fixtures_test.py`. CI: remote-mvp.yml "Test the Office fixture generator"; docker-publish.yml same step.
+
+**check-env-docs.ts**. Cross-checks every `MD_*` name in non-test `src/remote/*.ts` against the variable table in `docs/REMOTE.md`; lists the missing ones and exits 1. Needs only Bun. `bun scripts/check-env-docs.ts`. CI: remote-mvp.yml and docker-publish.yml, right after the typecheck.
 
 **docker-smoke-test.sh** (+ `docker-smoke-test.test.sh`). DOCKER REQUIRED for the script: builds the stdio `Dockerfile`, mounts `src/sample-data`, converts `test.pdf` via `pdf-to-markdown` over stdio, expects "Test PDF content". Env: `IMAGE` (default `markdownify-mcp:smoke`), `SMOKE_TIMEOUT` (default 60 s).
 `bash scripts/docker-smoke-test.sh`. The test file needs no Docker (sources the script, tests `wait_for_response`): `bash scripts/docker-smoke-test.test.sh`. CI: remote-mvp.yml job `stdio-and-compose` (script with `IMAGE=markdownify-mcp:ci`, test file); docker-publish.yml runs the test file only.
@@ -22,7 +24,7 @@ Operator tools, CI fixtures and smoke tests for the remote server. Run everythin
 **remote-converter-smoke.ts** (`bun run test:converter`). In-process `JobService` against real MarkItDown for pdf/docx/xlsx/pptx; generates fixtures first. No server, no dist needed. Python: `$PYTHON_PATH`, else `.venv/bin/python`, else `python`.
 `bun scripts/remote-converter-smoke.ts`. CI: remote-mvp.yml; docker-publish.yml.
 
-**remote-http-smoke.ts**. Single-tenant HTTP flow (list tools, `lookup_error`, binary PUT upload, convert, paginated read, delete) against a running server. Needs a server (default `MCP_URL=http://localhost:8000/mcp`) started with `MD_API_KEY` and `MD_PUBLIC_BASE_URL=http://localhost:8000`; the script reads `MCP_TOKEN` (or `MD_API_KEY`).
+**remote-http-smoke.ts** (`bun run test:http-smoke`). Single-tenant HTTP flow (list tools, `lookup_error`, binary PUT upload, convert, paginated read, delete) against a running server. Needs a server (default `MCP_URL=http://localhost:8000/mcp`) started with `MD_API_KEY` and `MD_PUBLIC_BASE_URL=http://localhost:8000`; the script reads `MCP_TOKEN` (or `MD_API_KEY`).
 `MCP_TOKEN=$MD_API_KEY bun scripts/remote-http-smoke.ts`. CI: remote-mvp.yml "Verify container HTTP upload workflow" only (against the Docker container).
 
 **multitenant-http-smoke.ts**. Three-agent isolation test (a, b same tenant; c other tenant) against a server using `MD_AUTH_FILE`. Needs `MD_TEST_AGENT_KEYS` (JSON with a, b, c, each at least 32 chars) matching the registry; optional `MCP_URL`.
@@ -36,7 +38,7 @@ Local: `bun scripts/create-test-agent-registry.ts /tmp/agents.json /tmp/env.txt`
 
 ## Rules for this folder
 
-- Python must survive `python -O`: no bare `assert` (CI greps `^\s*assert ` in `scripts/*.py` and fails). Use an explicit `raise` or the local `check()` helper. Do not write `assert(...)` either; the grep would miss it but `-O` still strips it.
+- Python must survive `python -O`: no `assert` statements (CI parses `scripts/*.py` with `ast` and fails on any `Assert` node, in any form; the word in comments and strings is fine). Use an explicit `raise` or the local `check()` helper. `mkdocs_hooks.py` is not yet covered (TODO #70).
 - Shell scripts must pass `bash -n` and `shellcheck -x` (CI covers `scripts/*.sh` and `setup.sh`). Keep them sourceable-safe (`main` guarded by `BASH_SOURCE`) if they have a Docker-free test.
 - TypeScript is run with `bun` and type-checked by `bun run typecheck` (`tsconfig.check.json` includes `src`, `scripts`, `examples`). Run it after any edit.
 - Never print secrets: no tokens, `Authorization` headers, `create_upload` results or env dumps. CI tokens are masked with `::add-mask::` before use. Credential files are written 0600 with exclusive create.
