@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable, PassThrough } from "node:stream";
 import { JobService, JobServiceOptions, ServiceError } from "./jobs.js";
 import { createConverter } from "./converter.js";
+import { waitFor } from "./test-helpers.js";
 
 const principal = { tenantId: "tenant-a", agentId: "agent-a" };
 const services: JobService[] = [];
@@ -17,15 +18,10 @@ async function service(overrides: Partial<JobServiceOptions> = {}) {
   const instance = new JobService(options); services.push(instance); await instance.init();
   return { instance, options };
 }
-async function waitFor(instance: JobService, id: string, status: string) {
-  for (let tries = 0; tries < 200; tries++) {
-    const result = await instance.getStatus(principal, id);
-    if (result.status === status) return result;
-    await new Promise(resolve => setTimeout(resolve, 5));
-  }
-  throw new Error(`Job never became ${status}`);
-}
+const jobStatus = (instance: JobService, id: string, status: string) => waitFor(async () => { const result = await instance.getStatus(principal, id); return result.status === status && result; }, { label: `job ${id} to become ${status}` });
+const exists = (file: string) => fs.stat(file).then(() => true, () => false);
 afterEach(async () => {
+  setSystemTime();
   await Promise.all(services.splice(0).map(value => value.close()));
   await Promise.all(directories.splice(0).map(value => fs.rm(value, { recursive: true, force: true })));
 });
@@ -39,7 +35,7 @@ describe("durable single tenant jobs", () => {
     await expect(instance.upload(principal, created.upload_id, "wrong", Readable.from(["test"]))).rejects.toMatchObject({ statusCode: 404 });
     await instance.upload(principal, created.upload_id, created.upload_token, Readable.from(["test"]));
     expect((await instance.startConversion(principal, created.upload_id)).status).toBe("queued");
-    await waitFor(instance, created.upload_id, "completed");
+    await jobStatus(instance, created.upload_id, "completed");
     const page = await instance.getMarkdown(principal, created.upload_id, { max_chars: 3 });
     expect(page).toEqual({ markdown: "# C", next_offset: 3, total_chars: 16 });
     expect((await instance.getMarkdown(principal, created.upload_id, { offset: 3 })).markdown).toBe("onverted\ntest");
@@ -78,7 +74,7 @@ describe("durable single tenant jobs", () => {
     const { instance, options } = await service();
     const finished = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
     await instance.upload(principal, finished.upload_id, finished.upload_token, Readable.from(["a"]));
-    await instance.startConversion(principal, finished.upload_id); await waitFor(instance, finished.upload_id, "completed");
+    await instance.startConversion(principal, finished.upload_id); await jobStatus(instance, finished.upload_id, "completed");
     const queued = await instance.createUpload(principal, { filename: "b.txt", size_bytes: 1 });
     await instance.upload(principal, queued.upload_id, queued.upload_token, Readable.from(["b"]));
     const interrupted = await instance.createUpload(principal, { filename: "c.txt", size_bytes: 1 });
@@ -90,7 +86,7 @@ describe("durable single tenant jobs", () => {
     const { instance: restarted } = await service(options);
     expect((await restarted.getMarkdown(principal, finished.upload_id)).markdown).toBe("# Converted\na");
     expect((await restarted.getStatus(principal, interrupted.upload_id)).error).toBe("Conversion interrupted by server restart");
-    await waitFor(restarted, queued.upload_id, "completed");
+    await jobStatus(restarted, queued.upload_id, "completed");
   });
   test("expiry erases uploaded bytes and releases reservations", async () => {
     const { instance, options } = await service({ retentionMs: 1000, maxJobs: 1 });
@@ -98,7 +94,7 @@ describe("durable single tenant jobs", () => {
     await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"]));
     const uploaded = await instance.getStatus(principal, job.upload_id);
     expect(await fs.readFile(path.join(options.dataDir, job.upload_id, "input.txt"), "utf8")).toBe("a");
-    await new Promise(resolve => setTimeout(resolve, Math.max(0, Date.parse(uploaded.expires_at) - Date.now()) + 10)); await instance.cleanup();
+    setSystemTime(new Date(Date.parse(uploaded.expires_at) + 10)); await instance.cleanup();
     const unavailable = await instance.getStatus(principal, job.upload_id).catch(error => error);
     // The periodic sweep may already remove the tombstone; both states deny
     // access and must leave no input/output while freeing admission capacity.
@@ -114,39 +110,39 @@ describe("durable single tenant jobs", () => {
     } });
     const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
     await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"]));
-    await instance.startConversion(principal, job.upload_id); const running = await waitFor(instance, job.upload_id, "running");
-    await new Promise(resolve => setTimeout(resolve, Math.max(0, Date.parse(running.expires_at) - Date.now()) + 10)); await instance.cleanup();
+    await instance.startConversion(principal, job.upload_id); const running = await jobStatus(instance, job.upload_id, "running");
+    setSystemTime(new Date(Date.parse(running.expires_at) + 10)); await instance.cleanup();
     expect((await instance.getStatus(principal, job.upload_id)).status).toBe("running");
     await instance.deleteJob(principal, job.upload_id); expect(stopped).toBe(true);
-    await expect(fs.stat(path.join(options.dataDir, job.upload_id))).rejects.toThrow();
+    await expect(fs.stat(path.join(options.dataDir, job.upload_id))).rejects.toMatchObject({ code: "ENOENT" });
   });
   test("output cap and timeout become readable failure states", async () => {
     const { instance } = await service({ maxOutputBytes: 2 });
     const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
     await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"])); await instance.startConversion(principal, job.upload_id);
-    expect((await waitFor(instance, job.upload_id, "failed")).error_info).toMatchObject({ code: "OUTPUT_LIMIT_EXCEEDED", details: { limit_bytes: 2 } });
+    expect((await jobStatus(instance, job.upload_id, "failed")).error_info).toMatchObject({ code: "OUTPUT_LIMIT_EXCEEDED", details: { limit_bytes: 2 } });
     await expect(instance.getMarkdown(principal, job.upload_id)).rejects.toMatchObject({ statusCode: 409 });
     const { instance: timed } = await service({ conversionTimeoutMs: 20, converter: async (_input, _output, signal) => {
       await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
     } });
     const slow = await timed.createUpload(principal, { filename: "slow.txt", size_bytes: 1 });
     await timed.upload(principal, slow.upload_id, slow.upload_token, Readable.from(["a"])); await timed.startConversion(principal, slow.upload_id);
-    expect((await waitFor(timed, slow.upload_id, "failed")).error_info).toMatchObject({ code: "CONVERSION_TIMEOUT" });
+    expect((await jobStatus(timed, slow.upload_id, "failed")).error_info).toMatchObject({ code: "CONVERSION_TIMEOUT" });
   });
   test("stalled uploads time out and close and deletion abort pending streams", async () => {
     const { instance, options } = await service({ uploadTtlMs: 30 });
     const stalled = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
     await expect(instance.upload(principal, stalled.upload_id, stalled.upload_token, new PassThrough())).rejects.toMatchObject({ statusCode: 408 });
     expect(await fs.readdir(path.join(options.dataDir, stalled.upload_id))).toEqual(["job.json"]);
-    const { instance: deletable } = await service();
+    const { instance: deletable, options: deletableOptions } = await service();
     const pending = await deletable.createUpload(principal, { filename: "b.txt", size_bytes: 1 });
     const upload = deletable.upload(principal, pending.upload_id, pending.upload_token, new PassThrough());
     const rejected = upload.catch(error => error);
     await deletable.deleteJob(principal, pending.upload_id); expect(await rejected).toMatchObject({ statusCode: 408 });
     const closing = await deletable.createUpload(principal, { filename: "c.txt", size_bytes: 1 });
     const closeUpload = deletable.upload(principal, closing.upload_id, closing.upload_token, new PassThrough());
-    // Let the upload acquire its lock before closing.
-    await new Promise(resolve => setTimeout(resolve, 5));
+    // Wait until the upload holds its lock and has opened its partial file before closing.
+    await waitFor(() => exists(path.join(deletableOptions.dataDir, closing.upload_id, "input.part")), { label: "upload to open its partial file" });
     const closeRejected = closeUpload.catch(error => error);
     await deletable.close(); expect(await closeRejected).toMatchObject({ statusCode: 408 });
   });
@@ -155,7 +151,7 @@ describe("durable single tenant jobs", () => {
     for (let index = 0; index < 3; index++) {
       const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
       await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"]));
-      await new Promise(resolve => setTimeout(resolve, 25)); await instance.cleanup();
+      setSystemTime(new Date(Date.now() + 1000)); await instance.cleanup();
       expect((await fs.readdir(options.dataDir)).filter(name => !name.startsWith(".")).length).toBeLessThanOrEqual(1);
     }
   });
@@ -166,12 +162,16 @@ describe("durable single tenant jobs", () => {
     const converter = createConverter({ executable: process.execPath, maxOutputBytes: 10 });
     await expect(converter(large, path.join(directory, "large.md"), new AbortController().signal)).rejects.toThrow("output limit");
     const hanging = path.join(directory, "hanging.js");
-    await fs.writeFile(hanging, 'setInterval(() => {}, 1000);');
+    const started = path.join(directory, "hanging.pid");
+    await fs.writeFile(hanging, `require("node:fs").writeFileSync(${JSON.stringify(started)}, String(process.pid)); setInterval(() => {}, 1000);`);
     const abort = new AbortController();
     const conversion = converter(hanging, path.join(directory, "hanging.md"), abort.signal);
     const rejection = conversion.catch(error => error);
-    await new Promise(resolve => setTimeout(resolve, 30)); abort.abort();
-    expect(await rejection).toBeInstanceOf(Error);
+    // Abort only once the child is really running, then require it to be gone.
+    const pid = Number(await waitFor(async () => (await fs.readFile(started, "utf8").catch(() => "")).trim(), { label: "hanging converter to start" }));
+    abort.abort();
+    expect(await rejection).toMatchObject({ statusCode: 422, code: "CONVERSION_FAILED" });
+    expect(() => process.kill(pid, 0)).toThrow();
     const nonzero = path.join(directory, "nonzero.js");
     const failedOutput = path.join(directory, "nonzero.md");
     await fs.writeFile(nonzero, 'process.stdout.write("some output"); process.exitCode = 1;');
@@ -181,7 +181,7 @@ describe("durable single tenant jobs", () => {
     // recreating a partial artifact and no Windows open-handle failure.
     await fs.rm(failedOutput);
     await new Promise(resolve => setTimeout(resolve, 10));
-    await expect(fs.stat(failedOutput)).rejects.toThrow();
+    await expect(fs.stat(failedOutput)).rejects.toMatchObject({ code: "ENOENT" });
   });
   test("restart removes crash leftovers before an awaiting upload can be retried", async () => {
     const { instance, options } = await service();
@@ -195,7 +195,7 @@ describe("durable single tenant jobs", () => {
     await fs.mkdir(orphan); await fs.writeFile(path.join(orphan, "input.part"), "partial create");
     const { instance: restarted } = await service(options);
     expect(await fs.readdir(directory)).toEqual(["job.json"]);
-    await expect(fs.stat(orphan)).rejects.toThrow();
+    await expect(fs.stat(orphan)).rejects.toMatchObject({ code: "ENOENT" });
     await restarted.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"]));
     expect((await restarted.getStatus(principal, job.upload_id)).status).toBe("uploaded");
   });
@@ -218,27 +218,29 @@ describe("agent isolation and tenant budgets", () => {
       await expect(instance.deleteJob(actor, job.upload_id)).rejects.toMatchObject({ statusCode: 404 });
     }
     await instance.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"]));
-    await instance.startConversion(principal, job.upload_id); await waitFor(instance, job.upload_id, "completed");
+    await instance.startConversion(principal, job.upload_id); await jobStatus(instance, job.upload_id, "completed");
     await expect(instance.getMarkdown(sibling, job.upload_id)).rejects.toMatchObject({ statusCode: 404 });
     await instance.close(); const { instance: restarted } = await service(options);
     expect((await restarted.getMarkdown(principal, job.upload_id)).markdown).toBe("# Converted\na");
     await expect(restarted.getStatus(sibling, job.upload_id)).rejects.toMatchObject({ statusCode: 404 });
   });
   test("foreign requests cannot cancel or block an owner's upload and conversion", async () => {
-    let aborted = false;
-    const { instance } = await service({ converter: async (_input, output, signal) => {
-      signal.addEventListener("abort", () => { aborted = true; });
-      await new Promise(resolve => setTimeout(resolve, 30)); await fs.writeFile(output, "ok");
+    let aborted = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const { instance, options } = await service({ converter: async (_input, output, signal) => {
+      signal.addEventListener("abort", () => { aborted = true; release(); });
+      await gate; await fs.writeFile(output, "ok");
     } });
     const job = await instance.createUpload(principal, { filename: "a.txt", size_bytes: 1 });
     const stream = new PassThrough(); const pending = instance.upload(principal, job.upload_id, job.upload_token, stream);
-    await new Promise(resolve => setTimeout(resolve, 5));
+    await waitFor(() => exists(path.join(options.dataDir, job.upload_id, "input.part")), { label: "upload to open its partial file" });
     await expect(instance.deleteJob(sibling, job.upload_id)).rejects.toMatchObject({ statusCode: 404 });
     await expect(instance.upload(sibling, job.upload_id, job.upload_token, Readable.from(["a"]))).rejects.toMatchObject({ statusCode: 404 });
     stream.end("a"); await pending;
-    await instance.startConversion(principal, job.upload_id); await waitFor(instance, job.upload_id, "running");
+    await instance.startConversion(principal, job.upload_id); await jobStatus(instance, job.upload_id, "running");
     await expect(instance.deleteJob(foreign, job.upload_id)).rejects.toMatchObject({ statusCode: 404 });
-    await waitFor(instance, job.upload_id, "completed"); expect(aborted).toBe(false);
+    expect(aborted).toBe(false); release();
+    await jobStatus(instance, job.upload_id, "completed"); expect(aborted).toBe(false);
   });
   test("agent and tenant job/storage reservations are atomic and release on delete", async () => {
     const { instance } = await service({ maxJobs: 8, maxStorageBytes: 50_000, maxAgentJobs: 1, maxTenantJobs: 2, maxTenantStorageBytes: 2002 });
@@ -294,7 +296,7 @@ describe("agent isolation and tenant budgets", () => {
     const user = { tenantId: "user-1", agentId: "user-1" };
     for (const [caps, scope] of [[{ maxTenantJobs: 5, maxAgentJobs: 2 }, "agent"], [{ maxTenantJobs: 2, maxAgentJobs: 5 }, "tenant"]] as const) {
       const { instance } = await service({ maxJobs: 10, ...caps });
-      const limits = (await instance.health(user)).limits;
+      const limits = (await instance.health(user) as any).limits;
       expect([limits.tenant_jobs, limits.agent_jobs]).toEqual([caps.maxTenantJobs, caps.maxAgentJobs]);
       await instance.createUpload(user, { filename: "a.txt", size_bytes: 1 }); await instance.createUpload(user, { filename: "b.txt", size_bytes: 1 });
       const denied = await instance.createUpload(user, { filename: "c.txt", size_bytes: 1 }).catch(e => e);
@@ -319,10 +321,10 @@ test("fair scheduler rotates tenants and agents while respecting scoped concurre
     const job = await instance.createUpload(actor, { filename: "a.txt", size_bytes: 1 });
     await instance.upload(actor, job.upload_id, job.upload_token, Readable.from([text]));
     await instance.startConversion(actor, job.upload_id); queued.push({ actor, id: job.upload_id });
-    if (text === "0") await waitFor(instance, job.upload_id, "running");
+    if (text === "0") await jobStatus(instance, job.upload_id, "running");
   }
   release();
-  for (let tries = 0; tries < 100 && order.length < 5; tries++) await new Promise(resolve => setTimeout(resolve, 5));
+  await waitFor(() => order.length >= 5, { label: "all five conversions to start" });
   expect(order).toEqual(["0", "4", "3", "1", "2"]);
 
   let simultaneous = 0, maxSimultaneous = 0;
@@ -333,7 +335,7 @@ test("fair scheduler rotates tenants and agents while respecting scoped concurre
     const job = await scoped.createUpload(principal, { filename: "b.txt", size_bytes: 1 }); ids.push(job.upload_id);
     await scoped.upload(principal, job.upload_id, job.upload_token, Readable.from(["a"])); await scoped.startConversion(principal, job.upload_id);
   }
-  for (const id of ids) await waitFor(scoped, id, "completed");
+  for (const id of ids) await jobStatus(scoped, id, "completed");
   expect(maxSimultaneous).toBe(1);
 });
 

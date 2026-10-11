@@ -8,6 +8,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { JobService } from "./jobs.js";
 import { createHttpServer } from "./http.js";
 import { createAuthenticator, hashToken } from "./auth.js";
+import { waitFor } from "./test-helpers.js";
 
 const disposers: Array<() => Promise<void>> = [];
 afterEach(async () => { while (disposers.length) await disposers.pop()!(); });
@@ -34,20 +35,22 @@ async function fixture() {
     const headers = new Headers(init.headers); headers.set("Host", "127.0.0.1");
     return fetch(`${base}${route}`, { ...init, headers });
   }
-  return { base, client, request, service, options };
+  return { base, client, request, service, options, dataDir };
 }
 function parsed(result: any): any { expect(result.isError).not.toBe(true); return JSON.parse(result.content[0].text); }
+/** Asserts a tool failure and returns its stable machine-readable code. */
+function errorCode(result: any): string { expect(result.isError).toBe(true); return JSON.parse(result.content[0].text).error_info.code; }
 
 test("SDK error envelopes and static lookup guide recovery without disclosing foreign jobs", async () => {
   const { client, request, options } = await fixture(); const a = await client(), b = await client("agent-b-secret");
   const listed = await a.listTools(); expect(listed.tools.every(tool => tool.description && tool.description.length > 80)).toBe(true);
   const tooLarge = await a.callTool({ name: "create_upload", arguments: { filename: "x.pdf", size_bytes: 100001 } });
-  expect(tooLarge.isError).toBe(true);
+  expect(errorCode(tooLarge)).toBe("FILE_TOO_LARGE");
   const failure = JSON.parse((tooLarge.content as any)[0].text);
   expect(failure.error_info).toMatchObject({ code: "FILE_TOO_LARGE", retryable: false, details: { limit_bytes: 100000, requested_bytes: 100001 } });
   const guidance = parsed(await a.callTool({ name: "lookup_error", arguments: { code: failure.error_info.code } }));
   expect(guidance.next_steps.join(" ")).toContain("split");
-  expect((await a.callTool({ name: "lookup_error", arguments: { code: "__proto__" } })).isError).toBe(true);
+  expect(errorCode(await a.callTool({ name: "lookup_error", arguments: { code: "__proto__" } }))).toBe("UNKNOWN_ERROR_CODE");
   const upload = parsed(await a.callTool({ name: "create_upload", arguments: { filename: "x.txt", size_bytes: 1 } }));
   const foreign = await b.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } });
   const missing = await b.callTool({ name: "get_conversion_status", arguments: { job_id: crypto.randomUUID() } });
@@ -69,18 +72,13 @@ test("stateless SDK clients can upload, convert, poll and retrieve across reconn
   const job = parsed(await second.callTool({ name: "start_conversion", arguments: { upload_id: upload.upload_id } }));
   await second.close();
   const third = await client();
-  let status: any;
-  for (let attempt = 0; attempt < 100; attempt++) {
-    status = parsed(await third.callTool({ name: "get_conversion_status", arguments: { job_id: job.job_id } }));
-    if (status.status === "completed") break;
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
+  const status = await waitFor(async () => { const current = parsed(await third.callTool({ name: "get_conversion_status", arguments: { job_id: job.job_id } })); return current.status === "completed" && current; }, { label: "conversion completed" });
   expect(status.status).toBe("completed");
   const page = parsed(await third.callTool({ name: "get_markdown", arguments: { job_id: job.job_id, max_chars: 4 } }));
   expect(page.markdown).toBe("# Co");
   expect(page.next_offset).toBe(4);
   parsed(await third.callTool({ name: "delete_job", arguments: { job_id: job.job_id } }));
-  expect((await third.callTool({ name: "get_conversion_status", arguments: { job_id: job.job_id } })).isError).toBe(true);
+  expect(errorCode(await third.callTool({ name: "get_conversion_status", arguments: { job_id: job.job_id } }))).toBe("JOB_NOT_FOUND");
 });
 
 test("HTTP enforces authentication, host/origin checks and bounded JSON", async () => {
@@ -101,8 +99,8 @@ test("upload token is scoped and tool validation returns isError", async () => {
   const { client, request, options } = await fixture();
   const agent = await client();
   const invalid = await agent.callTool({ name: "create_upload", arguments: { filename: "file.txt", size_bytes: -1, filepath: "/etc/passwd" } });
-  expect(invalid.isError).toBe(true);
-  expect((await agent.callTool({ name: "get_markdown", arguments: { job_id: "not-an-id" } })).isError).toBe(true);
+  expect(errorCode(invalid)).toBe("INVALID_ARGUMENTS");
+  expect(errorCode(await agent.callTool({ name: "get_markdown", arguments: { job_id: "not-an-id" } }))).toBe("INVALID_ARGUMENTS");
   const a = parsed(await agent.callTool({ name: "create_upload", arguments: { filename: "a.txt", size_bytes: 1 } }));
   const b = parsed(await agent.callTool({ name: "create_upload", arguments: { filename: "b.txt", size_bytes: 1 } }));
   expect((await request(`/uploads/${a.upload_id}`, { method: "PUT", headers: { Authorization: `Bearer ${options.apiKey}`, "Content-Type": "application/octet-stream" }, body: "a" })).status).toBe(404);
@@ -125,18 +123,22 @@ test("oversized upload responds clearly and remains retriable", async () => {
 });
 
 test("disconnect during a binary upload preserves the reservation for a retry", async () => {
-  const { client, request, base, options } = await fixture();
+  const { client, request, base, options, dataDir } = await fixture();
   const agent = await client();
   const upload = parsed(await agent.callTool({ name: "create_upload", arguments: { filename: "retry.txt", size_bytes: 5 } }));
-  await new Promise<void>(resolve => {
-    const interrupted = httpRequest(`${base}/uploads/${upload.upload_id}`, { method: "PUT", headers: { ...upload.required_headers, Authorization: `Bearer ${options.apiKey}`, Host: "127.0.0.1", "Content-Length": "5" } });
-    interrupted.on("error", () => resolve());
-    interrupted.write("he");
-    setTimeout(() => interrupted.destroy(new Error("Intentional test disconnect")), 30);
-  });
+  const partial = path.join(dataDir, upload.upload_id, "input.part");
+  const interrupted = httpRequest(`${base}/uploads/${upload.upload_id}`, { method: "PUT", headers: { ...upload.required_headers, Authorization: `Bearer ${options.apiKey}`, Host: "127.0.0.1", "Content-Length": "5" } });
+  const closed = new Promise<void>(resolve => { interrupted.on("error", () => resolve()); });
+  interrupted.write("he");
+  // Disconnect only once the server has actually received the partial body.
+  await waitFor(async () => (await fs.stat(partial).catch(() => undefined))?.size === 2, { label: "server to receive the partial upload" });
+  interrupted.destroy(new Error("Intentional test disconnect")); await closed;
+  await waitFor(async () => !(await fs.stat(partial).catch(() => undefined)), { label: "abandoned partial upload cleanup" });
   const status = parsed(await agent.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } }));
   expect(status.status).toBe("awaiting_upload");
-  expect((await request(`/uploads/${upload.upload_id}`, { method: "PUT", headers: { ...upload.required_headers, Authorization: `Bearer ${options.apiKey}` }, body: "hello" })).status).toBe(204);
+  // The server may still be releasing the aborted request's upload lock (409); the reservation itself must accept a retry.
+  const retry = await waitFor(async () => { const response = await request(`/uploads/${upload.upload_id}`, { method: "PUT", headers: { ...upload.required_headers, Authorization: `Bearer ${options.apiKey}` }, body: "hello" }); return response.status !== 409 && response; }, { label: "upload lock release" });
+  expect(retry.status).toBe(204);
 });
 
 test("each authenticated agent is isolated even within the same tenant", async () => {
@@ -150,7 +152,7 @@ test("each authenticated agent is isolated even within the same tenant", async (
   for (const foreign of [sibling, outsider]) {
     for (const [name, arguments_] of [["start_conversion", { upload_id: upload.upload_id }], ["get_conversion_status", { job_id: upload.upload_id }], ["get_markdown", { job_id: upload.upload_id }], ["delete_job", { job_id: upload.upload_id }]] as const) {
       const response = await foreign.callTool({ name, arguments: arguments_ });
-      expect(response.isError).toBe(true);
+      expect(errorCode(response)).toBe("JOB_NOT_FOUND");
       expect(JSON.parse((response.content as any)[0].text).error).toBe("Job not found");
     }
   }
@@ -162,17 +164,11 @@ test("each authenticated agent is isolated even within the same tenant", async (
   expect((await request(`/uploads/${upload.upload_id}`, { method: "PUT", headers: upload.required_headers, body: "abc" })).status).toBe(401);
   expect((await request(`/uploads/${upload.upload_id}`, { method: "PUT", headers: { ...upload.required_headers, Authorization: `Bearer ${options.apiKey}` }, body: "abc" })).status).toBe(204);
   parsed(await owner.callTool({ name: "start_conversion", arguments: { upload_id: upload.upload_id } }));
-  let state;
-  for (let attempt = 0; attempt < 100; attempt++) {
-    state = parsed(await owner.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } }));
-    if (state.status === "completed") break;
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-  expect(state.status).toBe("completed");
+  await waitFor(async () => parsed(await owner.callTool({ name: "get_conversion_status", arguments: { job_id: upload.upload_id } })).status === "completed", { label: "conversion completed" });
   expect(parsed(await owner.callTool({ name: "get_markdown", arguments: { job_id: upload.upload_id } })).markdown).toContain("abc");
   for (const foreign of [sibling, outsider]) {
     const result = await foreign.callTool({ name: "get_markdown", arguments: { job_id: upload.upload_id } });
-    expect(result.isError).toBe(true);
+    expect(errorCode(result)).toBe("JOB_NOT_FOUND");
     expect(JSON.parse((result.content as any)[0].text).error).toBe("Job not found");
   }
 });
@@ -182,7 +178,7 @@ test("tool arguments cannot override authenticated identity", async () => {
   const agent = await client("agent-b-secret");
   for (const identity of [{ tenant_id: "tenant", agent_id: "a" }, { principal: { tenantId: "tenant", agentId: "a" } }]) {
     const response = await agent.callTool({ name: "create_upload", arguments: { filename: "file.txt", size_bytes: 1, ...identity } });
-    expect(response.isError).toBe(true);
+    expect(errorCode(response)).toBe("INVALID_ARGUMENTS");
     expect(JSON.parse((response.content as any)[0].text).error).toBe("Invalid tool arguments");
   }
 });

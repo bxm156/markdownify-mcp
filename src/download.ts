@@ -33,6 +33,25 @@ const TRY_NEXT_ADDRESS_ERRORS = new Set([
 
 const NO_BODY_STATUSES = [204, 205, 304];
 
+/**
+ * How long one validated address may take to accept a TCP connection before
+ * the next validated address is tried. A route that silently drops packets
+ * (e.g. a black-holed IPv6 path on a dual-stack host) would otherwise stall
+ * until the caller's overall deadline. Only attempts that have another
+ * address after them get this budget; the last address may use whatever
+ * remains of the caller's deadline, so a slow but reachable single-address
+ * host behaves as before.
+ */
+export const CONNECT_TIMEOUT_MS = 5_000;
+
+export type DownloadOptions = {
+  /** Per-address connect budget; see CONNECT_TIMEOUT_MS. */
+  connectTimeoutMs?: number;
+};
+
+/** Progress of one attempt, read by `download.fetch` after a failure. */
+type AttemptState = { connected: boolean };
+
 function createDecoder(contentEncoding: string | null) {
   const encoding = (contentEncoding ?? "").trim().toLowerCase();
   if (encoding === "" || encoding === "identity") return undefined;
@@ -54,13 +73,28 @@ function createDecoder(contentEncoding: string | null) {
   }
 }
 
-/** One request whose DNS lookup is pinned to `selected`. The URL still supplies Host and TLS SNI. */
+/**
+ * One request whose DNS lookup is pinned to `selected`. The URL still supplies
+ * Host and TLS SNI. With `connectTimeoutMs`, the request is destroyed with an
+ * ETIMEDOUT error if its socket has not connected in time.
+ */
 function requestVia(
   url: string,
   selected: ResolvedAddress,
   signal: AbortSignal,
+  connectTimeoutMs: number | undefined,
+  state: AttemptState,
 ): Promise<Response> {
   return new Promise((resolve, reject) => {
+    let connectTimer: ReturnType<typeof setTimeout> | undefined;
+    const stopConnectTimer = () => {
+      if (connectTimer !== undefined) clearTimeout(connectTimer);
+      connectTimer = undefined;
+    };
+    const onConnect = () => {
+      state.connected = true;
+      stopConnectTimer();
+    };
     const parsed = new URL(url);
     const request = (parsed.protocol === "https:" ? https : http).request(parsed, {
       agent: false,
@@ -80,6 +114,7 @@ function requestVia(
         });
       }) as any,
     }, (response) => {
+      onConnect();
       const headers = new Headers();
       for (const [key, value] of Object.entries(response.headers)) {
         if (value !== undefined) headers.set(key, Array.isArray(value) ? value.join(", ") : value);
@@ -103,14 +138,33 @@ function requestVia(
       }
       const status = response.statusCode ?? 500;
       const hasBody = !NO_BODY_STATUSES.includes(status);
-      resolve(new Response(hasBody ? (Readable.toWeb(body) as ReadableStream<Uint8Array>) : null, {
+      resolve(new Response(hasBody ? (Readable.toWeb(body) as unknown as ReadableStream<Uint8Array>) : null, {
         status,
         statusText: response.statusMessage,
         headers,
       }));
       if (!hasBody) response.resume();
     });
-    request.on("error", reject);
+    request.on("error", (error) => {
+      stopConnectTimer();
+      reject(error);
+    });
+    request.on("close", stopConnectTimer);
+    request.on("socket", (socket) => {
+      // An immediate connect error can already have destroyed the socket
+      // (connecting is then false too); that attempt never connected.
+      if (socket.connecting) socket.once("connect", onConnect);
+      else if (!socket.destroyed) onConnect();
+    });
+    if (connectTimeoutMs !== undefined) {
+      connectTimer = setTimeout(() => {
+        connectTimer = undefined;
+        request.destroy(Object.assign(
+          new Error(`Connecting to ${selected.address} timed out after ${connectTimeoutMs} ms`),
+          { code: "ETIMEDOUT" },
+        ));
+      }, connectTimeoutMs);
+    }
     request.end();
   });
 }
@@ -118,21 +172,32 @@ function requestVia(
 export const download = {
   /**
    * Direct connection with DNS pinned to the validated addresses, tried in
-   * order until one accepts the connection. All attempts share `signal`.
+   * order until one accepts the connection. Every address but the last gets
+   * `connectTimeoutMs` (default CONNECT_TIMEOUT_MS) to connect; all attempts
+   * share `signal`, which stays the single overall deadline. Only failures
+   * before the connection is established move on to the next address; once a
+   * socket has connected the request is never retried.
    * HTTP(S)_PROXY is deliberately not used: a proxy would resolve the
    * hostname itself and undo the pinning.
    */
-  async fetch(url: string, addresses: ResolvedAddress[], signal: AbortSignal): Promise<Response> {
+  async fetch(
+    url: string,
+    addresses: ResolvedAddress[],
+    signal: AbortSignal,
+    { connectTimeoutMs = CONNECT_TIMEOUT_MS }: DownloadOptions = {},
+  ): Promise<Response> {
     signal.throwIfAborted();
     if (addresses.length === 0) throw new Error("No validated address");
     let lastError: unknown;
-    for (const address of addresses) {
+    for (const [index, address] of addresses.entries()) {
+      const isLast = index === addresses.length - 1;
+      const state: AttemptState = { connected: false };
       try {
-        return await requestVia(url, address, signal);
+        return await requestVia(url, address, signal, isLast ? undefined : connectTimeoutMs, state);
       } catch (error) {
         lastError = error;
         const code = (error as NodeJS.ErrnoException)?.code;
-        if (signal.aborted || !code || !TRY_NEXT_ADDRESS_ERRORS.has(code)) throw error;
+        if (signal.aborted || state.connected || !code || !TRY_NEXT_ADDRESS_ERRORS.has(code)) throw error;
       }
     }
     throw lastError;

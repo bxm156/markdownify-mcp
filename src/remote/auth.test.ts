@@ -14,10 +14,10 @@ test("credentials map only to trusted principals and support rotation and revoca
   expect(JSON.stringify(auth)).not.toContain("first");
 });
 test("registry validation rejects ambiguous or malformed identities and credentials", () => {
-  for (const registry of [null, [], {}, { credentials: [] }, { credentials: [credential("x")], secret: "plaintext" }, { credentials: [credential("same"), credential("same", "other")] }, { credentials: [{ ...credential("x"), token: "plaintext" }] }, { credentials: [{ ...credential("x"), disabled: "false" }] }, { credentials: [{ ...credential("x"), token_sha256: "bad" }] }]) expect(() => createAuthenticator(registry)).toThrow();
+  for (const registry of [null, [], {}, { credentials: [] }, { credentials: [credential("x")], secret: "plaintext" }, { credentials: [credential("same"), credential("same", "other")] }, { credentials: [{ ...credential("x"), token: "plaintext" }] }, { credentials: [{ ...credential("x"), disabled: "false" }] }, { credentials: [{ ...credential("x"), token_sha256: "bad" }] }]) expect(() => createAuthenticator(registry), JSON.stringify(registry)).toThrow(/^(Invalid credential registry|Credential registry must contain credentials|Invalid credential entry|Duplicate credential hash)$/);
   for (const value of ["", "../escape", "a b", "a".repeat(65), "ümlaut", 1]) {
-    expect(() => createAuthenticator({ credentials: [credential("x", value as string)] })).toThrow();
-    expect(() => createAuthenticator({ credentials: [credential("x", "tenant", value as string)] })).toThrow();
+    expect(() => createAuthenticator({ credentials: [credential("x", value as string)] }), String(value)).toThrow("Invalid principal");
+    expect(() => createAuthenticator({ credentials: [credential("x", "tenant", value as string)] }), String(value)).toThrow("Invalid principal");
   }
   expect(() => createAuthenticator({ credentials: [credential("x", "A_-0", "B_-9")] })).not.toThrow();
 });

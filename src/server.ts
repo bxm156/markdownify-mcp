@@ -14,6 +14,13 @@ const RequestPayloadSchema = z.object({
   compress: z.boolean().optional(),
 });
 
+/** Short, readable summary of the first schema issue, e.g. "Invalid arguments: url: expected string, received number". */
+function formatArgumentError(error: z.ZodError): string {
+  const issue = error.issues[0];
+  const path = issue.path.join(".");
+  return `Invalid arguments: ${path ? `${path}: ` : ""}${issue.message}`;
+}
+
 export function createServer() {
   const server = new Server(
     {
@@ -38,9 +45,13 @@ export function createServer() {
     async (request: CallToolRequest) => {
       const { name, arguments: args } = request.params;
 
-      const validatedArgs = RequestPayloadSchema.parse(args);
-
       try {
+        const parsed = RequestPayloadSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          throw new Error(formatArgumentError(parsed.error));
+        }
+        const validatedArgs = parsed.data;
+
         let result;
         switch (name) {
           case tools.YouTubeToMarkdownTool.name:

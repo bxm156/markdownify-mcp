@@ -188,3 +188,187 @@ test.each([
     },
   );
 });
+
+/**
+ * Wraps the real http.request so that connections to `stalled` addresses never
+ * complete: the pinned lookup simply never answers, leaving the socket in its
+ * connecting state exactly like a route that drops SYN packets, without
+ * depending on how any real IP behaves. Other addresses connect normally.
+ * `onStall` runs when an attempt to a stalled address has started.
+ */
+function stallConnectsTo(stalled: string[], onStall: () => void = () => {}) {
+  const realRequest = http.request.bind(http);
+  const attempts: string[] = [];
+  const requests: http.ClientRequest[] = [];
+  const spy = spyOn(http, "request").mockImplementation(((url: any, options: any, callback: any) => {
+    const lookup = options.lookup;
+    const request = realRequest(url, {
+      ...options,
+      lookup: (host: string, lookupOptions: any, answer: (...args: any[]) => void) => {
+        lookup(host, lookupOptions, (...args: any[]) => {
+          const address = Array.isArray(args[1]) ? args[1][0].address : args[1];
+          attempts.push(address);
+          if (stalled.includes(address)) onStall();
+          else answer(...args);
+        });
+      },
+    }, callback);
+    requests.push(request);
+    return request;
+  }) as any);
+  return { attempts, requests, restore: () => spy.mockRestore() };
+}
+
+test("a stalled connect falls through to the next validated address within the connect budget", async () => {
+  let host: string | undefined;
+  await withServer(
+    (request, response) => {
+      host = request.headers.host;
+      response.end("reachable address");
+    },
+    async (port) => {
+      const stall = stallConnectsTo(["2001:db8::1"]);
+      try {
+        const response = await download.fetch(
+          `http://dual.invalid:${port}/`,
+          [{ address: "2001:db8::1", family: 6 }, ...loopback],
+          // Far beyond the connect budget: success proves the budget, not the deadline, moved on.
+          AbortSignal.timeout(10_000),
+          { connectTimeoutMs: 20 },
+        );
+        expect(await response.text()).toBe("reachable address");
+        expect(stall.attempts).toEqual(["2001:db8::1", "127.0.0.1"]);
+        expect(stall.requests[0].destroyed).toBe(true);
+      } finally {
+        stall.restore();
+      }
+    },
+  );
+  expect(host).toMatch(/^dual\.invalid:\d+$/);
+});
+
+test("the last validated address has no connect budget and stalls until the overall deadline", async () => {
+  const stall = stallConnectsTo(["192.0.2.1", "192.0.2.2"]);
+  const signal = AbortSignal.timeout(300);
+  try {
+    const error = await download.fetch(
+      "http://blackhole.invalid/",
+      [{ address: "192.0.2.1", family: 4 }, { address: "192.0.2.2", family: 4 }],
+      signal,
+      { connectTimeoutMs: 20 },
+    ).then(() => undefined, (error) => error);
+    // Ended by the caller's deadline, not by a second connect timeout.
+    expect(signal.aborted).toBe(true);
+    expect(["AbortError", "TimeoutError"]).toContain(error?.name);
+    expect(error?.code).not.toBe("ETIMEDOUT");
+    expect(stall.attempts).toEqual(["192.0.2.1", "192.0.2.2"]);
+    expect(stall.requests.every((request) => request.destroyed)).toBe(true);
+  } finally {
+    stall.restore();
+  }
+});
+
+test("the overall abort during a stalled connect rejects promptly and clears the connect timer", async () => {
+  const controller = new AbortController();
+  const stall = stallConnectsTo(["192.0.2.1"], () => controller.abort());
+  const realSetTimeout = globalThis.setTimeout;
+  const connectTimers: unknown[] = [];
+  const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+    handler: (...args: any[]) => void, delay?: number, ...args: any[]
+  ) => {
+    const timer = realSetTimeout(handler, delay, ...args);
+    if (delay === 60_000) connectTimers.push(timer);
+    return timer;
+  }) as any);
+  const clearTimeoutSpy = spyOn(globalThis, "clearTimeout");
+  try {
+    await expect(download.fetch(
+      "http://blackhole.invalid/",
+      [{ address: "192.0.2.1", family: 4 }, ...loopback],
+      controller.signal,
+      { connectTimeoutMs: 60_000 },
+    )).rejects.toMatchObject({ name: "AbortError" });
+    expect(stall.attempts).toEqual(["192.0.2.1"]);
+    expect(connectTimers).toHaveLength(1);
+    expect(clearTimeoutSpy).toHaveBeenCalledWith(connectTimers[0] as any);
+  } finally {
+    setTimeoutSpy.mockRestore();
+    clearTimeoutSpy.mockRestore();
+    stall.restore();
+  }
+});
+
+test("a listed error after the connection is established is not retried on another address", async () => {
+  const late = Object.assign(new Error("timed out after connecting"), { code: "ETIMEDOUT" });
+  await withServer(
+    () => { /* never respond */ },
+    async (port) => {
+      const realRequest = http.request.bind(http);
+      const requestSpy = spyOn(http, "request").mockImplementation(((...args: any[]) => {
+        const request = (realRequest as any)(...args) as http.ClientRequest;
+        request.once("socket", (socket) => socket.once("connect", () => request.destroy(late)));
+        return request;
+      }) as any);
+      try {
+        await expect(download.fetch(
+          `http://late.invalid:${port}/`,
+          [...loopback, ...loopback],
+          AbortSignal.timeout(2000),
+          { connectTimeoutMs: 1000 },
+        )).rejects.toBe(late);
+        expect(requestSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        requestSpy.mockRestore();
+      }
+    },
+  );
+});
+
+test("under Node, a stalled connect falls through and every timer is released", async () => {
+  const script = `
+    import assert from 'node:assert/strict';
+    import http from 'node:http';
+    import {download} from ${JSON.stringify(new URL("./download.ts", import.meta.url).href)};
+    const realRequest = http.request;
+    let onStall = () => {};
+    const attempts = [];
+    // Connections to 192.0.2.x never complete: the pinned lookup never answers.
+    http.request = (url, options, callback) => realRequest(url, {...options, lookup: (host, o, answer) =>
+      options.lookup(host, o, (...args) => {
+        const address = Array.isArray(args[1]) ? args[1][0].address : args[1];
+        attempts.push(address);
+        if (address.startsWith('192.0.2.')) onStall(); else answer(...args);
+      })}, callback);
+    const timers = () => process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
+    const server = http.createServer((req, res) => res.end('host=' + req.headers.host));
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+    try {
+      // First address stalls, second succeeds with the original Host.
+      const controller = new AbortController();
+      const response = await download.fetch('http://dual.invalid:' + port + '/',
+        [{address: '192.0.2.1', family: 4}, {address: '127.0.0.1', family: 4}], controller.signal, {connectTimeoutMs: 20});
+      assert.equal(await response.text(), 'host=dual.invalid:' + port);
+      assert.deepEqual(attempts.splice(0), ['192.0.2.1', '127.0.0.1']);
+
+      // Every address stalls; the overall abort ends the last attempt.
+      const all = new AbortController();
+      onStall = () => { if (attempts.length === 2) all.abort(); };
+      await assert.rejects(download.fetch('http://blackhole.invalid/',
+        [{address: '192.0.2.1', family: 4}, {address: '192.0.2.2', family: 4}], all.signal, {connectTimeoutMs: 20}),
+        {name: 'AbortError'});
+      assert.deepEqual(attempts.splice(0), ['192.0.2.1', '192.0.2.2']);
+
+      // Abort during a stall with a long connect budget: no fall-through, no timer left behind.
+      const early = new AbortController();
+      onStall = () => early.abort();
+      await assert.rejects(download.fetch('http://blackhole.invalid/',
+        [{address: '192.0.2.1', family: 4}, {address: '127.0.0.1', family: 4}], early.signal, {connectTimeoutMs: 60000}),
+        {name: 'AbortError'});
+      assert.deepEqual(attempts.splice(0), ['192.0.2.1']);
+      await new Promise(r => setImmediate(r));
+      assert.equal(timers(), 0);
+    } finally {server.closeAllConnections(); await new Promise(r => server.close(r));}
+  `;
+  await promisify(execFile)("node", ["--experimental-strip-types", "--input-type=module", "-e", script], { timeout: 10_000 });
+});

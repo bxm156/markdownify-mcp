@@ -7,6 +7,7 @@ import { Readable } from "node:stream";
 import { JobService, type JobServiceOptions } from "./jobs.js";
 import { ServiceError } from "./errors.js";
 import type { Principal } from "./identity.js";
+import { waitFor } from "./test-helpers.js";
 
 const alice: Principal = { tenantId: "team", agentId: "alice" };
 const bob: Principal = { tenantId: "team", agentId: "bob" };
@@ -19,11 +20,6 @@ async function bounded(promise: Promise<void>) {
   try { await Promise.race([promise, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Timed out waiting for conversion barrier")), 2000); })]); }
   finally { if (timer) clearTimeout(timer); }
 }
-async function eventually<T>(check: () => Promise<T>, accept: (value: T) => boolean, label: string): Promise<T> {
-  const deadline = Date.now() + 2000;
-  while (Date.now() < deadline) { const value = await check(); if (accept(value)) return value; await new Promise(resolve => setTimeout(resolve, 5)); }
-  throw new Error(`Timed out waiting for ${label}`);
-}
 async function service(overrides: Partial<JobServiceOptions> = {}) {
   const dataDir = overrides.dataDir ?? await fs.mkdtemp(path.join(os.tmpdir(), "markdownify-lifecycle-"));
   if (!directories.includes(dataDir)) directories.push(dataDir);
@@ -35,7 +31,7 @@ async function uploaded(instance: JobService, actor: Principal, content = "x") {
   const job = await instance.createUpload(actor, { filename: "file.txt", size_bytes: Buffer.byteLength(content) });
   await instance.upload(actor, job.upload_id, job.upload_token, Readable.from([content])); return job.upload_id;
 }
-const status = (instance: JobService, actor: Principal, id: string, desired: string) => eventually(() => instance.getStatus(actor, id), value => value.status === desired, `${id}: ${desired}`);
+const status = (instance: JobService, actor: Principal, id: string, desired: string) => waitFor(async () => { const current = await instance.getStatus(actor, id); return current.status === desired && current; }, { label: `${id}: ${desired}` });
 afterEach(async () => {
   for (const release of releaseGates.splice(0)) release();
   for (const child of children.splice(0)) if (child.exitCode === null) child.kill("SIGKILL");
@@ -72,7 +68,7 @@ for(let i=0;i<actors.length;i++){const actor=actors[i];const job=await service.c
 process.stdout.write(JSON.stringify(ids)+'\\n');`);
     const child = spawn(process.execPath, [workerFile], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }); children.push(child);
     let stdout = "", stderr = ""; child.stdout!.on("data", chunk => { stdout += chunk.toString(); }); child.stderr!.on("data", chunk => { stderr += chunk.toString(); });
-    await eventually(async () => ({ stdout, exited: child.exitCode !== null }), value => value.stdout.includes("\n") || value.exited, "crash worker readiness");
+    await waitFor(() => stdout.includes("\n") || child.exitCode !== null, { label: "crash worker readiness" });
     if (!stdout.includes("\n")) throw new Error(`Worker exited: ${stderr}`);
     const ids: string[] = JSON.parse(stdout.trim());
     const before = await Promise.all(ids.map(id => fs.readFile(path.join(dataDir, id, "job.json"), "utf8").then(JSON.parse)));
@@ -102,9 +98,9 @@ process.stdout.write(JSON.stringify(ids)+'\\n');`);
     const blocked = scope === "global" ? carol : scope === "tenant" ? bob : alice;
     await expect(instance.createUpload(blocked, { filename: "blocked.txt", size_bytes: 1 })).rejects.toMatchObject({ statusCode: 507 });
     expect(await fs.stat(path.join(options.dataDir, id, "output.md.index.json")).then(value => value.isFile())).toBe(true);
-    await eventually(async () => { await instance.cleanup(); return fs.readdir(path.join(options.dataDir, id)).catch(() => []); }, files => !files.includes("output.md"), "expiration cleanup");
-    await expect(fs.stat(path.join(options.dataDir, id, "input.txt"))).rejects.toThrow();
-    await expect(fs.stat(path.join(options.dataDir, id, "output.md.index.json"))).rejects.toThrow();
+    await waitFor(async () => { await instance.cleanup(); return !(await fs.readdir(path.join(options.dataDir, id)).catch((): string[] => [])).includes("output.md"); }, { label: "expiration cleanup" });
+    await expect(fs.stat(path.join(options.dataDir, id, "input.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(path.join(options.dataDir, id, "output.md.index.json"))).rejects.toMatchObject({ code: "ENOENT" });
     const replacement = await instance.createUpload(blocked, { filename: "replacement.txt", size_bytes: 1 });
     await instance.deleteJob(blocked, replacement.upload_id);
     const own = await instance.createUpload(alice, { filename: "own.txt", size_bytes: 1 }); expect(own.upload_id).not.toBe(id);
@@ -135,7 +131,7 @@ process.stdout.write(JSON.stringify(ids)+'\\n');`);
     // A real directory at the manifest target prevents atomic file rename on
     // Windows and Linux, without mocking the implementation or filesystem API.
     await fs.rename(manifest, backup); await fs.mkdir(manifest);
-    await expect(instance.startConversion(alice, id)).rejects.toThrow(); expect(calls).toBe(0);
+    await expect(instance.startConversion(alice, id)).rejects.toMatchObject({ code: expect.stringMatching(/^(EISDIR|EPERM|EACCES)$/) }); expect(calls).toBe(0);
     expect((await instance.getStatus(alice, id)).status).toBe("uploaded");
     await fs.rmdir(manifest); await fs.rename(backup, manifest);
     await instance.startConversion(alice, id); await status(instance, alice, id, "completed");

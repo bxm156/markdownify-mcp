@@ -40,7 +40,10 @@ def _walk(exc, seen=None):
     yield from _walk(exc.__context__, seen)
     # ExceptionGroup / BaseExceptionGroup (Python 3.11+); the MCP SDK and anyio raise these.
     # Skip a malformed .exceptions so the walk cannot raise inside an except handler and mask the diagnostic.
-    inners = getattr(exc, "exceptions", None)
+    try:
+        inners = getattr(exc, "exceptions", None)
+    except Exception:  # a raising .exceptions property is malformed too
+        inners = None
     for inner in inners if isinstance(inners, (list, tuple)) else ():
         if isinstance(inner, BaseException):
             yield from _walk(inner, seen)
@@ -77,6 +80,13 @@ def self_test():
         if GROUPS:
             nested = ExceptionGroup("mcp", [RuntimeError("wrapper"), ExceptionGroup("inner", [_status_error(module, 401)])])
             check(has_http_401(nested), f"{name} 401 nested in exception groups not recognised")
+            # anyio cancellation produces a BaseExceptionGroup (not ExceptionGroup) when a member is a BaseException.
+            base_group = BaseExceptionGroup("cancelled", [asyncio.CancelledError(), _status_error(module, 401)])
+            check(type(base_group) is BaseExceptionGroup and has_http_401(base_group), f"{name} 401 in BaseExceptionGroup not recognised")
+            check(not has_http_401(BaseExceptionGroup("cancelled", [asyncio.CancelledError(), _status_error(module, 500)])),
+                  f"{name} 500 in BaseExceptionGroup misclassified as 401")
+            mixed = ExceptionGroup("mcp", [_status_error(module, 500), _status_error(module, 401)])
+            check(http_status_codes(mixed) == [401, 500] and has_http_401(mixed), f"{name} mixed 401+500 group not fully reported")
         chained = RuntimeError("session failed")
         chained.__cause__ = _status_error(module, 401)
         check(has_http_401(chained), f"{name} 401 via __cause__ not recognised")
@@ -90,15 +100,24 @@ def self_test():
         check(not has_http_401(ExceptionGroup("mcp", [TimeoutError("http://127.0.0.1:40123/mcp")])), "grouped timeout misclassified")
     else:
         print("Python < 3.11: skipping ExceptionGroup classifier cases")
-    for malformed in ([None, "x", 401], 401, "401"):
+    for malformed in ([None, "x", 401], 401, "401", {401: None}, (e for e in ()), object()):
         odd = RuntimeError("odd group")
         odd.exceptions = malformed
         check(http_status_codes(odd) == [], f"malformed .exceptions {malformed!r} not ignored")
+
+    class RaisingExceptions(RuntimeError):
+        @property
+        def exceptions(self):
+            raise ValueError("broken .exceptions")
+    check(http_status_codes(RaisingExceptions("odd")) == [], "raising .exceptions property not ignored")
+    tuple_group = RuntimeError("tuple group")
+    tuple_group.exceptions = ("x", _status_error(httpx, 401))
+    check(has_http_401(tuple_group), "401 in a tuple-valued .exceptions not recognised")
     check(http_status_codes(TimeoutError("x")) == [], "no status codes expected for a timeout")
 
 
-async def verify(base):
-    client = MCPClient(server_url=base + "/mcp", extra_headers={"Host": "127.0.0.1"}, timeout=10)
+async def verify(base, timeout=10):
+    client = MCPClient(server_url=base + "/mcp", extra_headers={"Host": "127.0.0.1"}, timeout=timeout)
     async def noop(session):
         await session.send_ping()
         return "ok"

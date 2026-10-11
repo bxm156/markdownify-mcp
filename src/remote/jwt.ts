@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, customFetch, jwtVerify, type JWTVerifyGetKey } from "jose";
+import { createRemoteJWKSet, customFetch, jwtVerify, type FetchImplementation, type JWTVerifyGetKey } from "jose";
 import { validatePrincipal, type Principal } from "./identity.js";
 import type { Authenticator, AuthenticatedPrincipal } from "./auth.js";
 
@@ -13,7 +13,7 @@ function trustedUrl(value: string, allowLoopback: boolean) {
   if (u.username || u.password || u.hash || u.search || (u.protocol !== "https:" && !(allowLoopback && u.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname)))) throw new Error("JWT issuer/JWKS URLs require HTTPS (explicit loopback HTTP is test-only)");
   return u;
 }
-const boundedJwksFetch: typeof fetch = async (input, init) => {
+const boundedJwksFetch: FetchImplementation = async (input, init) => {
   const response = await fetch(input, init);
   if (response.status !== 200 || !response.body) return response;
   const reader = response.body.getReader(), chunks: Uint8Array[] = []; let size = 0;

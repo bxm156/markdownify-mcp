@@ -167,6 +167,36 @@ New manifests persist immutable owner IDs. For a fresh deployment, leave `MD_LEG
 
 Audit records live in `MD_DATA_DIR/audit.jsonl`, with timestamps, tenant/agent IDs, job IDs, event/status codes, and limited reason codes. They exclude filenames, document content, and bearer/upload tokens. Rotation bounds local history to a 4 MiB active file and three archives. Export metadata to your logging system if longer retention is needed. Audit metadata itself identifies agents and should have restricted operator access.
 
+### Audited events
+
+Each record's `status` is the job's state when the event happened. Events written on behalf of a caller are written before the operation runs; if that write fails, the operation is refused with `AUDIT_UNAVAILABLE` (HTTP 503) and nothing changes:
+
+| Event | When | Fields besides tenant/agent |
+| --- | --- | --- |
+| `create_upload` | `create_upload` passed admission | none |
+| `quota_denied` | `create_upload` refused by a job or storage cap | `reason: capacity_exhausted` |
+| `authorization_denied` | Any job operation or upload PUT on a job ID the caller does not own or that does not exist, or a wrong upload token | `job_id` (when UUID-shaped), `reason: job_not_found` |
+| `upload` | Upload PUT accepted, before bytes are read | `job_id`, `status` |
+| `start_conversion` | Every `start_conversion` call on an unexpired job, including idempotent repeats | `job_id`, `status` |
+| `read_status` | `get_conversion_status`, coalesced (below) | `job_id`, `status` |
+| `read_markdown` | `get_markdown`, coalesced (below) | `job_id`, `status` |
+| `delete_job` | `delete_job`, before work is cancelled and files are removed | `job_id` |
+
+Lifecycle events are written after the state change has been committed. A failed write is logged to stderr as `Job audit unavailable` with the event and job ID and does not roll the change back:
+
+| Event | When |
+| --- | --- |
+| `create_upload_completed` | The upload reservation was saved |
+| `upload_completed` / `upload_failed` | An upload finished or was rejected (size mismatch, timeout, disconnect) |
+| `conversion_completed` / `conversion_failed` | A conversion finished |
+| `job_expired` | Retention cleanup erased a job's files and left a tombstone |
+
+`get_service_health`, `lookup_error`, `tools/list`, `/livez`, `/readyz`, anonymous `initialize`/`ping` and rejected credentials (HTTP 401) are not audited.
+
+`read_status` and `read_markdown` are coalesced because agents poll status with backoff and read Markdown page by page. Each is recorded once per job for each job state the owner observes. A poll loop therefore writes at most one `read_status` record per state (for example `awaiting_upload`, `uploaded`, `queued`, `running`, `completed`), and retrieving every page of a completed result, or retrieving it again, writes one `read_markdown` record. A read whose audit write failed is not counted as recorded, so the owner's retry writes it. A coalesced read does not touch the audit sink, so it succeeds even while the sink is failing; the first read of a new state still fails closed. The record of what has been seen is kept in memory per job and dropped when the job is deleted or its tombstone is removed, so it is bounded by the job limits. After a restart, the first read of each state is recorded again. `authorization_denied`, `quota_denied` and every other event are never coalesced or sampled: repeated denied attempts each write a record.
+
+Readiness reports the audit sink. After a failed audit write, from a caller's operation or a lifecycle event, `checks.audit.available` is `false` and `/readyz` returns 503 until a write succeeds. Because a replica removed from service by its readiness probe gets no traffic to write with, readiness also runs a recovery probe while the sink is failing: it opens `audit.jsonl` for append without writing anything, then requires free space on its filesystem. This probe runs at most once every two seconds, is shared by concurrent health checks and is bounded by the five-second health timeout. Health checks never write audit records. See [HEALTH.md](HEALTH.md).
+
 This milestone supplies application-level file isolation for distinct credentials, bounded resources, and restart-safe ownership. The converter subprocess is not a security sandbox against malicious document parser exploits. Use trusted document sources or additional parser isolation for hostile uploads. Multiple service replicas, distributed storage/queues, and a credential-management UI remain separate work.
 
 ## Inspecting and purging a retired user's artifacts

@@ -11,8 +11,14 @@ export interface AuditEvent {
   reason?: string;
 }
 
+/**
+ * A sink accepts one metadata record per call. The optional probe checks, without writing a record, whether a write
+ * could currently succeed; readiness calls it only while the last write failed, so a drained replica can recover.
+ */
+export type AuditLogger = ((event: AuditEvent) => Promise<void>) & { probe: () => Promise<void> };
+
 /** Metadata only. Serialize writes and cap local history with bounded rotation. */
-export async function createAuditLogger(directory: string, options: { maxBytes?: number; archives?: number } = {}): Promise<(event: AuditEvent) => Promise<void>> {
+export async function createAuditLogger(directory: string, options: { maxBytes?: number; archives?: number } = {}): Promise<AuditLogger> {
   const maxBytes = options.maxBytes ?? 4 * 1024 * 1024;
   const archives = options.archives ?? 3;
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1024 || !Number.isSafeInteger(archives) || archives < 1 || archives > 10) throw new Error("Invalid audit limits");
@@ -23,7 +29,7 @@ export async function createAuditLogger(directory: string, options: { maxBytes?:
   await fs.chmod(target, 0o600);
   let size = (await fs.stat(target)).size;
   let pending: Promise<void> = Promise.resolve();
-  return event => {
+  const write = (event: AuditEvent) => {
     const operation = pending.catch(() => undefined).then(async () => {
       const principal = validatePrincipal({ tenantId: event.tenant_id, agentId: event.agent_id });
       const code = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value);
@@ -52,4 +58,13 @@ export async function createAuditLogger(directory: string, options: { maxBytes?:
     pending = operation;
     return operation;
   };
+  // Opens the active file for append (creating it as a write would) and closes it without writing a byte, then requires
+  // free space. Detects a missing/replaced directory, permissions and read-only mounts; a full disk only via statfs.
+  const probe = async () => {
+    const handle = await fs.open(target, "a", 0o600);
+    await handle.close();
+    const stat = await fs.statfs(directory);
+    if (stat.bavail * stat.bsize <= 0) throw new Error("Audit storage full");
+  };
+  return Object.assign(write, { probe });
 }
