@@ -103,13 +103,15 @@ describe("data-directory lock", () => {
     expect(log).toEqual([]);
   });
 
+  // The 10 ms heartbeat tests below wait on real timers; under a loaded CI runner a few beats can take well over
+  // waitFor's default 2 s, so they get a long deadline (they still finish in milliseconds when idle).
   test("the heartbeat rewrites the file with a fresh mtime and heartbeat while keeping the token", async () => {
     const directory = await dataDir();
     let clock = 1000;
     const { real, lines } = await acquire(directory, { heartbeatMs: 10, now: () => ++clock });
     const token = await tokenIn(directory);
     const old = new Date(Date.now() - 600_000); await fs.utimes(lockFile(directory), old, old);
-    const refreshed = await waitFor(async () => { const [stat, text] = await Promise.all([fs.stat(lockFile(directory)), fs.readFile(lockFile(directory), "utf8")]); return stat.mtimeMs > old.getTime() + 300_000 && text; }, { label: "heartbeat to refresh the lock" });
+    const refreshed = await waitFor(async () => { const [stat, text] = await Promise.all([fs.stat(lockFile(directory)), fs.readFile(lockFile(directory), "utf8")]); return stat.mtimeMs > old.getTime() + 300_000 && text; }, { label: "heartbeat to refresh the lock", timeoutMs: 15_000 });
     expect(refreshed.split("\n")[1]).toBe(token);
     expect(Number(/heartbeat=(\d+)/.exec(refreshed)![1])).toBeGreaterThan(1001);
     expect((await fs.stat(lockFile(directory))).mode & 0o777).toBe(0o600);
@@ -233,13 +235,13 @@ describe("data-directory lock", () => {
     }) as typeof fs.rename);
     try {
       const { events } = await acquire(directory, { heartbeatMs: 10 });
-      await waitFor(() => failures >= 5, { label: "several failed heartbeats" });
+      await waitFor(() => failures >= 5, { label: "several failed heartbeats", timeoutMs: 15_000 });
       expect(events()).toEqual([{ event: "lock_heartbeat_failed", code: "EIO" }]);
       failWith = undefined;
-      await waitFor(() => successes >= 1, { label: "a successful heartbeat" });
+      await waitFor(() => successes >= 1, { label: "a successful heartbeat", timeoutMs: 15_000 });
       expect(events()).toHaveLength(1);
       failWith = "ENOSPC"; const before = failures;
-      await waitFor(() => failures >= before + 5, { label: "a second run of failures" });
+      await waitFor(() => failures >= before + 5, { label: "a second run of failures", timeoutMs: 15_000 });
       expect(events()).toEqual([{ event: "lock_heartbeat_failed", code: "EIO" }, { event: "lock_heartbeat_failed", code: "ENOSPC" }]);
       // A failed rewrite never leaves its temporary behind.
       expect(await strays(directory)).toEqual([]);
