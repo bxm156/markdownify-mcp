@@ -5,7 +5,9 @@ on:
 permissions:
   contents: read
 jobs:
-  remote:
+  # Matrix legs report as "remote-node (22)" / "remote-node (24)"; the `remote` gate job below is the
+  # single required status check for branch protection and fails unless every leg succeeded.
+  remote-node:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Node 24 is the image default; Node 22 stays covered until engines.node moves past it.
@@ -144,6 +146,18 @@ jobs:
           MCP_TOKEN="$(jq -r .a <<<"$MD_TEST_AGENT_KEYS")" CONVERSION_DEADLINE_MS=120000 \
             bun examples/upload-and-convert.ts src/sample-data/test.pdf "$example_output"
           grep -q 'Test PDF content' "$example_output"
+  remote:
+    # Required status check: collapses the Node matrix into one stable name. `if: always()` so a failed or
+    # cancelled leg still reports (a skipped job would otherwise count as a pass).
+    needs: remote-node
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every Node leg to pass
+        run: |
+          echo "remote-node result: ${{ needs.remote-node.result }}"
+          test "${{ needs.remote-node.result }}" = "success"
   stdio-and-compose:
     runs-on: ubuntu-latest
     timeout-minutes: 25

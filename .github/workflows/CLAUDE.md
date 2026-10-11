@@ -21,7 +21,7 @@ workflows use `permissions: contents: read` unless stated.
 
 Triggers: every `push` and `pull_request`. No secrets.
 
-- Job `remote` (15 min, matrix `node: [22, 24]`, `fail-fast: false`): first checks that
+- Job `remote-node` (15 min, matrix `node: [22, 24]`, `fail-fast: false`; the `remote` gate job needs it with `if: always()` and is the one required status check for branch protection): first checks that
   `node --version` on PATH is the leg's major (Node-only tests would otherwise skip
   silently); `bun install --frozen-lockfile --ignore-scripts`;
   `bun run typecheck` (tests, scripts, examples); `bun scripts/check-env-docs.ts`
