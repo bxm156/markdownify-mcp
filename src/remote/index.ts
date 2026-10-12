@@ -3,14 +3,11 @@
  * Entry point of the remote (Streamable HTTP) Markdownify server.
  *
  * Linux-only: startup is refused on Windows before configuration is read or the data directory is touched. The remote
- * tree is compiled by tsc and run under Node 22+ (`node dist/remote/index.js`), so it must not use Bun-only APIs; Bun
+ * tree is compiled by tsc and run under Node 24.2+ (`node dist/remote/index.js`), so it must not use Bun-only APIs; Bun
  * only builds and tests it. Importing this module never starts a server (see isEntryPoint), so tests drive
  * startRemoteServer with injected dependencies instead.
  */
-import fs from "node:fs";
-import path from "node:path";
 import type { Server } from "node:http";
-import { fileURLToPath } from "node:url";
 import { loadConfig, SHUTDOWN_TIMEOUT_WARN_MS, WINDOWS_UNSUPPORTED_MESSAGE } from "./config.js";
 import { createHttpServer } from "./http.js";
 import { JobService } from "./jobs.js";
@@ -121,15 +118,10 @@ export async function startRemoteServer(options: RemoteServerOptions): Promise<R
 
 /**
  * True only when this module is the program being run, so importing it (for example from a test) never starts a server.
- * Bun and Node 22.18+ / 24.2+ provide `import.meta.main`; older Node (including 24.0 and 24.1) compares the resolved
- * script path with this module's file.
+ * Requires `import.meta.main`, which Node 24.2+ (engines.node) and Bun provide.
  */
 function isEntryPoint(): boolean {
-  const flag = (import.meta as { main?: boolean }).main;
-  if (typeof flag === "boolean") return flag;
-  const script = process.argv[1];
-  if (!script) return false;
-  try { return fs.realpathSync(path.resolve(script)) === fs.realpathSync(fileURLToPath(import.meta.url)); } catch { return false; }
+  return import.meta.main;
 }
 
 /**

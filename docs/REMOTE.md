@@ -19,7 +19,7 @@ The allowlist is PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, HTML, and JSON. The remote
 
 The remote server supports Linux only and ships as a Linux container image. The process refuses to start on Windows; run the container instead, for example with Docker Desktop (see [CONTAINERS.md](CONTAINERS.md)).
 
-Use Bun for this repository's package management. The portable remote build produces JavaScript runnable with Node 22 or later; the container image uses Node 24, and CI tests both.
+Use Bun for this repository's package management. The portable remote build produces JavaScript runnable with Node 24.2 or later (`engines.node`); the container image uses Node 24, the only major CI tests.
 
 ```sh
 bun install --frozen-lockfile --ignore-scripts
@@ -28,13 +28,13 @@ python -m venv .venv
 bun run build:remote
 ```
 
-Copy `.env.remote.example` to `.env.remote`, set `MD_API_KEY` to a random secret of at least 32 characters, and load its values into the environment of the server process. The native Node entry does not automatically load `.env.remote`. Node 22 and later can load it explicitly:
+Copy `.env.remote.example` to `.env.remote`, set `MD_API_KEY` to a random secret of at least 32 characters, and load its values into the environment of the server process. The native Node entry does not automatically load `.env.remote`. Node can load it explicitly:
 
 ```sh
 node --env-file=.env.remote dist/remote/index.js
 ```
 
-Always start the server with the full `dist/remote/index.js` path, as above, as `bun run start:remote` does and as the image's `CMD` does. The module only starts a server when it is the program being run. Node releases that provide `import.meta.main` (22.18 and later 22.x, 24.2 and later) and Bun detect that directly; older Node, including Node 24.0 and 24.1, compares the started script path with the module's own file. There, `node dist/remote/index` (no `.js`) or `node dist/remote` loads the module but never starts the server, and the process exits with status 0 and no output.
+Always start the server with the full `dist/remote/index.js` path, as above, as `bun run start:remote` does and as the image's `CMD` does. The module only starts a server when it is the program being run, which it detects with `import.meta.main`; Node 24.2+ and Bun provide `import.meta.main`.
 
 Generate a key without storing it in the image:
 
@@ -46,7 +46,7 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 
 ## Node runtime
 
-The image runs Node 24, which builds OpenSSL at security level 2 where Node 22 used level 1: a TLS server that uses an RSA or DH key under 2048 bits, or an EC key under 224 bits, is now refused. A certificate with such a key fails verification (Node reports it as `UNSPECIFIED`, "EE certificate key too weak"). Neither Markdownify server has a setting to lower the level; the server on the other end has to replace its key. For this service that affects the HTTPS JWKS fetch (`MD_JWT_JWKS_URL`): an issuer serving its JWKS with such a key cannot authenticate any token. Uploads are not affected. The stdio server's URL downloads follow the same rule when it runs under Node 24 or later (for example through the package's `node` entry): a weak-key server fails with a verification error and the download is not retried on the host's other addresses. Under Bun, which does not use OpenSSL security levels, such a server is still accepted.
+The image runs Node 24, which builds OpenSSL at security level 2 where Node 22 used level 1: a TLS server that uses an RSA or DH key under 2048 bits, or an EC key under 224 bits, is now refused. A certificate with such a key fails verification (Node reports it as `UNSPECIFIED`, "EE certificate key too weak"). Neither Markdownify server has a setting to lower the level; the server on the other end has to replace its key. For this service that affects the HTTPS JWKS fetch (`MD_JWT_JWKS_URL`): an issuer serving its JWKS with such a key cannot authenticate any token. Uploads are not affected. The stdio server's URL downloads follow the same rule when it runs under Node (for example through the package's `node` entry): a weak-key server fails with a verification error and the download is not retried on the host's other addresses. Under Bun, which does not use OpenSSL security levels, such a server is still accepted.
 
 ## Docker deployment
 

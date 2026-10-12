@@ -2,7 +2,7 @@
 
 `upload-and-convert.ts` is the reference client for the remote server: connect over MCP Streamable HTTP, discover tools (direct or LiteLLM-prefixed), `create_upload`, stream the file with `PUT` to the returned scoped URL, `start_conversion`, poll `get_conversion_status` with backoff, then read `get_markdown` page by page (`next_offset`) into a new output file. It never overwrites output and never logs upload credentials.
 
-Run (from the repo root, server already running), under Bun or Node 22.18+ (earlier 22.x: add `--experimental-strip-types`):
+Run (from the repo root, server already running), under Bun or Node 24.2+ (`engines.node`; type stripping is on by default):
 `MCP_TOKEN=<token> bun examples/upload-and-convert.ts src/sample-data/test.pdf out.md`
 `MCP_TOKEN=<token> node examples/upload-and-convert.ts src/sample-data/test.pdf out.md`
 Env: `MCP_URL` (default `http://localhost:8000/mcp`), `MCP_TOKEN` (direct), or gateway mode with `LITELLM_API_KEY` + `MARKDOWNIFY_BASE_URL` (+ optional `MARKDOWNIFY_AGENT_TOKEN`, `MARKDOWNIFY_SERVER_ALIAS`), `CONVERSION_DEADLINE_MS` (default 300000). Plain HTTP only for loopback.

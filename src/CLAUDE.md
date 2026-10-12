@@ -3,7 +3,7 @@
 Scope: the files directly in `src/`. `src/remote/` is the separate HTTP service and has its own notes. The one cross-dependency: `remote/converter.ts` and `remote/health.ts` import `resolveMarkitdownPath` from `utils.ts`, so changing it affects both servers.
 
 ## Purpose and entry point
-- Fork of upstream `zcaceres/markdownify-mcp`. Package `mcp-markdownify-server`; `bin` is `dist/index.js` (`tsc` output, `#!/usr/bin/env node`). `engines.node >= 22`.
+- Fork of upstream `zcaceres/markdownify-mcp`. Package `mcp-markdownify-server`; `bin` is `dist/index.js` (`tsc` output, `#!/usr/bin/env node`). `engines.node >= 24.2`.
 - `index.ts`: sets `PYTHONUTF8=1`, installs the shutdown handlers, calls `warnIfProxyConfigured()` (`proxyWarning.ts`, stderr note: URL downloads never use `HTTP(S)_PROXY`), connects `createServer()` to `StdioServerTransport`. stdout carries the protocol: never `console.log`, use `console.error`.
 - Shutdown: converters run in their own process group, so signals sent to the server (or to the terminal's group on Ctrl+C) do not reach them. `installShutdownHandlers` adds `process.once` handlers for SIGHUP, SIGINT and SIGTERM that call `killActiveTools()` and then `process.exit(128 + signal number)`: 129, 130, 143 (an exit status, not a re-raised signal, so it behaves the same under Node, Bun and on Windows). A `process.once("exit")` handler calls `killActiveTools()` again for any other exit (stdin closed, fatal error); it must stay synchronous. Only `index.ts` installs handlers: importing `Markdownify.ts` (tests do) installs none. SIGKILL of the server cannot be handled; its converters then run until their own timeout. A signal exit skips `withStagingDir`'s `finally`, so that call's staging directory stays in `os.tmpdir()`.
 - Must run under the user's Node or Bun (`bun start` = `bun dist/index.js`). macOS, Linux and Windows are all supported here (`setup.sh` / `setup.bat`; `preinstall.js` picks one). Tests run under Bun (`bun test`).
@@ -41,7 +41,7 @@ Scope: the files directly in `src/`. `src/remote/` is the separate HTTP service 
 - Errors: `TRY_NEXT_ADDRESS_ERRORS` (ECONNREFUSED, EHOSTUNREACH, ENETUNREACH, ETIMEDOUT, EADDRNOTAVAIL, EAFNOSUPPORT, EINVAL, ECONNRESET, EPIPE, ECONNABORTED) fall through; `isVerificationError` (ERR_TLS_*, ERR_SSL_*, *CERT*, UNABLE_TO_*, ...) and unknown codes end the fetch immediately and never try another address. All addresses failing, or the deadline passing mid-race, gives `ConnectFailedError` (`code ERR_ALL_ADDRESSES_FAILED`, `attempts[]`, `untried`). After a winner exists nothing is retried.
 
 ## Invariants for changes
-- No Bun-only APIs in non-test code (`Bun.*` is test-only); the shipped server must run on Node >= 22.
+- No Bun-only APIs in non-test code (`Bun.*` is test-only); the shipped server must run on Node >= 24.2.
 - Never run markitdown/repomix on a path that was not opened and validated by `openLocalFile`; never reopen a path after validating it.
 - Staged copies keep the original extension (markitdown chooses the converter by it); URL input uses `input.<pdf|html>`.
 - Temp dirs are created only through `withStagingDir`; cleanup stays in `finally`.

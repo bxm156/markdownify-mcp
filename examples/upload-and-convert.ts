@@ -1,7 +1,6 @@
 /**
- * Run with Node 22.18+ or Bun: node examples/upload-and-convert.ts input.docx output.md
- * (Node 22.6-22.17: node --experimental-strip-types ...; the image ships it
- * compiled: node examples/upload-and-convert.js ...).
+ * Run with Node 24.2+ or Bun: node examples/upload-and-convert.ts input.docx output.md
+ * (the image ships it compiled: node examples/upload-and-convert.js ...).
  *
  * Example client for the remote server: uploads a local file, converts it and
  * writes the Markdown to a new file. Two modes:

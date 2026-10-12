@@ -5,16 +5,11 @@ on:
 permissions:
   contents: read
 jobs:
-  # Matrix legs report as "remote-node (22)" / "remote-node (24)"; the `remote` gate job below is the
-  # single required status check for branch protection and fails unless every leg succeeded.
-  remote-node:
+  # `remote` is the single required status check for branch protection. Node 24 is the only supported
+  # runtime (engines.node >=24.2) and the image default, so this job tests that major alone.
+  remote:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Node 24 is the image default; Node 22 stays covered until engines.node moves past it.
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [22, 24]
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
@@ -26,16 +21,16 @@ jobs:
       # Pin the Node the smoke scripts and Node-subprocess tests spawn; the runner default drifts.
       - uses: actions/setup-node@v5
         with:
-          node-version: ${{ matrix.node }}
-      # Node-only tests skip when node is missing; fail loudly if this leg runs another major.
+          node-version: 24
+      # Node-only tests skip when node is missing; fail loudly if PATH has another major.
       - name: Check the Node major on PATH
         shell: bash
         run: |
           actual="$(node --version)"
           echo "node $actual"
           case "$actual" in
-            "v${{ matrix.node }}."*) ;;
-            *) echo "::error::Expected Node ${{ matrix.node }}.x on PATH, got $actual"; exit 1 ;;
+            "v24."*) ;;
+            *) echo "::error::Expected Node 24.x on PATH, got $actual"; exit 1 ;;
           esac
       - run: bun install --frozen-lockfile --ignore-scripts
       - name: Type-check tests, scripts and examples
@@ -72,7 +67,7 @@ jobs:
       - name: Verify compiled Node JWT authentication and scoped uploads
         run: bun scripts/jwt-http-smoke.ts
       # The smoke inherits NODE_OPTIONS into the compiled server it spawns, so any
-      # deprecated Node API the server reaches on this major throws and fails the run.
+      # deprecated Node API the server reaches on Node 24 throws and fails the run.
       - name: Verify the compiled server reaches no deprecated Node API
         run: bun scripts/jwt-http-smoke.ts
         env:
@@ -84,8 +79,8 @@ jobs:
           python -O scripts/litellm-health-smoke.py
       - name: Verify LiteLLM health smoke rejects 403, 500, timeout and unexpected success
         run: python -O scripts/litellm_health_smoke_test.py
-      - name: Build the remote image on this leg's Node
-        run: docker build -f Dockerfile.remote --build-arg NODE_IMAGE=node:${{ matrix.node }}-bookworm-slim -t markdownify-remote:ci .
+      - name: Build the remote image on Node 24
+        run: docker build -f Dockerfile.remote --build-arg NODE_IMAGE=node:24-bookworm-slim -t markdownify-remote:ci .
       - name: Check the image's Node version and shared libraries
         shell: bash
         run: |
@@ -93,8 +88,8 @@ jobs:
           version="$(docker run --rm --entrypoint node markdownify-remote:ci -p process.version)"
           echo "image node $version"
           case "$version" in
-            "v${{ matrix.node }}."*) ;;
-            *) echo "::error::Image runs Node $version, expected ${{ matrix.node }}.x"; exit 1 ;;
+            "v24."*) ;;
+            *) echo "::error::Image runs Node $version, expected 24.x"; exit 1 ;;
           esac
           # node is copied from the node image into the python runtime image: every library must resolve there.
           libs="$(docker run --rm --entrypoint ldd markdownify-remote:ci /usr/local/bin/node)"
@@ -146,18 +141,6 @@ jobs:
           MCP_TOKEN="$(jq -r .a <<<"$MD_TEST_AGENT_KEYS")" CONVERSION_DEADLINE_MS=120000 \
             bun examples/upload-and-convert.ts src/sample-data/test.pdf "$example_output"
           grep -q 'Test PDF content' "$example_output"
-  remote:
-    # Required status check: collapses the Node matrix into one stable name. `if: always()` so a failed or
-    # cancelled leg still reports (a skipped job would otherwise count as a pass).
-    needs: remote-node
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    steps:
-      - name: Require every Node leg to pass
-        run: |
-          echo "remote-node result: ${{ needs.remote-node.result }}"
-          test "${{ needs.remote-node.result }}" = "success"
   stdio-and-compose:
     runs-on: ubuntu-latest
     timeout-minutes: 25

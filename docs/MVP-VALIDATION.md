@@ -4,6 +4,8 @@ Validated locally on 2026-10-06 on Windows using Bun 1.4.2, Node 24.19.0, Python
 
 Update 2026-10-11: the image now runs Node 24 ([#65](https://github.com/bxm156/markdownify-mcp/issues/65)); CI tests Node 22 and Node 24. The results below were recorded on Node 22 and are unchanged.
 
+Update 2026-10-12: Node 22 support was dropped ([#73](https://github.com/bxm156/markdownify-mcp/issues/73)); `engines.node` is `>=24.2` and CI tests Node 24 only.
+
 ## Passed
 
 GitHub Linux CI [run 37454606073](https://github.com/bxm156/markdownify-mcp/actions/runs/37454606073) completed successfully for implementation commit `f0475aba89bb5a7c884c231e8f64bd6ec086d60d`. It passed the remote test suite, converted the real PDF and generated Office fixtures, built `Dockerfile.remote`, started the resulting Node 22 container, and verified authenticated MCP initialization/tool discovery, binary PDF upload, asynchronous conversion, paginated retrieval and deletion.
