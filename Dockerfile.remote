@@ -1,5 +1,5 @@
-# The Node runtime image. CI builds once per supported major, e.g.
-#   docker build -f Dockerfile.remote --build-arg NODE_IMAGE=node:22-bookworm-slim .
+# The Node runtime image. Node 24 is the only supported major (engines.node >=24.2); CI builds with
+#   docker build -f Dockerfile.remote --build-arg NODE_IMAGE=node:24-bookworm-slim .
 # Keep the Debian release (bookworm) the same as the python:3.12-slim-bookworm runtime stage,
 # because only the node binary is copied across and it links against the runtime's glibc and libstdc++.
 ARG NODE_IMAGE=node:24-bookworm-slim

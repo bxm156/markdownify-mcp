@@ -5,10 +5,8 @@ file is documentation. Pinned everywhere: Bun 1.4.2, Node 24, Python 3.12,
 markitdown 0.1.5 (`markitdown[pdf,docx,xlsx,pptx]==0.1.5`), LiteLLM 1.104.0
 (`litellm[mcp]==1.104.0`). `Dockerfile.remote` takes the Node image from
 `ARG NODE_IMAGE` (default `node:24-bookworm-slim`) and pins Python 3.12 and
-`markitdown[pdf,docx,xlsx,pptx]==0.1.5`. Node 22 is still tested: remote-mvp.yml's
-`remote` job runs a `node: [22, 24]` matrix (and builds the image with the matching
-`NODE_IMAGE`) until a cleanup PR drops 22 at its end of life; `engines.node` stays
-`>=22` until then. docker-publish.yml and cross-platform.yml use Node 24 only.
+`markitdown[pdf,docx,xlsx,pptx]==0.1.5`. Node 24 is the only supported runtime
+(`engines.node` `>=24.2`): every job that sets up Node uses 24, and none has a Node matrix.
 Actions, all on Node 24 runtimes (`runs.using: node24`): `actions/checkout@v5`, `actions/setup-node@v5`,
 `actions/setup-python@v6`, and in docs.yml `actions/configure-pages@v6`,
 `actions/deploy-pages@v5`, `actions/upload-pages-artifact@v5` (a composite action over
@@ -23,8 +21,8 @@ workflows use `permissions: contents: read` unless stated.
 
 Triggers: every `push` and `pull_request`. No secrets.
 
-- Job `remote-node` (15 min, matrix `node: [22, 24]`, `fail-fast: false`; the `remote` gate job needs it with `if: always()` and is the one required status check for branch protection): first checks that
-  `node --version` on PATH is the leg's major (Node-only tests would otherwise skip
+- Job `remote` (15 min, Node 24; the one required status check for branch protection): first checks that
+  `node --version` on PATH is 24.x (Node-only tests would otherwise skip
   silently); `bun install --frozen-lockfile --ignore-scripts`;
   `bun run typecheck` (tests, scripts, examples); `bun scripts/check-env-docs.ts`
   (every `MD_*` in `src/remote` is in the `docs/REMOTE.md` table, and every `MD_*` or `process.env` read in `src/*.ts` is in the README's "Stdio environment variables" table); an `ast`-based guard that
@@ -38,8 +36,8 @@ Triggers: every `push` and `pull_request`. No secrets.
   anonymous health smoke (`litellm-health-smoke.py`, also under `-O`) and
   `litellm_health_smoke_test.py` under `-O` (rejects 403, 500, timeout,
   unexpected success). Then `docker build -f Dockerfile.remote --build-arg
-  NODE_IMAGE=node:<leg>-bookworm-slim`, a check that `node -p process.version` in the
-  image is the leg's major and `ldd /usr/local/bin/node` has no `not found`, and two
+  NODE_IMAGE=node:24-bookworm-slim`, a check that `node -p process.version` in the
+  image is 24.x and `ldd /usr/local/bin/node` has no `not found`, and two
   containers: single-key (`remote-http-smoke.ts` plus `examples/upload-and-convert.ts`
   on `src/sample-data/test.pdf`) and a disposable three-agent registry
   (`create-test-agent-registry.ts`, `multitenant-http-smoke.ts`, the example as agent "a").

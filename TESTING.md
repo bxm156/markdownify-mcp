@@ -22,7 +22,7 @@ bun scripts/jwt-http-smoke.ts              # compiled Node server, JWT auth, rea
 | Need | For | Install / check |
 | --- | --- | --- |
 | Bun 1.4.2 | everything | `bun --version` |
-| Node 22 or 24 on PATH (the image runs 24; CI tests both) | `src/download.test.ts` (runs `node --experimental-strip-types`; its 1024-bit-key TLS case expects success on 22 and a verification error on 24+), compiled-entry tests in `src/remote/cleanup.test.ts` (skipped without `node`), all HTTP smokes | `node --version` |
+| Node 24 (24.2+) on PATH, the only supported major (`engines.node`) | `src/download.test.ts` (runs `node --experimental-strip-types`; its 1024-bit-key TLS case expects a verification error, so a Node 22 on PATH fails it), compiled-entry tests in `src/remote/cleanup.test.ts` (skipped without `node`), all HTTP smokes | `node --version` |
 | `.venv` with markitdown 0.1.5 | stdio converter tests (skipped without it), converter and HTTP smokes | see below; check `.venv/bin/markitdown --version` |
 | `litellm[mcp]==1.104.0` | `scripts/litellm-health-smoke.py` and its test only | separate venv, see [LiteLLM](#litellm-health-smoke) |
 | MkDocs (`docs/requirements.txt`) | docs build only | separate venv, see [Docs](#docs-build) |
@@ -109,7 +109,7 @@ every test change. `bun run build` / `bun run build:remote` use `tsconfig.json` 
 
 ## Smoke scripts
 
-All need `bun install`; the HTTP ones also need `bun run build:remote`, Node 22 or 24 and markitdown in `.venv` or on PATH.
+All need `bun install`; the HTTP ones also need `bun run build:remote`, Node 24 and markitdown in `.venv` or on PATH.
 
 ### remote-converter-smoke
 
@@ -215,13 +215,13 @@ Run it when `docs/`, `mkdocs.yml`, `mkdocs_hooks.py`, `README.md`, `SKILL.md`, `
 
 | Workflow | Trigger | Commands |
 | --- | --- | --- |
-| Remote MVP (`remote-mvp.yml`), job `remote-node` (gated by `remote`) | every push, PR; matrix Node 22 and 24 | Node major check; `bun install --frozen-lockfile --ignore-scripts`; `bun run typecheck`; bare-assert grep; `bun run build:remote`; `bun test src/remote`; pip `markitdown[pdf,docx,xlsx,pptx]==0.1.5`; `bun run build`; `MD_TEST_NETWORK=1 bun test`; fixture test (plain and `-O`); converter and JWT smokes, JWT again with `NODE_OPTIONS=--throw-deprecation`; LiteLLM smoke (plain and `-O`) and `-O` negative test; `docker build -f Dockerfile.remote --build-arg NODE_IMAGE=node:<leg>-bookworm-slim`; image `node -p process.version` and `ldd` check; container + `wait-for-container.sh` + `remote-http-smoke.ts` + example; registry container + `multitenant-http-smoke.ts` + example |
+| Remote MVP (`remote-mvp.yml`), job `remote` (required status check) | every push, PR; Node 24 | Node 24 check; `bun install --frozen-lockfile --ignore-scripts`; `bun run typecheck`; bare-assert grep; `bun run build:remote`; `bun test src/remote`; pip `markitdown[pdf,docx,xlsx,pptx]==0.1.5`; `bun run build`; `MD_TEST_NETWORK=1 bun test`; fixture test (plain and `-O`); converter and JWT smokes, JWT again with `NODE_OPTIONS=--throw-deprecation`; LiteLLM smoke (plain and `-O`) and `-O` negative test; `docker build -f Dockerfile.remote --build-arg NODE_IMAGE=node:24-bookworm-slim`; image `node -p process.version` and `ldd` check; container + `wait-for-container.sh` + `remote-http-smoke.ts` + example; registry container + `multitenant-http-smoke.ts` + example |
 | Remote MVP, job `stdio-and-compose` | every push, PR | `bash -n`; `shellcheck -x`; `docker-smoke-test.test.sh`; `docker compose config -q` x3; `docker-smoke-test.sh` |
 | Cross-platform (`cross-platform.yml`) | every push, PR; macOS + Windows | markitdown 0.1.5 on PATH; `bun run typecheck`; `bun test src/utils.test.ts src/Markdownify.test.ts src/download.test.ts src/server.test.ts src/tools.test.ts` |
 | Docs (`docs.yml`) | PRs and `main` pushes touching doc paths | `pip install -r docs/requirements.txt`; `python mkdocs_hooks.py`; `mkdocs build --strict`; deploys Pages from `main` |
 | Docker Hub publication (`docker-publish.yml`) | push to `main`, manual | typecheck, both builds, `bun test src/remote`, `bun test` (no `MD_TEST_NETWORK`), converter/JWT (also `--throw-deprecation`)/LiteLLM smokes, shellcheck, `docker-smoke-test.test.sh`, fixture test; builds the image, checks its Node 24 and `ldd`, tests it with three agents, then pushes |
 
-All Linux jobs pin Bun 1.4.2 and Python 3.12. Node: 24 in publication and Cross-platform; Remote MVP's `remote` job runs Node 22 and 24 (its `stdio-and-compose` job needs no Node).
+All Linux jobs pin Bun 1.4.2 and Python 3.12. Node: 24 everywhere (publication, Cross-platform and Remote MVP's `remote` job; its `stdio-and-compose` job needs no Node).
 
 ## Timing (observed 2026-10-11, Linux, as root, `.venv` present)
 

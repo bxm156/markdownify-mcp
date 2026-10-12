@@ -66,8 +66,8 @@ IX5GtFz9bBbcIxlnfk2v2tXKpmqy6INp54/nZpECsQ==
 `;
 
 /**
- * Self-signed 1024-bit RSA certificate for tls.invalid (valid until 2126). OpenSSL security level 1 (Node 22)
- * accepts the key; level 2 (Node 24 and later) requires at least 2048 bits.
+ * Self-signed 1024-bit RSA certificate for tls.invalid (valid until 2126). Node 24 builds OpenSSL at security level 2,
+ * which requires at least 2048 bits, so a client with Node's defaults rejects it.
  */
 const WEAK_TLS_KEY = `-----BEGIN PRIVATE KEY-----
 MIICdAIBADANBgkqhkiG9w0BAQEFAASCAl4wggJaAgEAAoGBAJdCrhLnqXAFcsV7
@@ -914,13 +914,12 @@ test("under Node, a TLS handshake reset also falls through and leaves no timer b
   `);
 }, 15_000);
 
-test("under Node, a 1024-bit server key fails verification from Node 24 on and is not retried", async () => {
+test("under Node, a 1024-bit server key fails verification and is not retried", async () => {
   await runUnderNode(`
     import assert from 'node:assert/strict';
     import https from 'node:https';
     import tls from 'node:tls';
     import {download} from ${downloadModule};
-    const major = Number(process.versions.node.split('.')[0]);
     const realTlsConnect = tls.connect;
     let attempts = 0;
     tls.connect = (options) => { attempts++; return realTlsConnect({...options, ca: ${JSON.stringify(WEAK_TLS_CERT)}}); };
@@ -934,20 +933,14 @@ test("under Node, a 1024-bit server key fails verification from Node 24 on and i
     try {
       const attempt = download.fetch('https://tls.invalid:' + secure.address().port + '/', loopbackTwice,
         AbortSignal.timeout(5000), {connectTimeoutMs: 60000, attemptDelayMs: 60000});
-      if (major >= 24) {
-        // OpenSSL security level 2. Node reports X509_V_ERR_EE_KEY_TOO_SMALL, which it has no name for, as UNSPECIFIED.
-        await assert.rejects(attempt, (error) => {
-          assert.equal(error.code, 'UNSPECIFIED');
-          assert.match(error.message, /key too (weak|small)/i);
-          return true;
-        });
-        // A verification failure ends the fetch: a retry would have opened the second address synchronously.
-        assert.equal(attempts, 1);
-      } else {
-        // OpenSSL security level 1 (Node 22) accepts a 1024-bit key.
-        const response = await attempt;
-        assert.equal(await response.text(), 'weak key served');
-      }
+      // OpenSSL security level 2. Node reports X509_V_ERR_EE_KEY_TOO_SMALL, which it has no name for, as UNSPECIFIED.
+      await assert.rejects(attempt, (error) => {
+        assert.equal(error.code, 'UNSPECIFIED');
+        assert.match(error.message, /key too (weak|small)/i);
+        return true;
+      });
+      // A verification failure ends the fetch: a retry would have opened the second address synchronously.
+      assert.equal(attempts, 1);
     } finally {
       secure.closeAllConnections();
       await new Promise(r => secure.close(r));

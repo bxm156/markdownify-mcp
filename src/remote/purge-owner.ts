@@ -8,8 +8,6 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { realpathSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { errnoCode } from "./audit.js";
 import { WINDOWS_UNSUPPORTED_MESSAGE } from "./config.js";
 import { validatePrincipal, type Principal } from "./identity.js";
@@ -86,8 +84,8 @@ async function scan(root: string, candidates: string[], owner: Principal, apply:
   return report;
 }
 
-// Compare real paths so invocation through a symlink behaves like a direct invocation.
-const isMain = () => { try { return !!process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); } catch { return false; } };
+// `import.meta.main` (Node 24.2+, engines.node, and Bun) is also true when the CLI is invoked through a symlink.
+const isMain = () => import.meta.main;
 if (isMain() && process.platform === "win32") {
   // Like the server, this CLI is Linux-only: run it inside the container image (see docs/CONTAINERS.md).
   console.error(WINDOWS_UNSUPPORTED_MESSAGE);

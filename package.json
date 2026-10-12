@@ -12,7 +12,7 @@
   },
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=24.2"
   },
   "bin": {
     "mcp-markdownify-server": "dist/index.js"

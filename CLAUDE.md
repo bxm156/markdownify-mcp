@@ -22,8 +22,9 @@ python-pptx), run as a subprocess. `resolveMarkitdownPath` (`src/utils.ts`, shar
 
 - **Bun 1.4.2** for install, build, test and scripts. Never npm, pnpm or yarn; do not add other lockfiles.
 - **Node 24** is the production runtime of the remote server (image `node:24-bookworm-slim` via the
-  `NODE_IMAGE` build arg, `@types/node ^24`); `engines.node` stays `>= 22` and CI still tests Node 22 in a
-  matrix until Node 22's end of life. Some tests and smokes spawn `node` from PATH, so have Node 22 or 24 installed.
+  `NODE_IMAGE` build arg, `@types/node ^24`) and the only supported one: `engines.node` is `>=24.2` (so
+  `import.meta.main` and type stripping are always there) and CI tests Node 24 only. Some tests and smokes spawn
+  `node` from PATH, so have Node 24 installed (a Node 22 on PATH fails the 1024-bit-key TLS test in `src/download.test.ts`).
 - **Python 3.12 + markitdown 0.1.5** in `.venv` (`.python-version`, CI and the images all say 3.12; `pyproject.toml` pins the converter).
   Create it with `uv sync` (pyproject.toml + uv.lock) or `./setup.sh` (`setup.bat` on Windows); details in TESTING.md.
 - **TypeScript** strict, ESM (`"type": "module"`), `module`/`moduleResolution` Node16: relative imports
@@ -76,7 +77,7 @@ NO_MKDOCS_2_WARNING=true /tmp/mkdocs-venv/bin/mkdocs build --strict -d /tmp/site
 - **Docs**: MkDocs Material, built with `--strict` (any broken link or anchor fails). `README.md`, `SKILL.md`
   and `PLAN.md` are included into the site through wrapper pages (`docs/install.md`, `docs/agent-skill.md`,
   `docs/plan.md`), so links in those root files must resolve too. See docs/CLAUDE.md.
-- **Pins move together**: Bun 1.4.2, Node 24 (22 in the CI matrix), Python 3.12, `markitdown[...]==0.1.5`, `litellm[mcp]==1.104.0`
+- **Pins move together**: Bun 1.4.2, Node 24, Python 3.12, `markitdown[...]==0.1.5`, `litellm[mcp]==1.104.0`
   appear in workflows, Dockerfiles and docs. Change all of them in one PR.
 - **Commits**: describe the change and reference the issue. Never put AI model identifiers in code,
   comments, docs, PR titles or PR bodies; the `Co-Authored-By` trailer the tooling appends to commits is
