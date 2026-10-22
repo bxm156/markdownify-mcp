@@ -30,7 +30,7 @@ LABEL org.opencontainers.image.title="Markdownify remote MCP" \
     org.opencontainers.image.revision="${VCS_REF}" \
     org.opencontainers.image.licenses="MIT"
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
-RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir 'markitdown[pdf,docx,xlsx,pptx]==0.1.5' \
     && groupadd --gid 10001 markdownify \
@@ -39,6 +39,7 @@ WORKDIR /app
 COPY --from=build /app/dist ./dist
 COPY --from=production-deps /app/node_modules ./node_modules
 COPY package.json LICENSE SKILL.md ./
+COPY --chmod=755 docker-entrypoint.sh ./docker-entrypoint.sh
 COPY docs/REMOTE.md docs/MULTITENANT.md docs/CONTAINERS.md docs/QUICKSTART.md docs/ERRORS.md docs/JWT.md docs/HEALTH.md ./docs/
 COPY --from=build /app/build-examples/upload-and-convert.js ./examples/upload-and-convert.js
 RUN mkdir /data && chown 10001:10001 /data
@@ -48,4 +49,5 @@ EXPOSE 8000
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:8000/livez').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["node", "dist/remote/index.js"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["remote"]
