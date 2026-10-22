@@ -193,6 +193,17 @@ Replace the example origin with your server. Supply a separately provisioned tok
 
 The examples configure MCP access. File conversion also needs a runtime that can upload bytes as described above. Give the agent [SKILL.md](SKILL.md) as instructions, or ask it to read the file before converting. A suitable request is: “Use Markdownify to convert this accessible PDF, save the Markdown, and retain the job ID for later retrieval.”
 
+### Use the local Docker container
+
+The published image is an HTTP server, not a stdio command, so clients connect to the running container rather than launching it with `docker run` in their config. Start it as in [step 3](#3-run-the-published-image), confirm `curl --fail http://localhost:8000/healthz`, then use `http://localhost:8000/mcp` as the `url` in the client examples below (Codex, Claude Code, Cursor, VS Code). For example, with Claude Code:
+
+```sh
+claude mcp add --transport http markdownify http://localhost:8000/mcp \
+  --header "Authorization: Bearer ${MARKDOWNIFY_TOKEN}"
+```
+
+`MARKDOWNIFY_TOKEN` is the raw token provisioned for that agent in step 2. Keep the port bound to `127.0.0.1` as in the compose file. Clients that only speak stdio are not supported by this image; the stdio server is the separate `Dockerfile`.
+
 ### Codex CLI / IDE extension
 
 Add to `~/.codex/config.toml`:
