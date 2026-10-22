@@ -193,6 +193,30 @@ Replace the example origin with your server. Supply a separately provisioned tok
 
 The examples configure MCP access. File conversion also needs a runtime that can upload bytes as described above. Give the agent [SKILL.md](SKILL.md) as instructions, or ask it to read the file before converting. A suitable request is: “Use Markdownify to convert this accessible PDF, save the Markdown, and retain the job ID for later retrieval.”
 
+### Run the same image over stdio
+
+The image runs in two modes. The default (`remote`) is the HTTP service. Passing `stdio` runs the local stdio MCP server (11 tools for local paths, URLs and git repos) from the same image, so a client can launch it directly:
+
+```sh
+docker run -i --rm -v "$PWD:/work:ro" bryanmarty/markdownify-mcp:latest stdio
+```
+
+Use `-i` and no `-t`; stdout carries the protocol. Mount the directories the agent should read (paths in tool calls are container paths). Client configuration, for example Claude Code's `.mcp.json`, Cursor's `.cursor/mcp.json` or Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "markdownify": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-v", "/path/to/files:/work:ro",
+               "bryanmarty/markdownify-mcp:latest", "stdio"]
+    }
+  }
+}
+```
+
+For VS Code, use the same `command` and `args` under `servers` in `.vscode/mcp.json`; for Codex, set `command = "docker"` and the same `args` in `[mcp_servers.markdownify]`. No token is needed in stdio mode. To use the HTTP service instead, follow [step 3](#3-run-the-published-image) and point clients at `http://localhost:8000/mcp` as in the examples below.
+
 ### Codex CLI / IDE extension
 
 Add to `~/.codex/config.toml`:
